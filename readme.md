@@ -1,3 +1,4 @@
+![alt text](https://github.com/ctaho19/policy-guardian/blob/main/logo.png)
 # policy-guardian
 policyGuardian is a firewall policy analyzer  graphical user interface. It allows users to select a Palo Alto Firewalls XML configuration file, choose from multiple validation checks, and run them against the firewall rules. The application then displays the results and offers the option to export a detailed PDF report of the findings.
 
@@ -54,4 +55,4 @@ Export the results in PDF format using the respective buttons.
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 ### License & Acknowldgment
-This project is licensed under the MIT License. The idea stemmed from @moshekplan's palo_alto_firewall_analyzer repository and leverages the python validators he created.
+This project is licensed under the MIT License. The idea stemmed from @moshekplan's [palo_alto_firewall_analyzer repository](https://github.com/moshekaplan/palo_alto_firewall_analyzer) and leverages the python validators he created.
