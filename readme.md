@@ -53,5 +53,5 @@ Export the results in PDF format using the respective buttons.
 ### Contributing
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-### License
-This project is licensed under the MIT License.
+### License & Acknowldgment
+This project is licensed under the MIT License. The idea stemmed from @moshekplan's palo_alto_firewall_analyzer repository and leverages the python validators he created.
