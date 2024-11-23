@@ -22,6 +22,11 @@ policyGuardian is a firewall policy analyzer  graphical user interface. It allow
 
 **Rules Missing Security Zones:** This check looks for rules that allow traffic but are missing security profiles. It ensures that allow rules have appropriate security measures in place, such as virus scanning, spyware protection, vulnerability protection, URL filtering, file blocking, and wildfire analysis. 
 
+## Sample Configuration
+
+For testing purposes, this project uses a sample Palo Alto Networks firewall configuration XML file from the [Azure Application Gateway Integration repository](https://github.com/PaloAltoNetworks/azure-applicationgateway). This sample configuration helps demonstrate the analyzer's capabilities without requiring access to a production firewall configuration.
+
+Note: When using with your own firewall configurations, ensure you've sanitized any sensitive information.
 
 ## Requirements
 - Python 3.6+
