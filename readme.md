@@ -51,6 +51,9 @@ Click the "Run Checks" button to analyze the files.
 View the results in the table below.
 Export the results in PDF format using the respective buttons.
 
+Example Output:
+![alt text](https://github.com/ctaho19/policy-guardian/blob/main/report1_1.png "Output of Succesful Run")
+
 ### Contributing
 Contributions are welcome! Please feel free to submit a Pull Request.
 
