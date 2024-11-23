@@ -1,5 +1,5 @@
 # policy-guardian
-policyGuardian is a firewall policy analyzer web application. It allows users to select a Palo Alto Firewalls XML configuration file, choose from multiple validation checks, and run them against the firewall rules. The application then displays the results and offers the option to export a detailed PDF report of the findings.
+policyGuardian is a firewall policy analyzer  graphical user interface. It allows users to select a Palo Alto Firewalls XML configuration file, choose from multiple validation checks, and run them against the firewall rules. The application then displays the results and offers the option to export a detailed PDF report of the findings.
 
 ## Features
 
@@ -7,7 +7,7 @@ policyGuardian is a firewall policy analyzer web application. It allows users to
 - Select from various security checks to perform
 - Batch processing of files
 - Display results in a tabular format
-- Export results in CSV and PDF formats
+- Export results in PDF format
 
 ## Available Checks
 
@@ -22,50 +22,33 @@ policyGuardian is a firewall policy analyzer web application. It allows users to
 **Rules Missing Security Zones:** This check looks for rules that allow traffic but are missing security profiles. It ensures that allow rules have appropriate security measures in place, such as virus scanning, spyware protection, vulnerability protection, URL filtering, file blocking, and wildfire analysis. 
 
 
-## Technology Stack
+## Requirements
+- Python 3.6+
+- PyQt6
+- reportlab
 
-- **Next.js**
-- **React**
-- **Tailwind CSS**
-- **shadcn/ui components**
-
-## Getting Started
-
-### Prerequisites
-
-- **Node.js** (v14 or later)
-- **npm** (v6 or later)
-
-### Installation
-
-1. **Clone the repository:**
-
+## Installation
+1. Clone the repository
+2. Install requirements:
    ```bash
-   git clone https://github.com/ctaho19/policy-guardian.git
-
-2. **Navigate to the project directory:**
-
+   pip install -r requirements.txt
+   ```
+3. Run the application:
    ```bash
-   cd <project-directory>
-   
-3. **Install dependencies:**
+   python GUI.py
+   ```
 
-   ```bash
-   npm install
-
-4. **Start the development server:**
-
-   ```bash
-   npm run dev
-
-4. **Open your browser and visit http://localhost:3000**
+## Structure
+- `GUI.py`: Main application file
+- `Test Scripts/`: Contains validator modules
+- `path/to/logo.png`: Application icon
 
 ### Usage
 Upload your firewall configuration files using the file input.
 Select the checks you want to perform from the available options.
 Click the "Run Checks" button to analyze the files.
 View the results in the table below.
-Export the results in CSV or PDF format using the respective buttons.
+Export the results in PDF format using the respective buttons.
 
 ### Contributing
 Contributions are welcome! Please feel free to submit a Pull Request.
