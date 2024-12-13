@@ -64,3 +64,15 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ### License & Acknowldgment
 This project is licensed under the MIT License. The idea stemmed from @moshekplan's [palo_alto_firewall_analyzer repository](https://github.com/moshekaplan/palo_alto_firewall_analyzer) and leverages the python validators he created.
+
+
+Tier 1 - Control Execution Check
+This query validates that our control is being executed by checking for recent records in the QER dataset within the last 3 days. It's a simple existence check that returns a binary result (1/0) based on whether we find any records for our control in the most recent batch, essentially confirming that our control evaluation process is running as expected.
+Tier 2 - Resource Compliance Rate
+This query calculates what percentage of our resources are compliant by comparing the total evaluated resources from QER against the count of non-compliant resources from our non-compliant history. The calculation takes the total evaluated resources as the denominator and subtracts any active (non-closed) non-compliant findings to determine how many resources are currently compliant, expressing this as a percentage.
+Tier 2 Supporting Evidence
+This query breaks down the compliance calculation by account/region/ASV to show exactly how many resources were evaluated and how many are non-compliant in each segment. By joining the QER data with non-compliant history and excluding closed findings, we can see the detailed distribution of compliant vs non-compliant resources that roll up into our Tier 2 metric.
+Tier 3 - Past SLA Non-Compliance
+This query measures remediation effectiveness by calculating what percentage of our total resources are past their SLA for remediation. It uses the TCRD view to identify non-compliant resources and determines if they're past SLA based on their risk level and age, then compares this count against total resources from QER to produce a percentage of resources that have exceeded their remediation timeline.
+Tier 3 Supporting Evidence
+This query provides visibility into the specific resources that are contributing to our past-SLA metric by showing each non-compliant resource's age and SLA status based on its risk level. It helps us understand which resources are driving our Tier 3 metric by showing their aging details and SLA classification, making it clear which ones need immediate attention for remediation.
