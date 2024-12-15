@@ -4,35 +4,32 @@ WITH LAST_SCAN_DATE AS (
     WHERE REPORTDATE BETWEEN DATEADD(DAY, -3, CURRENT_DATE) AND DATEADD(DAY, -1, CURRENT_DATE())
 ),
 DAILY_METRICS AS (
-    -- Overall metrics for current day
+    -- Today's metrics
     SELECT 
-        'A. Overall Current Day Tests' as METRIC_NAME,
-        COUNT(*) as TOTAL_COUNT,
-        SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) as SUCCESSFUL_COUNT,
-        ROUND(100.0 * SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) as SUCCESS_RATE
+        'Current Day Tests' as METRIC_NAME,
+        COALESCE(COUNT(*), 0) as TOTAL_COUNT,
+        COALESCE(SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END), 0) as SUCCESSFUL_COUNT,
+        COALESCE(ROUND(100.0 * SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2), 0) as SUCCESS_RATE
     FROM CYBR_DB.PHDP_CYBR.MACIE_CONTROLS_TESTING
     JOIN LAST_SCAN_DATE LSD ON REPORTDATE = LSD.RECENT_DATE
-    
-    UNION ALL
-    
-    -- Breakdown by test type for current day
-    SELECT 
-        'B. Test Type: ' || TESTNAME as METRIC_NAME,
-        COUNT(*) as TOTAL_COUNT,
-        SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) as SUCCESSFUL_COUNT,
-        ROUND(100.0 * SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) as SUCCESS_RATE
-    FROM CYBR_DB.PHDP_CYBR.MACIE_CONTROLS_TESTING
-    JOIN LAST_SCAN_DATE LSD ON REPORTDATE = LSD.RECENT_DATE
-    GROUP BY TESTNAME
     
     UNION ALL
     
     -- 14-day average metrics
     SELECT 
-        'C. Expected Daily Tests (14-day avg)',
-        ROUND(AVG(DAILY_COUNT), 0),
-        ROUND(AVG(SUCCESSFUL_COUNT), 0),
-        ROUND(100.0 * SUM(SUCCESSFUL_COUNT) / NULLIF(SUM(DAILY_COUNT), 0), 2)
+        'Expected Daily Tests (14-day avg)',
+        CASE 
+            WHEN COUNT(*) = 0 THEN 0 
+            ELSE ROUND(AVG(DAILY_COUNT), 0) 
+        END,
+        CASE 
+            WHEN COUNT(*) = 0 THEN 0 
+            ELSE ROUND(AVG(SUCCESSFUL_COUNT), 0) 
+        END,
+        CASE 
+            WHEN COUNT(*) = 0 THEN 0 
+            ELSE ROUND(100.0 * SUM(SUCCESSFUL_COUNT) / NULLIF(SUM(DAILY_COUNT), 0), 2) 
+        END
     FROM (
         SELECT 
             REPORTDATE,
@@ -45,8 +42,20 @@ DAILY_METRICS AS (
 )
 SELECT 
     METRIC_NAME,
-    TOTAL_COUNT as "Total Tests",
-    SUCCESSFUL_COUNT as "Successful Tests",
-    SUCCESS_RATE as "Success Rate (%)"
+    CASE 
+        WHEN METRIC_NAME = 'Expected Daily Tests (14-day avg)' AND TOTAL_COUNT = 0 
+        THEN 'No Data Available in Past 14 Days'
+        ELSE TOTAL_COUNT::VARCHAR 
+    END as "Total Tests",
+    CASE 
+        WHEN METRIC_NAME = 'Expected Daily Tests (14-day avg)' AND SUCCESSFUL_COUNT = 0 
+        THEN 'No Data Available in Past 14 Days'
+        ELSE SUCCESSFUL_COUNT::VARCHAR 
+    END as "Successful Tests",
+    CASE 
+        WHEN METRIC_NAME = 'Expected Daily Tests (14-day avg)' AND SUCCESS_RATE = 0 
+        THEN 'No Data Available in Past 14 Days'
+        ELSE SUCCESS_RATE::VARCHAR || '%'
+    END as "Success Rate (%)"
 FROM DAILY_METRICS
-ORDER BY METRIC_NAME;
+ORDER BY METRIC_NAME DESC;
