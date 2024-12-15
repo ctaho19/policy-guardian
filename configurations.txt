@@ -4,9 +4,9 @@ WITH LAST_SCAN_DATE AS (
     WHERE REPORTDATE BETWEEN DATEADD(DAY, -3, CURRENT_DATE) AND DATEADD(DAY, -1, CURRENT_DATE())
 ),
 DAILY_METRICS AS (
-    -- Today's metrics
+    -- Overall metrics for current day
     SELECT 
-        'Current Day Tests' as METRIC_NAME,
+        'A. Overall Current Day Tests' as METRIC_NAME,
         COUNT(*) as TOTAL_COUNT,
         SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) as SUCCESSFUL_COUNT,
         ROUND(100.0 * SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) as SUCCESS_RATE
@@ -15,9 +15,21 @@ DAILY_METRICS AS (
     
     UNION ALL
     
+    -- Breakdown by test type for current day
+    SELECT 
+        'B. Test Type: ' || TESTNAME as METRIC_NAME,
+        COUNT(*) as TOTAL_COUNT,
+        SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) as SUCCESSFUL_COUNT,
+        ROUND(100.0 * SUM(CASE WHEN TESTISSUCCESFUL = TRUE THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) as SUCCESS_RATE
+    FROM CYBR_DB.PHDP_CYBR.MACIE_CONTROLS_TESTING
+    JOIN LAST_SCAN_DATE LSD ON REPORTDATE = LSD.RECENT_DATE
+    GROUP BY TESTNAME
+    
+    UNION ALL
+    
     -- 14-day average metrics
     SELECT 
-        'Expected Daily Tests (14-day avg)',
+        'C. Expected Daily Tests (14-day avg)',
         ROUND(AVG(DAILY_COUNT), 0),
         ROUND(AVG(SUCCESSFUL_COUNT), 0),
         ROUND(100.0 * SUM(SUCCESSFUL_COUNT) / NULLIF(SUM(DAILY_COUNT), 0), 2)
@@ -37,4 +49,4 @@ SELECT
     SUCCESSFUL_COUNT as "Successful Tests",
     SUCCESS_RATE as "Success Rate (%)"
 FROM DAILY_METRICS
-ORDER BY METRIC_NAME DESC;
+ORDER BY METRIC_NAME;
