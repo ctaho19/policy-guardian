@@ -1,78 +1,66 @@
--- Tier 2: Compliance Rate (Evaluated Resources vs Non-Compliant Resources)
--- This query calculates the percentage of evaluated resources that are compliant
--- by comparing total evaluated resources against known non-compliant resources
+-- Tier 3: Past SLA Non-Compliance
+-- This query calculates the percentage of non-compliant resources that are within their SLA period
+-- SLA thresholds: Critical: 0 days, High: 30 days, Medium: 60 days, Low: 90 days
 
--- Get the most recent batch ID to ensure we're working with latest data
-WITH LATEST_BATCH AS (
-    SELECT MAX(BATCH_ID) AS BATCH_ID 
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-),
--- Get total evaluated resources using same logic as Tier 1
--- This ensures consistency between Tier 1 and Tier 2 metrics
-EVALUATED_RESOURCES AS (
+WITH NON_COMPLIANT_COUNTS AS (
     SELECT 
-        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATED
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    WHERE BATCH_ID = (SELECT BATCH_ID FROM LATEST_BATCH)
-    AND CONTROL_ID = 'AC-3.AWS.30.v02'                    -- Filter for specific control
-    AND RESOURCE_TYPE = 'AWS::IAM::Role'                  -- Resource type filter
-    AND ROLE_TYPE = 'MACHINE'                             -- Role type filter
-),
--- Get count of currently non-compliant resources
--- Uses same base logic as Tier 3 but without SLA status filtering
-NON_COMPLIANT_COUNT AS (
-    SELECT 
-        COUNT(DISTINCT nc.RESOURCE_ID) as TOTAL_NON_COMPLIANT
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01 nc
-    WHERE nc.CONTROL_ID = 'AC-3.AWS.30.v02'
-    AND nc.ID NOT IN (                                    -- Exclude closed/resolved cases
+        -- Count total non-compliant resources
+        COUNT(DISTINCT RESOURCE_ID) as TOTAL_NON_COMPLIANT,
+        -- Count resources that are past their SLA based on risk level
+        COUNT(DISTINCT CASE 
+            WHEN (CONTROL_RISK = 'Critical' AND DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) > 0) OR
+                 (CONTROL_RISK = 'High' AND DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) > 30) OR
+                 (CONTROL_RISK = 'Medium' AND DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) > 60) OR
+                 (CONTROL_RISK = 'Low' AND DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) > 90)
+            THEN RESOURCE_ID 
+        END) as PAST_SLA_COUNT
+    FROM CLCN_DB.PHDP_CLOUD.OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01
+    WHERE CONTROL_ID = 'AC-3.AWS.30.v02'
+    -- Exclude resources that have been remediated
+    AND ID NOT IN (
         SELECT ID 
         FROM CLCN_DB.PHDP_CLOUD.OZONE_CLOSED_NON_COMPLIANT_RESOURCES_V04
     )
-),
--- Calculate final compliance metrics
-COMPLIANCE_METRICS AS (
-    SELECT 
-        e.TOTAL_EVALUATED as EVALUATED_RESOURCES,         -- Total resources evaluated
-        nc.TOTAL_NON_COMPLIANT as NON_COMPLIANT_RESOURCES, -- Total non-compliant resources
-        -- Calculate compliant resources (ensure non-negative result)
-        GREATEST(0, e.TOTAL_EVALUATED - nc.TOTAL_NON_COMPLIANT) as COMPLIANT_RESOURCES
-    FROM EVALUATED_RESOURCES e
-    CROSS JOIN NON_COMPLIANT_COUNT nc
 )
--- Generate the final metric report
 SELECT 
-    CURRENT_DATE AS DATE,                                 -- Current date for the report
-    'MNTR-XXXXX-T2' AS MONITORING_METRIC_NUMBER,         -- Metric identifier
-    -- Calculate compliance rate as percentage of evaluated resources that are compliant
-    ROUND(100.0 * COMPLIANT_RESOURCES / NULLIF(EVALUATED_RESOURCES, 0), 2) AS MONITORING_METRIC,
-    -- Determine compliance status based on compliance rate:
-    -- >= 95% : GREEN
-    -- >= 90% : YELLOW
-    -- < 90%  : RED
+    CURRENT_DATE AS DATE,
+    'MNTR-XXXXX-T3' AS MONITORING_METRIC_NUMBER,
+    -- Calculate percentage of resources within SLA (higher is better)
+    ROUND(100.0 * (1 - (CAST(PAST_SLA_COUNT AS DECIMAL(18,2)) / NULLIF(CAST(TOTAL_NON_COMPLIANT AS DECIMAL(18,2)), 0))), 2) AS MONITORING_METRIC,
+    -- Determine compliance status:
+    -- GREEN: 95% or more within SLA (5% or less past due)
+    -- YELLOW: 90-95% within SLA (5-10% past due)
+    -- RED: Less than 90% within SLA (more than 10% past due)
     CASE 
-        WHEN (COMPLIANT_RESOURCES / NULLIF(EVALUATED_RESOURCES, 0)) >= 0.95 THEN 'GREEN'
-        WHEN (COMPLIANT_RESOURCES / NULLIF(EVALUATED_RESOURCES, 0)) >= 0.90 THEN 'YELLOW'
+        WHEN (PAST_SLA_COUNT / NULLIF(TOTAL_NON_COMPLIANT, 0)) <= 0.05 THEN 'GREEN'
+        WHEN (PAST_SLA_COUNT / NULLIF(TOTAL_NON_COMPLIANT, 0)) <= 0.10 THEN 'YELLOW'
         ELSE 'RED'
     END AS COMPLIANCE_STATUS,
-    COMPLIANT_RESOURCES AS NUMERATOR,                     -- Number of compliant resources
-    EVALUATED_RESOURCES AS DENOMINATOR                    -- Total number of evaluated resources
-FROM COMPLIANCE_METRICS;
+    TOTAL_NON_COMPLIANT - PAST_SLA_COUNT AS NUMERATOR,   -- Resources within SLA
+    TOTAL_NON_COMPLIANT AS DENOMINATOR                    -- Total non-compliant resources
+FROM NON_COMPLIANT_COUNTS;
 
--- Supporting Evidence Query for Tier 2
--- Lists all currently non-compliant resources with their details
+-- Supporting Evidence Query for Tier 3
+-- Lists all non-compliant resources that are past their SLA deadline
 SELECT 
-    nc.ACCOUNT_ID,                                        -- AWS Account ID
-    nc.REGION,                                           -- AWS Region
-    nc.RESOURCE_TYPE,                                    -- Type of resource
-    nc.RESOURCE_ID,                                      -- Unique resource identifier
-    nc.CONTROL_ID,                                       -- Control being evaluated
-    nc.OPEN_DATE_UTC_TIMESTAMP,                          -- When non-compliance was first detected
-    DATEDIFF('days', nc.OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) as DAYS_OPEN  -- How long issue has been open
-FROM CLCN_DB.PHDP_CLOUD.OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01 nc
-WHERE nc.CONTROL_ID = 'AC-3.AWS.30.v02'
-AND nc.ID NOT IN (                                       -- Exclude closed/resolved cases
+    ACCOUNT_ID,                                           -- AWS Account identifier
+    REGION,                                              -- AWS Region
+    RESOURCE_TYPE,                                       -- Type of AWS resource
+    RESOURCE_ID,                                         -- Unique resource identifier
+    CONTROL_RISK,                                        -- Risk level (Critical/High/Medium/Low)
+    OPEN_DATE_UTC_TIMESTAMP,                             -- When the non-compliance was first detected
+    DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) as AGING_DAYS  -- Days since detection
+FROM CLCN_DB.PHDP_CLOUD.OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01
+WHERE CONTROL_ID = 'AC-3.AWS.30.v02'
+AND ID NOT IN (
     SELECT ID 
     FROM CLCN_DB.PHDP_CLOUD.OZONE_CLOSED_NON_COMPLIANT_RESOURCES_V04
 )
-ORDER BY DAYS_OPEN DESC;                                 -- Sort by oldest issues first
+-- Only include resources that have exceeded their SLA based on risk level
+AND (
+    (CONTROL_RISK = 'Critical' AND DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) > 0) OR
+    (CONTROL_RISK = 'High' AND DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) > 30) OR
+    (CONTROL_RISK = 'Medium' AND DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) > 60) OR
+    (CONTROL_RISK = 'Low' AND DATEDIFF('days', OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) > 90)
+)
+ORDER BY AGING_DAYS DESC;                                -- Show oldest issues first
