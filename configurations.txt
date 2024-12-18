@@ -1,8 +1,14 @@
--- Fixed query that properly aggregates instead of ranking
+-- Tier 1: Evaluated vs Total Resources
+-- This query calculates the ratio of evaluated resources to total resources
+-- and determines compliance status based on that ratio
+
+-- Get the most recent batch ID to ensure we're working with latest data
 WITH LATEST_BATCH AS (
     SELECT MAX(BATCH_ID) AS BATCH_ID 
     FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
 ),
+-- Calculate resource totals for each unique combination of account/region/etc.
+-- This ensures we properly sum up resources that might have multiple entries
 RESOURCE_TOTALS AS (
     SELECT 
         ACCOUNT_NUMBER,
@@ -10,38 +16,46 @@ RESOURCE_TOTALS AS (
         ASV,
         RESOURCE_TYPE,
         ROLE_TYPE,
+        -- Sum inventory and evaluation counts for each unique combination
         SUM(INVENTORY_COUNT) as TOTAL_RESOURCES,
         SUM(TOTAL_EVALUATIONS_COUNT) as EVALUATED_RESOURCES
     FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    WHERE BATCH_ID = (SELECT BATCH_ID FROM LATEST_BATCH)
-    AND CONTROL_ID = 'AC-3.AWS.30.v02'
-    AND RESOURCE_TYPE = 'AWS::IAM::Role'
-    AND ROLE_TYPE = 'MACHINE'
-    AND INVENTORY_COUNT >= 0
-    GROUP BY 
+    WHERE BATCH_ID = (SELECT BATCH_ID FROM LATEST_BATCH)  -- Use latest batch only
+    AND CONTROL_ID = 'AC-3.AWS.30.v02'                    -- Filter for specific control
+    AND RESOURCE_TYPE = 'AWS::IAM::Role'                  -- Only IAM roles
+    AND ROLE_TYPE = 'MACHINE'                             -- Only machine roles
+    AND INVENTORY_COUNT >= 0                              -- Exclude negative counts
+    GROUP BY                                              -- Group by all dimensions that define a unique resource
         ACCOUNT_NUMBER,
         REGION,
         ASV,
         RESOURCE_TYPE,
         ROLE_TYPE
 ),
+-- Calculate final totals across all accounts/regions
 FINAL_TOTALS AS (
     SELECT 
-        SUM(TOTAL_RESOURCES) as TOTAL_RESOURCES,
-        SUM(EVALUATED_RESOURCES) as EVALUATED_RESOURCES
+        SUM(TOTAL_RESOURCES) as TOTAL_RESOURCES,          -- Total resources across all groups
+        SUM(EVALUATED_RESOURCES) as EVALUATED_RESOURCES   -- Total evaluated across all groups
     FROM RESOURCE_TOTALS
 )
+-- Generate the final metric report
 SELECT 
-    CURRENT_DATE AS DATE,
-    'MNTR-XXXXX-T1' AS MONITORING_METRIC_NUMBER,
+    CURRENT_DATE AS DATE,                                 -- Current date for the report
+    'MNTR-XXXXX-T1' AS MONITORING_METRIC_NUMBER,         -- Metric identifier
+    -- Calculate the percentage of resources evaluated (rounded to 2 decimal places)
     ROUND(100.0 * EVALUATED_RESOURCES / NULLIF(TOTAL_RESOURCES, 0), 2) AS MONITORING_METRIC,
+    -- Determine compliance status based on evaluation percentage:
+    -- >= 90% : GREEN
+    -- >= 80% : YELLOW
+    -- < 80%  : RED
     CASE 
         WHEN (EVALUATED_RESOURCES / NULLIF(TOTAL_RESOURCES, 0)) >= 0.9 THEN 'GREEN'
         WHEN (EVALUATED_RESOURCES / NULLIF(TOTAL_RESOURCES, 0)) >= 0.8 THEN 'YELLOW'
         ELSE 'RED'
     END AS COMPLIANCE_STATUS,
-    EVALUATED_RESOURCES AS NUMERATOR,
-    TOTAL_RESOURCES AS DENOMINATOR
+    EVALUATED_RESOURCES AS NUMERATOR,                     -- Number of resources evaluated
+    TOTAL_RESOURCES AS DENOMINATOR                        -- Total number of resources
 FROM FINAL_TOTALS;
 
 -- Validation query
