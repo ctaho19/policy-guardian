@@ -1,18 +1,21 @@
--- Tier 1 with both explicit and Lazer mapping filters
+-- Tier 1 with correct Lazer controls dataset
 WITH LATEST_BATCH AS (
     SELECT MAX(BATCH_ID) AS BATCH_ID 
     FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
 ),
 VALID_RESOURCES AS (
-    -- Get valid resource types from Lazer mapping
-    SELECT DISTINCT RESOURCE_TYPE 
-    FROM CLCN_DB.PHDP_CLOUD.LAZER_RESOURCE_TYPE_MAPPING_V01
-    WHERE CONTROL_ID = 'CM-6.AWS.63.v01'
-    AND BATCH_ID = (
+    -- Get valid resource types from Lazer controls
+    SELECT DISTINCT lcomp.RESOURCE_TYPE 
+    FROM CLCN_DB.PHDP_CLOUD.LAZER_CONTROLS_V03 lctrl
+    LEFT JOIN CLCN_DB.PHDP_CLOUD.LAZER_COMPONENTS_V03 lcomp 
+        USING (CLOUD_CONTROL_VERSION_ID, BATCH_ID)
+    WHERE lctrl.BATCH_ID = (
         SELECT MAX(BATCH_ID) 
-        FROM CLCN_DB.PHDP_CLOUD.LAZER_RESOURCE_TYPE_MAPPING_V01
+        FROM CLCN_DB.PHDP_CLOUD.LAZER_CONTROLS_V03
     )
-    AND RESOURCE_TYPE = 'AWS::EC2::Instance'  -- Double-check resource type in Lazer
+    AND lctrl.CLOUD_CONTROL_VERSION_ID = 'CM-6.AWS.63.v01'
+    AND lcomp.PHASE = 'Operational'
+    AND lcomp.RESOURCE_TYPE = 'AWS::EC2::Instance'
 ),
 RANKEDRECORDS AS (
     SELECT 
@@ -26,8 +29,16 @@ RANKEDRECORDS AS (
         ON t.RESOURCE_TYPE = v.RESOURCE_TYPE
     WHERE t.BATCH_ID = (SELECT BATCH_ID FROM LATEST_BATCH)
     AND t.CONTROL_ID = 'CM-6.AWS.63.v01'
-    AND t.RESOURCE_TYPE = 'AWS::EC2::Instance'
     AND t.INVENTORY_COUNT >= 0
+    AND LOWER(t.REGION) IN (
+        'ca-central-1', 
+        'eu-west-1', 
+        'eu-west-2', 
+        'us-east-1', 
+        'us-east-2', 
+        'us-west-2', 
+        'global'
+    )
 )
 SELECT 
     SUM(INVENTORY_COUNT) as TOTAL_RESOURCES,
