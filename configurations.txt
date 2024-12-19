@@ -1,38 +1,30 @@
+-- Detailed analysis of resource counts
 WITH LATEST_BATCH AS (
     SELECT MAX(BATCH_ID) AS BATCH_ID 
     FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-),
-RANKED_ASV_RECORDS AS (
-    SELECT 
-        *,
-        ROW_NUMBER() OVER (
-            PARTITION BY ACCOUNT_NUMBER, REGION, RESOURCE_ID
-            ORDER BY 
-                -- Prioritize non-empty ASVs
-                CASE WHEN ASV = 'Unassigned' THEN 2 ELSE 1 END,
-                BATCH_ID DESC
-        ) AS RANK
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    WHERE BATCH_ID = (SELECT BATCH_ID FROM LATEST_BATCH)
-    AND CONTROL_ID = 'CM-6.AWS.63.v01'
-    AND RESOURCE_TYPE = 'AWS::EC2::Instance'
-    AND INVENTORY_COUNT >= 0  -- Exclude negative counts
-    AND ASV != 'Unassigned'  -- Exclude unassigned ASVs
-    AND LOWER(REGION) IN (
-        'ca-central-1', 
-        'eu-west-1', 
-        'eu-west-2', 
-        'us-east-1', 
-        'us-east-2', 
-        'us-west-2', 
-        'global'
-    )
 )
 SELECT 
-    COUNT(DISTINCT ACCOUNT_NUMBER) as unique_accounts,
-    COUNT(DISTINCT REGION) as unique_regions,
-    SUM(INVENTORY_COUNT) as TOTAL_RESOURCES,
-    SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATED,
-    ROUND(100.0 * SUM(TOTAL_EVALUATIONS_COUNT) / NULLIF(SUM(INVENTORY_COUNT), 0), 2) as EVALUATION_PERCENTAGE
-FROM RANKED_ASV_RECORDS 
-WHERE RANK = 1;
+    ACCOUNT_NUMBER,
+    REGION,
+    ASV,
+    RESOURCE_TYPE,
+    COUNT(*) as row_count,
+    MIN(TOTAL_EVALUATIONS_COUNT) as min_eval,
+    MAX(TOTAL_EVALUATIONS_COUNT) as max_eval,
+    SUM(TOTAL_EVALUATIONS_COUNT) as sum_eval,
+    MIN(INVENTORY_COUNT) as min_inv,
+    MAX(INVENTORY_COUNT) as max_inv,
+    SUM(INVENTORY_COUNT) as sum_inv
+FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
+WHERE BATCH_ID = (SELECT BATCH_ID FROM LATEST_BATCH)
+AND CONTROL_ID = 'CM-6.AWS.63.v01'
+AND RESOURCE_TYPE = 'AWS::EC2::Instance'
+AND INVENTORY_COUNT >= 0
+GROUP BY 
+    ACCOUNT_NUMBER,
+    REGION,
+    ASV,
+    RESOURCE_TYPE
+HAVING sum_eval > 100  -- Let's look at accounts with high evaluation counts
+ORDER BY sum_eval DESC
+LIMIT 10;
