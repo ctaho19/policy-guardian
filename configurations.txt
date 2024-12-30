@@ -1,4 +1,4 @@
--- Tier 0 (Heartbeat) Main Query: Monitor certificate rotation compliance
+-- Tier 0 (Heartbeat): Monitor certificate rotation compliance
 -- This query identifies certificates needing rotation and checks if they are being actively rotated
 
 -- First CTE: Identify certificates that need rotation based on expiration criteria
@@ -13,7 +13,7 @@ WITH CERTS_NEEDING_ROTATION AS (
         -- Calculate days remaining until expiry
         DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) as DAYS_UNTIL_EXPIRY
     FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
-    WHERE CERTIFICATE_ARN LIKE '%ARN:AWS:ACM%'
+    WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%'
     -- Only include certificates expiring within next 30 days but not yet expired
     AND DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) <= 30
     AND DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) > 0
@@ -31,7 +31,7 @@ RECENT_ROTATIONS AS (
         NOT_VALID_AFTER_UTC_TIMESTAMP,
         LAST_USAGE_OBSERVATION_UTC_TIMESTAMP
     FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
-    WHERE CERTIFICATE_ARN LIKE '%ARN:AWS:ACM%'
+    WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%'
     -- Only include certificates created in last 3 days
     AND DATE(NOT_VALID_BEFORE_UTC_TIMESTAMP) >= DATEADD(day, -3, CURRENT_DATE())
     -- Take most recent certificate for each ARN
@@ -69,14 +69,14 @@ SELECT
         WHEN ROTATION_STATUS = 'Certificates are being actively rotated' THEN 'GREEN'
         ELSE 'RED'
     END as COMPLIANCE_STATUS,
-    CERTS_RECENTLY_ROTATED as NUMERATOR,
-    GREATEST(CERTS_NEEDING_ROTATION, 1) as DENOMINATOR
+    CASE 
+        WHEN ROTATION_STATUS IN ('No certificates currently need rotation', 'Certificates are being actively rotated') THEN 1
+        ELSE 0
+    END as NUMERATOR,
+    1 as DENOMINATOR
 FROM ROTATION_METRICS;
 
 -- Tier 0 Supporting Evidence Query
--- This query provides detailed information about certificates needing rotation
-
--- First CTE: Get certificates needing rotation
 WITH CERTS_NEEDING_ROTATION AS (
     SELECT 
         Certificate_ARN,
@@ -86,13 +86,11 @@ WITH CERTS_NEEDING_ROTATION AS (
         DATEDIFF(day, NOT_VALID_BEFORE_UTC_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) as CERT_VALIDITY_DAYS,
         DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) as DAYS_UNTIL_EXPIRY
     FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
-    WHERE CERTIFICATE_ARN LIKE '%ARN:AWS:ACM%'
+    WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%'
     AND DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) <= 30
     AND DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) > 0
     QUALIFY ROW_NUMBER() OVER (PARTITION BY Certificate_ARN ORDER BY LAST_USAGE_OBSERVATION_UTC_TIMESTAMP DESC) = 1
 ),
-
--- Second CTE: Get recently rotated certificates
 RECENT_ROTATIONS AS (
     SELECT 
         Certificate_ARN,
@@ -100,13 +98,26 @@ RECENT_ROTATIONS AS (
         NOT_VALID_AFTER_UTC_TIMESTAMP,
         LAST_USAGE_OBSERVATION_UTC_TIMESTAMP
     FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
-    WHERE CERTIFICATE_ARN LIKE '%ARN:AWS:ACM%'
+    WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%'
     AND DATE(NOT_VALID_BEFORE_UTC_TIMESTAMP) >= DATEADD(day, -3, CURRENT_DATE())
     QUALIFY ROW_NUMBER() OVER (PARTITION BY Certificate_ARN ORDER BY NOT_VALID_BEFORE_UTC_TIMESTAMP DESC) = 1
+),
+ROTATION_SUMMARY AS (
+    SELECT
+        COUNT(DISTINCT CNR.Certificate_ARN) as CERTS_NEEDING_ROTATION,
+        COUNT(DISTINCT RR.Certificate_ARN) as CERTS_RECENTLY_ROTATED,
+        MAX(CNR.LAST_USAGE_OBSERVATION_UTC_TIMESTAMP) as LAST_OBSERVATION_TIME,
+        MIN(CNR.DAYS_UNTIL_EXPIRY) as NEAREST_EXPIRATION_DAYS
+    FROM CERTS_NEEDING_ROTATION CNR
+    LEFT JOIN RECENT_ROTATIONS RR ON CNR.Certificate_ARN = RR.Certificate_ARN
 )
-
--- Final output with detailed certificate information
 SELECT
+    -- Summary Section
+    RS.CERTS_NEEDING_ROTATION as "Total Certificates Needing Rotation",
+    RS.CERTS_RECENTLY_ROTATED as "Certificates Rotated (Last 3 Days)",
+    RS.LAST_OBSERVATION_TIME as "Last Certificate Observation Time",
+    RS.NEAREST_EXPIRATION_DAYS as "Days Until Next Certificate Expiration",
+    -- Detailed Certificate Status
     CNR.Certificate_ARN,
     CNR.DAYS_UNTIL_EXPIRY,
     CNR.CERT_VALIDITY_DAYS,
@@ -115,7 +126,15 @@ SELECT
         ELSE 'Pending Rotation'
     END as ROTATION_STATUS,
     CNR.NOT_VALID_AFTER_UTC_TIMESTAMP as EXPIRATION_DATE,
-    RR.NOT_VALID_BEFORE_UTC_TIMESTAMP as NEW_CERT_START_DATE
+    RR.NOT_VALID_BEFORE_UTC_TIMESTAMP as NEW_CERT_START_DATE,
+    CASE
+        WHEN CNR.DAYS_UNTIL_EXPIRY <= 7 THEN 'Critical'
+        WHEN CNR.DAYS_UNTIL_EXPIRY <= 14 THEN 'High'
+        ELSE 'Medium'
+    END as PRIORITY
 FROM CERTS_NEEDING_ROTATION CNR
 LEFT JOIN RECENT_ROTATIONS RR ON CNR.Certificate_ARN = RR.Certificate_ARN
-ORDER BY CNR.DAYS_UNTIL_EXPIRY ASC;
+CROSS JOIN ROTATION_SUMMARY RS
+ORDER BY 
+    CNR.DAYS_UNTIL_EXPIRY ASC,
+    ROTATION_STATUS DESC;
