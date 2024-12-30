@@ -1,66 +1,121 @@
--- Tier 1 (Completeness) Main Query
-WITH LATEST_SCAN_DATE AS (
-    SELECT MAX(METRIC_DATE) AS MOST_RECENT_SCAN_DATE
-    FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
-),
-METRIC_CALCULATION AS (
-    SELECT
-        LSD.MOST_RECENT_SCAN_DATE AS DATE,
-        CURRENT_DATE() AS CURRENT_DATE,
-        COALESCE(
-            CAST(SUM(TOTAL_BUCKETS_SCANNED_BY_MACIE) AS FLOAT) /
-            NULLIF(CAST(SUM(TOTAL_CLOUDFRONTED_BUCKETS) AS FLOAT), 0),
-            0
-        ) AS TIER_1_METRIC,
-        CASE 
-            WHEN LSD.MOST_RECENT_SCAN_DATE = CURRENT_DATE() THEN TRUE 
-            ELSE FALSE 
-        END AS IS_CURRENT
-    FROM LATEST_SCAN_DATE LSD
-    LEFT JOIN CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3 MMV 
-        ON MMV.METRIC_DATE = LSD.MOST_RECENT_SCAN_DATE
-    GROUP BY 
-        LSD.MOST_RECENT_SCAN_DATE,
-        CURRENT_DATE()
-)
-SELECT
-    DATE,
-    'MNTR-1079134-T1' AS MONITORING_METRIC_NUMBER,
-    ROUND(TIER_1_METRIC * 100, 2) AS MONITORING_METRIC,
-    CASE 
-        WHEN NOT IS_CURRENT THEN 'RED'
-        WHEN TIER_1_METRIC >= 0.9 THEN 'GREEN'
-        WHEN TIER_1_METRIC >= 0.8 THEN 'YELLOW'
-        ELSE 'RED'
-    END AS COMPLIANCE_STATUS
-FROM METRIC_CALCULATION;
+-- Tier 0 (Heartbeat) Main Query: Monitor certificate rotation compliance
+-- This query identifies certificates needing rotation and checks if they are being actively rotated
 
--- Tier 1 Supporting Evidence Query
-WITH LATEST_SCAN_DATE AS (
-    SELECT MAX(METRIC_DATE) AS MOST_RECENT_SCAN_DATE
-    FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+-- First CTE: Identify certificates that need rotation based on expiration criteria
+WITH CERTS_NEEDING_ROTATION AS (
+    SELECT 
+        Certificate_ARN,
+        NOT_VALID_BEFORE_UTC_TIMESTAMP,
+        NOT_VALID_AFTER_UTC_TIMESTAMP,
+        LAST_USAGE_OBSERVATION_UTC_TIMESTAMP,
+        -- Calculate total validity period in days
+        DATEDIFF(day, NOT_VALID_BEFORE_UTC_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) as CERT_VALIDITY_DAYS,
+        -- Calculate days remaining until expiry
+        DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) as DAYS_UNTIL_EXPIRY
+    FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
+    WHERE CERTIFICATE_ARN LIKE '%ARN:AWS:ACM%'
+    -- Only include certificates expiring within next 30 days but not yet expired
+    AND DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) <= 30
+    AND DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) > 0
+    -- Only include ~1 year certificates (350-380 days)
+    AND DATEDIFF(day, NOT_VALID_BEFORE_UTC_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) BETWEEN 350 AND 380
+    -- Take most recent observation for each certificate
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY Certificate_ARN ORDER BY LAST_USAGE_OBSERVATION_UTC_TIMESTAMP DESC) = 1
 ),
-SCAN_INFO AS (
+
+-- Second CTE: Identify certificates that were recently rotated
+RECENT_ROTATIONS AS (
+    SELECT 
+        Certificate_ARN,
+        NOT_VALID_BEFORE_UTC_TIMESTAMP,
+        NOT_VALID_AFTER_UTC_TIMESTAMP,
+        LAST_USAGE_OBSERVATION_UTC_TIMESTAMP
+    FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
+    WHERE CERTIFICATE_ARN LIKE '%ARN:AWS:ACM%'
+    -- Only include certificates created in last 3 days
+    AND DATE(NOT_VALID_BEFORE_UTC_TIMESTAMP) >= DATEADD(day, -3, CURRENT_DATE())
+    -- Take most recent certificate for each ARN
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY Certificate_ARN ORDER BY NOT_VALID_BEFORE_UTC_TIMESTAMP DESC) = 1
+),
+
+-- Third CTE: Calculate rotation metrics by comparing certificates needing rotation vs recently rotated
+ROTATION_METRICS AS (
     SELECT
-        COALESCE(SUM(MMV.TOTAL_BUCKETS_SCANNED_BY_MACIE), 0) AS SCANNED_BUCKETS,
-        COALESCE(SUM(MMV.TOTAL_CLOUDFRONTED_BUCKETS), 0) AS TOTAL_BUCKETS,
-        LSD.MOST_RECENT_SCAN_DATE AS SCAN_DATE_USED,
-        CURRENT_DATE() AS CURRENT_DATE,
+        COUNT(CNR.Certificate_ARN) as CERTS_NEEDING_ROTATION,
+        COUNT(RR.Certificate_ARN) as CERTS_RECENTLY_ROTATED,
+        -- Determine overall rotation status
         CASE 
-            WHEN LSD.MOST_RECENT_SCAN_DATE = CURRENT_DATE() THEN 'Current'
-            ELSE 'Not Current'
-        END AS SCAN_STATUS
-    FROM LATEST_SCAN_DATE LSD
-    LEFT JOIN CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3 MMV 
-        ON MMV.METRIC_DATE = LSD.MOST_RECENT_SCAN_DATE
-    GROUP BY 
-        LSD.MOST_RECENT_SCAN_DATE,
-        CURRENT_DATE()
+            WHEN COUNT(CNR.Certificate_ARN) = 0 THEN 'No certificates currently need rotation'
+            WHEN COUNT(RR.Certificate_ARN) > 0 THEN 'Certificates are being actively rotated'
+            ELSE 'Certificates need rotation but none rotated recently'
+        END as ROTATION_STATUS
+    FROM CERTS_NEEDING_ROTATION CNR
+    LEFT JOIN RECENT_ROTATIONS RR ON CNR.Certificate_ARN = RR.Certificate_ARN
 )
+
+-- Final output with compliance status
 SELECT
-    SCANNED_BUCKETS,
-    TOTAL_BUCKETS,
-    ROUND(100.0 * SCANNED_BUCKETS / NULLIF(TOTAL_BUCKETS, 0), 2) AS SCAN_PERCENTAGE,
-    SCAN_DATE_USED,
-    SCAN_STATUS
-FROM SCAN_INFO;
+    CURRENT_DATE() as DATE,
+    'MNTR-1077188-T0' as MONITORING_METRIC_NUMBER,
+    -- Binary metric: 1 if compliant, 0 if not
+    CASE 
+        WHEN ROTATION_STATUS = 'No certificates currently need rotation' THEN 1
+        WHEN ROTATION_STATUS = 'Certificates are being actively rotated' THEN 1
+        ELSE 0
+    END as MONITORING_METRIC,
+    -- Compliance status based on rotation status
+    CASE 
+        WHEN ROTATION_STATUS = 'No certificates currently need rotation' THEN 'GREEN'
+        WHEN ROTATION_STATUS = 'Certificates are being actively rotated' THEN 'GREEN'
+        ELSE 'RED'
+    END as COMPLIANCE_STATUS,
+    CERTS_RECENTLY_ROTATED as NUMERATOR,
+    GREATEST(CERTS_NEEDING_ROTATION, 1) as DENOMINATOR
+FROM ROTATION_METRICS;
+
+-- Tier 0 Supporting Evidence Query
+-- This query provides detailed information about certificates needing rotation
+
+-- First CTE: Get certificates needing rotation
+WITH CERTS_NEEDING_ROTATION AS (
+    SELECT 
+        Certificate_ARN,
+        NOT_VALID_BEFORE_UTC_TIMESTAMP,
+        NOT_VALID_AFTER_UTC_TIMESTAMP,
+        LAST_USAGE_OBSERVATION_UTC_TIMESTAMP,
+        DATEDIFF(day, NOT_VALID_BEFORE_UTC_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) as CERT_VALIDITY_DAYS,
+        DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) as DAYS_UNTIL_EXPIRY
+    FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
+    WHERE CERTIFICATE_ARN LIKE '%ARN:AWS:ACM%'
+    AND DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) <= 30
+    AND DATEDIFF(day, CURRENT_TIMESTAMP, NOT_VALID_AFTER_UTC_TIMESTAMP) > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY Certificate_ARN ORDER BY LAST_USAGE_OBSERVATION_UTC_TIMESTAMP DESC) = 1
+),
+
+-- Second CTE: Get recently rotated certificates
+RECENT_ROTATIONS AS (
+    SELECT 
+        Certificate_ARN,
+        NOT_VALID_BEFORE_UTC_TIMESTAMP,
+        NOT_VALID_AFTER_UTC_TIMESTAMP,
+        LAST_USAGE_OBSERVATION_UTC_TIMESTAMP
+    FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
+    WHERE CERTIFICATE_ARN LIKE '%ARN:AWS:ACM%'
+    AND DATE(NOT_VALID_BEFORE_UTC_TIMESTAMP) >= DATEADD(day, -3, CURRENT_DATE())
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY Certificate_ARN ORDER BY NOT_VALID_BEFORE_UTC_TIMESTAMP DESC) = 1
+)
+
+-- Final output with detailed certificate information
+SELECT
+    CNR.Certificate_ARN,
+    CNR.DAYS_UNTIL_EXPIRY,
+    CNR.CERT_VALIDITY_DAYS,
+    CASE 
+        WHEN RR.Certificate_ARN IS NOT NULL THEN 'Recently Rotated'
+        ELSE 'Pending Rotation'
+    END as ROTATION_STATUS,
+    CNR.NOT_VALID_AFTER_UTC_TIMESTAMP as EXPIRATION_DATE,
+    RR.NOT_VALID_BEFORE_UTC_TIMESTAMP as NEW_CERT_START_DATE
+FROM CERTS_NEEDING_ROTATION CNR
+LEFT JOIN RECENT_ROTATIONS RR ON CNR.Certificate_ARN = RR.Certificate_ARN
+ORDER BY CNR.DAYS_UNTIL_EXPIRY ASC;
