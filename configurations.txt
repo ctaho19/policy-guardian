@@ -1,10 +1,45 @@
-For these low-coverage accounts, I'd like to know:
-Region Distribution:
-Are all the roles in the 'global' region, or are they spread across different regions?
-If in multiple regions, is the coverage consistently low across all regions?
-Role Type Patterns:
-Are we seeing only 'MACHINE' roles, or are there other role types ('N/A', '', etc.) for these accounts?
-If multiple role types exist, how does their coverage compare?
-Data Consistency:
-Are there any unusual patterns in how INVENTORY_COUNT relates to TOTAL_EVALUATIONS_COUNT?
-Are there any NULL values or unexpected values in any fields?
+WITH MachineRoleStats AS (
+    SELECT 
+        ACCOUNT_NUMBER,
+        ASV,
+        REGION,
+        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS,
+        SUM(INVENTORY_COUNT) as INVENTORY_COUNT,
+        COUNT(*) as RESOURCE_COUNT,
+        ROUND(SUM(TOTAL_EVALUATIONS_COUNT) * 100.0 / NULLIF(SUM(INVENTORY_COUNT), 0), 2) as COVERAGE_PERCENTAGE
+    FROM (
+        SELECT *, 
+               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
+        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
+        WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
+        AND CLOUD_PROVIDER = 'AWS'
+        AND ROLE_TYPE = 'MACHINE'
+        AND RESOURCE_TYPE = 'AWS::IAM::Role'
+        AND INVENTORY_COUNT > 0
+    ) a
+    WHERE rank = 1
+    GROUP BY ACCOUNT_NUMBER, ASV, REGION
+)
+SELECT 
+    COVERAGE_RANGE,
+    COUNT(*) as COUNT_IN_RANGE,
+    SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
+    SUM(TOTAL_EVALUATIONS) as TOTAL_EVALUATIONS,
+    ROUND(AVG(COVERAGE_PERCENTAGE), 2) as AVG_COVERAGE_IN_RANGE
+FROM (
+    SELECT *,
+           CASE 
+               WHEN COVERAGE_PERCENTAGE < 20 THEN '0-20%'
+               WHEN COVERAGE_PERCENTAGE < 40 THEN '20-40%'
+               WHEN COVERAGE_PERCENTAGE < 60 THEN '40-60%'
+               WHEN COVERAGE_PERCENTAGE < 80 THEN '60-80%'
+               ELSE '80-100%'
+           END as COVERAGE_RANGE
+    FROM MachineRoleStats
+)
+GROUP BY COVERAGE_RANGE
+ORDER BY COVERAGE_RANGE;
+
+1. How are the resources distributed across the coverage ranges?
+2. Is there a correlation between inventory size and coverage range?
+3. Are most resources in the lower ranges or is it more evenly distributed?
