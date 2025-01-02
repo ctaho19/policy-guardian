@@ -1,13 +1,9 @@
-WITH RoleClassification AS (
+WITH TotalCounts AS (
+    -- Get total counts across all IAM roles
     SELECT 
-        ROLE_TYPE,
-        ASV,
-        ACCOUNT_NUMBER,
-        REGION,
-        INVENTORY_COUNT,
-        TOTAL_EVALUATIONS_COUNT,
-        ROUND(TOTAL_EVALUATIONS_COUNT * 100.0 / NULLIF(INVENTORY_COUNT, 0), 2) as COVERAGE_PERCENTAGE,
-        ROW_NUMBER() OVER (PARTITION BY ASV ORDER BY INVENTORY_COUNT DESC) as INV_RANK
+        'ALL_ROLES' as CATEGORY,
+        SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
+        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS
     FROM (
         SELECT *, 
                ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
@@ -18,30 +14,50 @@ WITH RoleClassification AS (
         AND INVENTORY_COUNT > 0
     ) a
     WHERE rank = 1
+),
+RoleTypeCounts AS (
+    -- Get sums by role type
+    SELECT 
+        'BY_ROLE_TYPE' as CATEGORY,
+        SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
+        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS
+    FROM (
+        SELECT *, 
+               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
+        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
+        WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
+        AND CLOUD_PROVIDER = 'AWS'
+        AND RESOURCE_TYPE = 'AWS::IAM::Role'
+        AND INVENTORY_COUNT > 0
+    ) a
+    WHERE rank = 1
+),
+DetailedRoleTypes AS (
+    -- Break down by each role type
+    SELECT 
+        ROLE_TYPE,
+        SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
+        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS
+    FROM (
+        SELECT *, 
+               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
+        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
+        WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
+        AND CLOUD_PROVIDER = 'AWS'
+        AND RESOURCE_TYPE = 'AWS::IAM::Role'
+        AND INVENTORY_COUNT > 0
+    ) a
+    WHERE rank = 1
+    GROUP BY ROLE_TYPE
 )
-SELECT 
-    ASV,
-    STRING_AGG(DISTINCT ROLE_TYPE, ', ') as ROLE_TYPES,
-    COUNT(DISTINCT ROLE_TYPE) as NUM_ROLE_TYPES,
-    COUNT(DISTINCT ACCOUNT_NUMBER) as NUM_ACCOUNTS,
-    SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
-    SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS,
-    ROUND(AVG(COVERAGE_PERCENTAGE), 2) as AVG_COVERAGE
-FROM RoleClassification
-GROUP BY ASV
-HAVING COUNT(DISTINCT ROLE_TYPE) > 1  -- ASVs with multiple role types
-ORDER BY TOTAL_INVENTORY DESC;
 
- Role Type Mixing Analysis:
-How many ASVs have both 'N/A' and 'MACHINE' classifications?
-What percentage of total ASVs have multiple role type classifications?
-Which role type combinations appear most frequently?
-Inventory and Coverage Impact:
-For ASVs with multiple role types:
-What is their total inventory count?
-What is their average coverage percentage?
-How many accounts are these ASVs present in?
-High-Impact ASVs:
-Which ASVs in the top 20 (by total inventory) have multiple role types?
-Do these high-inventory ASVs correspond to the ones we previously identified with low coverage?
-How many distinct role types do these high-inventory ASVs have?
+SELECT * FROM TotalCounts
+UNION ALL
+SELECT * FROM RoleTypeCounts
+UNION ALL
+SELECT 
+    ROLE_TYPE as CATEGORY,
+    TOTAL_INVENTORY,
+    TOTAL_EVALUATIONS
+FROM DetailedRoleTypes
+ORDER BY CATEGORY;
