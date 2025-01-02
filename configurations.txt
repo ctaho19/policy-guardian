@@ -1,31 +1,31 @@
-WITH LowCoverageDetails AS (
+WITH ASVComparison AS (
     SELECT 
-        ACCOUNT_NUMBER,
         ASV,
+        ROLE_TYPE,
         REGION,
-        INVENTORY_COUNT,
-        TOTAL_EVALUATIONS_COUNT,
-        ROUND(TOTAL_EVALUATIONS_COUNT * 100.0 / NULLIF(INVENTORY_COUNT, 0), 2) as COVERAGE_PERCENTAGE
+        COUNT(*) as RESOURCE_COUNT,
+        SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
+        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS,
+        ROUND(SUM(TOTAL_EVALUATIONS_COUNT) * 100.0 / NULLIF(SUM(INVENTORY_COUNT), 0), 2) as COVERAGE_PERCENTAGE
     FROM (
         SELECT *, 
                ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
         FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
         WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
         AND CLOUD_PROVIDER = 'AWS'
-        AND ROLE_TYPE = 'MACHINE'
         AND RESOURCE_TYPE = 'AWS::IAM::Role'
-        AND INVENTORY_COUNT > 0
+        AND ASV IN ('ASVCLOUDCI', 'ASVWANDA', 'ASVNEWREL', 'ASVCOEPCL', 'ASVCLOUDJA', 'ASVXXX')
     ) a
     WHERE rank = 1
-    AND (TOTAL_EVALUATIONS_COUNT * 100.0 / NULLIF(INVENTORY_COUNT, 0)) < 20
+    GROUP BY ASV, ROLE_TYPE, REGION
 )
 SELECT *
-FROM LowCoverageDetails
-ORDER BY INVENTORY_COUNT DESC;
+FROM ASVComparison
+ORDER BY ASV, COVERAGE_PERCENTAGE ASC;
 
+Could you run this and tell me:
+Do these ASVs have better coverage when they're not machine roles?
+Do they have better coverage in non-global regions?
+Is the inventory-to-evaluation ratio consistent across all instances of these ASVs?
 
-For these worst-performing resources (0-20% coverage with high inventory counts), could you tell me:
-Are they concentrated in specific regions?
-Are there any patterns in the ASV names?
-What's the typical ratio between INVENTORY_COUNT and TOTAL_EVALUATIONS_COUNT for these resources?
 
