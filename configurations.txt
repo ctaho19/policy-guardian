@@ -1,14 +1,10 @@
-SELECT 
-    ACCOUNT_NUMBER,
-    ASV,
-    REGION,
-    ROLE_TYPE,
-    INVENTORY_COUNT,
-    TOTAL_EVALUATIONS_COUNT,
-    ROUND(TOTAL_EVALUATIONS_COUNT * 100.0 / NULLIF(INVENTORY_COUNT, 0), 2) as COVERAGE_PERCENTAGE
-FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
-AND CLOUD_PROVIDER = 'AWS'
-AND RESOURCE_TYPE = 'AWS::IAM::Role'
-AND ACCOUNT_NUMBER IN ('123456789012', '123456789013', '123456789014')
-ORDER BY COVERAGE_PERCENTAGE ASC;
+For these low-coverage accounts, I'd like to know:
+Region Distribution:
+Are all the roles in the 'global' region, or are they spread across different regions?
+If in multiple regions, is the coverage consistently low across all regions?
+Role Type Patterns:
+Are we seeing only 'MACHINE' roles, or are there other role types ('N/A', '', etc.) for these accounts?
+If multiple role types exist, how does their coverage compare?
+Data Consistency:
+Are there any unusual patterns in how INVENTORY_COUNT relates to TOTAL_EVALUATIONS_COUNT?
+Are there any NULL values or unexpected values in any fields?
