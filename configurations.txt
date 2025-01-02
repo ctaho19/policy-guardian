@@ -1,17 +1,14 @@
-Based on this data , can you answer the following questions?
-
-
-1. For the low-coverage accounts (the ones with 1.15%, 2.63%, and 2.94%):
-What are their inventory_count values typically like?
-What are their total_evaluations typically like?
-Are they consistently low across all their ASVs?
-For the high-ASV accounts:
-Is there a pattern where certain ASVs consistently have better/worse coverage?
-Do you see any patterns in the ASV names (if visible) that might indicate why some have better coverage than others?
-Are there any ASVs with unusually high inventory_counts compared to others?
-For both groups:
-Are there any notable differences in how the inventory_count vs total_evaluations ratio looks between the two groups?
-Do you see any patterns in the coverage percentages? (e.g., are they clustered around certain values, or spread evenly?)
-
-Low Coverage Accounts:
-High ASV Accounts:
+SELECT 
+    ACCOUNT_NUMBER,
+    ASV,
+    REGION,
+    ROLE_TYPE,
+    INVENTORY_COUNT,
+    TOTAL_EVALUATIONS_COUNT,
+    ROUND(TOTAL_EVALUATIONS_COUNT * 100.0 / NULLIF(INVENTORY_COUNT, 0), 2) as COVERAGE_PERCENTAGE
+FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
+WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
+AND CLOUD_PROVIDER = 'AWS'
+AND RESOURCE_TYPE = 'AWS::IAM::Role'
+AND ACCOUNT_NUMBER IN ('123456789012', '123456789013', '123456789014')
+ORDER BY COVERAGE_PERCENTAGE ASC;
