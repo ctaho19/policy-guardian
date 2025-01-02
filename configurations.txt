@@ -32,6 +32,16 @@ GROUP BY ASV
 HAVING COUNT(DISTINCT ROLE_TYPE) > 1  -- ASVs with multiple role types
 ORDER BY TOTAL_INVENTORY DESC;
 
-Are there ASVs that appear under both N/A and other role types?
-For ASVs with multiple role types, how does the coverage compare?
-Are the high-inventory, low-coverage cases we found earlier showing up with multiple role classifications?
+ Role Type Mixing Analysis:
+How many ASVs have both 'N/A' and 'MACHINE' classifications?
+What percentage of total ASVs have multiple role type classifications?
+Which role type combinations appear most frequently?
+Inventory and Coverage Impact:
+For ASVs with multiple role types:
+What is their total inventory count?
+What is their average coverage percentage?
+How many accounts are these ASVs present in?
+High-Impact ASVs:
+Which ASVs in the top 20 (by total inventory) have multiple role types?
+Do these high-inventory ASVs correspond to the ones we previously identified with low coverage?
+How many distinct role types do these high-inventory ASVs have?
