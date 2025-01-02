@@ -1,12 +1,11 @@
-WITH MachineRoleStats AS (
+WITH LowCoverageDetails AS (
     SELECT 
         ACCOUNT_NUMBER,
         ASV,
         REGION,
-        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS,
-        SUM(INVENTORY_COUNT) as INVENTORY_COUNT,
-        COUNT(*) as RESOURCE_COUNT,
-        ROUND(SUM(TOTAL_EVALUATIONS_COUNT) * 100.0 / NULLIF(SUM(INVENTORY_COUNT), 0), 2) as COVERAGE_PERCENTAGE
+        INVENTORY_COUNT,
+        TOTAL_EVALUATIONS_COUNT,
+        ROUND(TOTAL_EVALUATIONS_COUNT * 100.0 / NULLIF(INVENTORY_COUNT, 0), 2) as COVERAGE_PERCENTAGE
     FROM (
         SELECT *, 
                ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
@@ -18,28 +17,15 @@ WITH MachineRoleStats AS (
         AND INVENTORY_COUNT > 0
     ) a
     WHERE rank = 1
-    GROUP BY ACCOUNT_NUMBER, ASV, REGION
+    AND (TOTAL_EVALUATIONS_COUNT * 100.0 / NULLIF(INVENTORY_COUNT, 0)) < 20
 )
-SELECT 
-    COVERAGE_RANGE,
-    COUNT(*) as COUNT_IN_RANGE,
-    SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
-    SUM(TOTAL_EVALUATIONS) as TOTAL_EVALUATIONS,
-    ROUND(AVG(COVERAGE_PERCENTAGE), 2) as AVG_COVERAGE_IN_RANGE
-FROM (
-    SELECT *,
-           CASE 
-               WHEN COVERAGE_PERCENTAGE < 20 THEN '0-20%'
-               WHEN COVERAGE_PERCENTAGE < 40 THEN '20-40%'
-               WHEN COVERAGE_PERCENTAGE < 60 THEN '40-60%'
-               WHEN COVERAGE_PERCENTAGE < 80 THEN '60-80%'
-               ELSE '80-100%'
-           END as COVERAGE_RANGE
-    FROM MachineRoleStats
-)
-GROUP BY COVERAGE_RANGE
-ORDER BY COVERAGE_RANGE;
+SELECT *
+FROM LowCoverageDetails
+ORDER BY INVENTORY_COUNT DESC;
 
-1. How are the resources distributed across the coverage ranges?
-2. Is there a correlation between inventory size and coverage range?
-3. Are most resources in the lower ranges or is it more evenly distributed?
+
+For these worst-performing resources (0-20% coverage with high inventory counts), could you tell me:
+Are they concentrated in specific regions?
+Are there any patterns in the ASV names?
+What's the typical ratio between INVENTORY_COUNT and TOTAL_EVALUATIONS_COUNT for these resources?
+
