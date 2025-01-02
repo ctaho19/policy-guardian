@@ -1,126 +1,82 @@
--- Query to analyze coverage metrics across different role types
-WITH RoleTypeStats AS (
-    -- Calculate aggregated metrics for each role type
+-- Tier 1 (Coverage) Metric: What percentage of machine roles are being evaluated?
+
+
+-- Query 1: Tier 1 Metric & Compliance Status
+WITH LATEST_BATCH AS (
+    -- Get the most recent batch ID from the dataset
+    SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
+),
+COVERAGE_STATS AS (
+    -- Calculate aggregated totals for resources and evaluations
     SELECT 
-        ROLE_TYPE,
-        SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
-        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS
+        SUM(INVENTORY_COUNT) AS TOTAL_RESOURCES,      -- Total number of resources that should be evaluated
+        SUM(TOTAL_EVALUATIONS_COUNT) AS EVALUATED_RESOURCES  -- Total number of resources actually evaluated
     FROM (
-        -- Get the most recent record for each unique resource
+        -- Subquery to get the most recent record for each unique resource
         SELECT *, 
-               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE 
-                                 ORDER BY BATCH_ID DESC) AS RANK
-        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-        WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
-        AND RESOURCE_TYPE = 'AWS::IAM::Role'  -- Filter for IAM roles only
-        AND INVENTORY_COUNT > 0  -- Exclude resources with no inventory
+               -- Rank records by batch ID to get most recent
+               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
+        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4 TC
+        WHERE BATCH_ID = (SELECT * FROM LATEST_BATCH)
+        AND CLOUD_PROVIDER = 'AWS'                    -- Filter for AWS resources only
+        AND RESOURCE_TYPE = 'AWS::IAM::Role'         -- Looking at IAM roles specifically
+        AND ROLE_TYPE = 'MACHINE'                     -- Filter for machine roles only
+        AND INVENTORY_COUNT > 0                       -- Exclude resources with no inventory
+        -- Filter for specific regions we monitor
+        AND LOWER(REGION) IN ('ca-central-1', 'eu-west-1', 'eu-west-2', 'us-east-1', 'us-east-2', 'us-west-2', 'global')
     ) a
-    WHERE rank = 1  -- Take only the most recent record
-    GROUP BY ROLE_TYPE
+    WHERE rank = 1  -- Take only the most recent record for each resource
 )
--- Calculate final metrics including coverage percentage
+-- Final output for the metric
 SELECT 
-    ROLE_TYPE,
-    TOTAL_INVENTORY,
-    TOTAL_EVALUATIONS,
-    -- Calculate coverage as a percentage, handling division by zero
-    ROUND(TOTAL_EVALUATIONS * 100.0 / NULLIF(TOTAL_INVENTORY, 0), 2) as COVERAGE_PERCENTAGE
-FROM RoleTypeStats
-ORDER BY COVERAGE_PERCENTAGE DESC;
+    CURRENT_DATE() AS DATE,                          -- Current date for the metric
+    'MNTR-MACHINE-ROLES-T1' AS MONITORING_METRIC_NUMBER,  -- Unique identifier for this metric
+    -- Calculate coverage percentage, rounded to 2 decimal places
+    ROUND(100.0 * EVALUATED_RESOURCES / NULLIF(TOTAL_RESOURCES, 0), 2) AS MONITORING_METRIC,
+    -- Determine compliance status based on coverage
+    CASE 
+        WHEN (EVALUATED_RESOURCES >= TOTAL_RESOURCES) THEN 'GREEN'
+        ELSE 'RED'
+    END AS COMPLIANCE_STATUS,
+    -- Number of resources evaluated (numerator)
+    TO_DOUBLE(ROUND(EVALUATED_RESOURCES, 2)) AS NUMERATOR,
+    -- Total number of resources that should be evaluated (denominator)
+    TO_DOUBLE(ROUND(TOTAL_RESOURCES, 2)) AS DENOMINATOR
+FROM COVERAGE_STATS;
 
-
--- Query to compare coverage between MACHINE and N/A roles within each ASV
-WITH ASVCoverage AS (
-    -- Calculate coverage metrics for each ASV and role type combination
+-- Query 2: Supporting Data - Provides detailed breakdown by ASV
+WITH COVERAGE_DETAILS AS (
+    -- Calculate coverage metrics for each ASV
     SELECT 
         ASV,
-        ROLE_TYPE,
-        SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,
-        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS,
-        -- Calculate coverage percentage for each group
-        ROUND(SUM(TOTAL_EVALUATIONS_COUNT) * 100.0 / NULLIF(SUM(INVENTORY_COUNT), 0), 2) as COVERAGE_PERCENTAGE
+        SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,      -- Total resources per ASV
+        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS,  -- Total evaluations per ASV
+        -- Calculate coverage percentage per ASV
+        ROUND(100.0 * SUM(TOTAL_EVALUATIONS_COUNT) / NULLIF(SUM(INVENTORY_COUNT), 0), 2) as COVERAGE_PERCENTAGE
     FROM (
-        -- Get most recent records
+        -- Subquery to get most recent records
         SELECT *, 
-               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE 
-                                 ORDER BY BATCH_ID DESC) AS RANK
+               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
         FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
         WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
-        AND RESOURCE_TYPE = 'AWS::IAM::Role'
-        AND ROLE_TYPE IN ('MACHINE', 'N/A')  -- Only compare these two role types
-        AND INVENTORY_COUNT > 0
-    ) a
-    WHERE rank = 1
-    GROUP BY ASV, ROLE_TYPE
-)
--- Pivot the data to show MACHINE and N/A coverage side by side
-SELECT 
-    c1.ASV,
-    -- Get MACHINE role coverage
-    MAX(CASE WHEN c1.ROLE_TYPE = 'MACHINE' THEN c1.COVERAGE_PERCENTAGE END) as MACHINE_COVERAGE,
-    -- Get N/A role coverage
-    MAX(CASE WHEN c1.ROLE_TYPE = 'N/A' THEN c1.COVERAGE_PERCENTAGE END) as NA_COVERAGE,
-    -- Calculate the difference in coverage
-    MAX(CASE WHEN c1.ROLE_TYPE = 'N/A' THEN c1.COVERAGE_PERCENTAGE END) - 
-    MAX(CASE WHEN c1.ROLE_TYPE = 'MACHINE' THEN c1.COVERAGE_PERCENTAGE END) as DELTA
-FROM ASVCoverage c1
--- Only include ASVs where N/A roles have 100% coverage
-WHERE EXISTS (
-    SELECT 1 FROM ASVCoverage c2 
-    WHERE c2.ASV = c1.ASV 
-    AND c2.ROLE_TYPE = 'N/A'
-    AND c2.COVERAGE_PERCENTAGE = 100
-)
-GROUP BY c1.ASV
-ORDER BY DELTA DESC
-LIMIT 10;
-
-
--- Query to analyze the distribution of coverage across different ranges for MACHINE roles
-WITH MachineRoleStats AS (
-    -- Calculate coverage metrics for each unique combination
-    SELECT 
-        ACCOUNT_NUMBER,
-        ASV,
-        REGION,
-        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS,
-        SUM(INVENTORY_COUNT) as INVENTORY_COUNT,
-        -- Calculate coverage percentage
-        ROUND(SUM(TOTAL_EVALUATIONS_COUNT) * 100.0 / NULLIF(SUM(INVENTORY_COUNT), 0), 2) as COVERAGE_PERCENTAGE
-    FROM (
-        -- Get most recent records
-        SELECT *, 
-               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE 
-                                 ORDER BY BATCH_ID DESC) AS RANK
-        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-        WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
+        AND CLOUD_PROVIDER = 'AWS'
         AND RESOURCE_TYPE = 'AWS::IAM::Role'
         AND ROLE_TYPE = 'MACHINE'
         AND INVENTORY_COUNT > 0
+        AND LOWER(REGION) IN ('ca-central-1', 'eu-west-1', 'eu-west-2', 'us-east-1', 'us-east-2', 'us-west-2', 'global')
     ) a
     WHERE rank = 1
-    GROUP BY ACCOUNT_NUMBER, ASV, REGION
+    GROUP BY ASV
 )
--- Group the results into coverage ranges
+-- Final output showing detailed breakdown by ASV
 SELECT 
-    -- Define coverage ranges
-    CASE 
-        WHEN COVERAGE_PERCENTAGE < 20 THEN '0-20%'
-        WHEN COVERAGE_PERCENTAGE < 40 THEN '20-40%'
-        WHEN COVERAGE_PERCENTAGE < 60 THEN '40-60%'
-        WHEN COVERAGE_PERCENTAGE < 80 THEN '60-80%'
-        ELSE '80-100%'
-    END as COVERAGE_RANGE,
-    COUNT(*) as COUNT,  -- Number of resources in each range
-    SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,  -- Total inventory in each range
-    ROUND(AVG(COVERAGE_PERCENTAGE), 2) as AVG_COVERAGE  -- Average coverage in each range
-FROM MachineRoleStats
-GROUP BY 
-    CASE 
-        WHEN COVERAGE_PERCENTAGE < 20 THEN '0-20%'
-        WHEN COVERAGE_PERCENTAGE < 40 THEN '20-40%'
-        WHEN COVERAGE_PERCENTAGE < 60 THEN '40-60%'
-        WHEN COVERAGE_PERCENTAGE < 80 THEN '60-80%'
-        ELSE '80-100%'
-    END
-ORDER BY COVERAGE_RANGE;
+    ASV,                                -- Application Service Version
+    TOTAL_INVENTORY,                    -- Total resources for this ASV
+    TOTAL_EVALUATIONS,                  -- Total evaluations completed for this ASV
+    COVERAGE_PERCENTAGE,                -- Coverage percentage for this ASV
+    CASE                               -- Compliance status for this ASV
+        WHEN COVERAGE_PERCENTAGE >= 100 THEN 'GREEN'
+        ELSE 'RED'
+    END AS STATUS
+FROM COVERAGE_DETAILS
+ORDER BY COVERAGE_PERCENTAGE DESC;      -- Sort by coverage percentage in descending order
