@@ -1,82 +1,115 @@
--- Tier 1 (Coverage) Metric: What percentage of machine roles are being evaluated?
 
-
--- Query 1: Tier 1 Metric & Compliance Status
-WITH LATEST_BATCH AS (
-    -- Get the most recent batch ID from the dataset
-    SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-),
-COVERAGE_STATS AS (
-    -- Calculate aggregated totals for resources and evaluations
     SELECT 
-        SUM(INVENTORY_COUNT) AS TOTAL_RESOURCES,      -- Total number of resources that should be evaluated
-        SUM(TOTAL_EVALUATIONS_COUNT) AS EVALUATED_RESOURCES  -- Total number of resources actually evaluated
-    FROM (
-        -- Subquery to get the most recent record for each unique resource
-        SELECT *, 
-               -- Rank records by batch ID to get most recent
-               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
-        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4 TC
-        WHERE BATCH_ID = (SELECT * FROM LATEST_BATCH)
-        AND CLOUD_PROVIDER = 'AWS'                    -- Filter for AWS resources only
-        AND RESOURCE_TYPE = 'AWS::IAM::Role'         -- Looking at IAM roles specifically
-        AND ROLE_TYPE = 'MACHINE'                     -- Filter for machine roles only
-        AND INVENTORY_COUNT > 0                       -- Exclude resources with no inventory
-        -- Filter for specific regions we monitor
-        AND LOWER(REGION) IN ('ca-central-1', 'eu-west-1', 'eu-west-2', 'us-east-1', 'us-east-2', 'us-west-2', 'global')
-    ) a
-    WHERE rank = 1  -- Take only the most recent record for each resource
+        METRIC_DATE,
+        SF_LOAD_TIMESTAMP,
+        -- Consider scan current if timestamp is from today or yesterday
+        CASE 
+            WHEN DATE(SF_LOAD_TIMESTAMP) >= DATEADD(DAY, -1, CURRENT_DATE()) THEN TRUE 
+            ELSE FALSE 
+        END AS IS_CURRENT,
+        TOTAL_BUCKETS_SCANNED_BY_MACIE AS BUCKETS_SCANNED
+    FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+    -- Get the row with the most recent load timestamp
+    WHERE SF_LOAD_TIMESTAMP = (
+        SELECT MAX(SF_LOAD_TIMESTAMP) 
+        FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+    )
 )
--- Final output for the metric
 SELECT 
-    CURRENT_DATE() AS DATE,                          -- Current date for the metric
-    'MNTR-MACHINE-ROLES-T1' AS MONITORING_METRIC_NUMBER,  -- Unique identifier for this metric
-    -- Calculate coverage percentage, rounded to 2 decimal places
-    ROUND(100.0 * EVALUATED_RESOURCES / NULLIF(TOTAL_RESOURCES, 0), 2) AS MONITORING_METRIC,
-    -- Determine compliance status based on coverage
+    CURRENT_DATE() AS DATE,
+    'MNTR-1079134-T0' AS MONITORING_METRIC_NUMBER,
     CASE 
-        WHEN (EVALUATED_RESOURCES >= TOTAL_RESOURCES) THEN 'GREEN'
+        WHEN IS_CURRENT = TRUE AND BUCKETS_SCANNED > 0 THEN 1
+        ELSE 0
+    END AS MONITORING_METRIC,
+    CASE 
+        WHEN IS_CURRENT = TRUE AND BUCKETS_SCANNED > 0 THEN 'GREEN'
         ELSE 'RED'
     END AS COMPLIANCE_STATUS,
-    -- Number of resources evaluated (numerator)
-    TO_DOUBLE(ROUND(EVALUATED_RESOURCES, 2)) AS NUMERATOR,
-    -- Total number of resources that should be evaluated (denominator)
-    TO_DOUBLE(ROUND(TOTAL_RESOURCES, 2)) AS DENOMINATOR
-FROM COVERAGE_STATS;
+    BUCKETS_SCANNED AS NUMERATOR,
+    1 AS DENOMINATOR
+FROM LATEST_SCAN_INFO;
 
--- Query 2: Supporting Data - Provides detailed breakdown by ASV
-WITH COVERAGE_DETAILS AS (
-    -- Calculate coverage metrics for each ASV
-    SELECT 
-        ASV,
-        SUM(INVENTORY_COUNT) as TOTAL_INVENTORY,      -- Total resources per ASV
-        SUM(TOTAL_EVALUATIONS_COUNT) as TOTAL_EVALUATIONS,  -- Total evaluations per ASV
-        -- Calculate coverage percentage per ASV
-        ROUND(100.0 * SUM(TOTAL_EVALUATIONS_COUNT) / NULLIF(SUM(INVENTORY_COUNT), 0), 2) as COVERAGE_PERCENTAGE
-    FROM (
-        -- Subquery to get most recent records
-        SELECT *, 
-               ROW_NUMBER() OVER (PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE ORDER BY BATCH_ID DESC) AS RANK
-        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-        WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
-        AND CLOUD_PROVIDER = 'AWS'
-        AND RESOURCE_TYPE = 'AWS::IAM::Role'
-        AND ROLE_TYPE = 'MACHINE'
-        AND INVENTORY_COUNT > 0
-        AND LOWER(REGION) IN ('ca-central-1', 'eu-west-1', 'eu-west-2', 'us-east-1', 'us-east-2', 'us-west-2', 'global')
-    ) a
-    WHERE rank = 1
-    GROUP BY ASV
+-- Tier 0 Supporting Evidence
+WITH LATEST_SCAN_INFO AS (
+    SELECT
+        METRIC_DATE,
+        SF_LOAD_TIMESTAMP,
+        TOTAL_BUCKETS_SCANNED_BY_MACIE AS TOTAL_SCANNED_BUCKETS,
+        CASE 
+            WHEN DATE(SF_LOAD_TIMESTAMP) >= DATEADD(DAY, -1, CURRENT_DATE()) THEN 'Current'
+            ELSE 'Not Current'
+        END AS SCAN_STATUS
+    FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+    WHERE SF_LOAD_TIMESTAMP = (
+        SELECT MAX(SF_LOAD_TIMESTAMP) 
+        FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+    )
 )
--- Final output showing detailed breakdown by ASV
-SELECT 
-    ASV,                                -- Application Service Version
-    TOTAL_INVENTORY,                    -- Total resources for this ASV
-    TOTAL_EVALUATIONS,                  -- Total evaluations completed for this ASV
-    COVERAGE_PERCENTAGE,                -- Coverage percentage for this ASV
-    CASE                               -- Compliance status for this ASV
-        WHEN COVERAGE_PERCENTAGE >= 100 THEN 'GREEN'
+SELECT
+    TOTAL_SCANNED_BUCKETS,
+    METRIC_DATE AS SCAN_DATE_USED,
+    SF_LOAD_TIMESTAMP AS LAST_UPDATED,
+    SCAN_STATUS
+FROM LATEST_SCAN_INFO;
+
+-- Tier 1 (Completeness) Main Query
+WITH LATEST_SCAN_INFO AS (
+    SELECT 
+        METRIC_DATE,
+        SF_LOAD_TIMESTAMP,
+        TOTAL_BUCKETS_SCANNED_BY_MACIE,
+        TOTAL_CLOUDFRONTED_BUCKETS,
+        CASE 
+            WHEN DATE(SF_LOAD_TIMESTAMP) >= DATEADD(DAY, -1, CURRENT_DATE()) THEN TRUE 
+            ELSE FALSE 
+        END AS IS_CURRENT
+    FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+    WHERE SF_LOAD_TIMESTAMP = (
+        SELECT MAX(SF_LOAD_TIMESTAMP) 
+        FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+    )
+)
+SELECT
+    CURRENT_DATE() AS DATE,
+    'MNTR-1079134-T1' AS MONITORING_METRIC_NUMBER,
+    CASE 
+        WHEN IS_CURRENT THEN 
+            ROUND(100.0 * TOTAL_BUCKETS_SCANNED_BY_MACIE / NULLIF(TOTAL_CLOUDFRONTED_BUCKETS, 0), 2)
+        ELSE 0
+    END AS MONITORING_METRIC,
+    CASE 
+        WHEN NOT IS_CURRENT THEN 'RED'
+        WHEN (TOTAL_BUCKETS_SCANNED_BY_MACIE / NULLIF(TOTAL_CLOUDFRONTED_BUCKETS, 0)) >= 0.9 THEN 'GREEN'
+        WHEN (TOTAL_BUCKETS_SCANNED_BY_MACIE / NULLIF(TOTAL_CLOUDFRONTED_BUCKETS, 0)) >= 0.8 THEN 'YELLOW'
         ELSE 'RED'
-    END AS STATUS
-FROM COVERAGE_DETAILS
-ORDER BY COVERAGE_PERCENTAGE DESC;      -- Sort by coverage percentage in descending order
+    END AS COMPLIANCE_STATUS,
+    TOTAL_BUCKETS_SCANNED_BY_MACIE AS NUMERATOR,
+    TOTAL_CLOUDFRONTED_BUCKETS AS DENOMINATOR
+FROM LATEST_SCAN_INFO;
+
+-- Tier 1 Supporting Evidence
+WITH LATEST_SCAN_INFO AS (
+    SELECT
+        METRIC_DATE,
+        SF_LOAD_TIMESTAMP,
+        TOTAL_BUCKETS_SCANNED_BY_MACIE AS SCANNED_BUCKETS,
+        TOTAL_CLOUDFRONTED_BUCKETS AS TOTAL_BUCKETS,
+        CASE 
+            WHEN DATE(SF_LOAD_TIMESTAMP) >= DATEADD(DAY, -1, CURRENT_DATE()) THEN 'Current'
+            ELSE 'Not Current'
+        END AS SCAN_STATUS
+    FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+    WHERE SF_LOAD_TIMESTAMP = (
+        SELECT MAX(SF_LOAD_TIMESTAMP) 
+        FROM CYBR_DB.PHDP_CYBR.MACIE_METRICS_V3
+    )
+)
+SELECT
+    SCANNED_BUCKETS,
+    TOTAL_BUCKETS,
+    ROUND(100.0 * SCANNED_BUCKETS / NULLIF(TOTAL_BUCKETS, 0), 2) AS SCAN_PERCENTAGE,
+    METRIC_DATE AS SCAN_DATE_USED,
+    SF_LOAD_TIMESTAMP AS LAST_UPDATED,
+    SCAN_STATUS
+FROM LATEST_SCAN_INFO;
