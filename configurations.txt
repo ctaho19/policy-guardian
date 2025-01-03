@@ -1,22 +1,28 @@
+-- Supporting Evidence Query for Tier 2
+-- CTE to gather all non-compliant resources and their details
 WITH NON_COMPLIANT_RESOURCES AS (
     SELECT 
-        nc.ACCOUNT_ID,
-        nc.REGION,
-        nc.RESOURCE_TYPE,
-        nc.RESOURCE_ID,
-        nc.CONTROL_ID,
-        nc.OPEN_DATE_UTC_TIMESTAMP,
+        nc.ACCOUNT_ID,                                    -- AWS Account identifier
+        nc.REGION,                                        -- AWS Region
+        nc.RESOURCE_TYPE,                                 -- Type of AWS resource
+        nc.RESOURCE_ID,                                   -- Unique resource identifier
+        nc.CONTROL_ID,                                    -- Control being evaluated
+        nc.OPEN_DATE_UTC_TIMESTAMP,                       -- When non-compliance was first detected
+        -- Calculate how many days the resource has been non-compliant
         DATEDIFF('days', nc.OPEN_DATE_UTC_TIMESTAMP, CURRENT_DATE) as DAYS_OPEN
     FROM CLCN_DB.PHDP_CLOUD.OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01 nc
-    WHERE nc.CONTROL_ID = 'AC-3.AWS.30.v02'
-    AND nc.ID NOT IN (
+    WHERE nc.CONTROL_ID = 'AC-3.AWS.30.v02'              -- Filter for specific control
+    AND nc.ID NOT IN (                                   -- Exclude resolved/closed cases
         SELECT ID 
         FROM CLCN_DB.PHDP_CLOUD.OZONE_CLOSED_NON_COMPLIANT_RESOURCES_V04
     )
 )
+-- Return either list of non-compliant resources or a "no results" message
 SELECT CASE 
+    -- If non-compliant resources exist, return them ordered by days open
     WHEN EXISTS (SELECT 1 FROM NON_COMPLIANT_RESOURCES) THEN
         (SELECT * FROM NON_COMPLIANT_RESOURCES ORDER BY DAYS_OPEN DESC)
+    -- If no non-compliant resources found, return a single row with nulls and message
     ELSE
         SELECT 
             'No non-compliant resources found' as ACCOUNT_ID,
