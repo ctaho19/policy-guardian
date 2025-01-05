@@ -1,0 +1,51 @@
+-- Tier 1 Supporting Evidence Query
+-- First query: Get all certificates with missing expiration dates
+-- Retrieves detailed certificate information for ACM certificates that are missing expiration timestamps
+-- and were issued within the last year
+SELECT
+    CERTIFICATE_ID,
+    CERTIFICATE_ASV,
+    NOMINAL_ISSUER,
+    SERIAL_NUMBER, 
+    NOT_VALID_AFTER_UTC_TIMESTAMP,
+    RESOURCE_TYPE,
+    IP,
+    PORT,
+    ORIG_USAGE_OBSERVATION_UTC_TIMESTAMP,
+    LAST_USAGE_OBSERVATION_UTC_TIMESTAMP,
+    TECH_EXEC,
+    BUSINESS_EXEC,
+    ENGINEERING_LEAD,
+    LOB
+FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
+WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%'
+AND NOT_VALID_ATER_UTC_TIMESTAMP IS NULL
+AND NOT_VALID_ATER_UTC_TIMESTAMP > DATEADD('DAY', -365, CURRENT_TIMESTAMP)
+
+UNION ALL
+
+-- Second query: Return a single row with message if no certificates are missing expiration dates
+-- Acts as a default message when the first query returns no results
+SELECT
+    'ALL ACM CERTIIFCATES CURRENTLY MAINTAIN AN EXPIRATION DATE' AS CERTIFICATE_ID,
+    NULL AS CERTIFICATE_ASV,
+    NULL AS NOMINAL_ISSUER,
+    NULL AS SERIAL_NUMBER,
+    NULL AS NOT_VALID_AFTER_UTC_TIMESTAMP,
+    NULL AS RESOURCE_TYPE,
+    NULL AS IP,
+    NULL AS PORT,
+    NULL AS ORIG_USAGE_OBSERVATION_UTC_TIMESTAMP,
+    NULL AS LAST_USAGE_OBSERVATION_UTC_TIMESTAMP,
+    NULL AS TECH_EXEC,
+    NULL AS BUSINESS_EXEC,
+    NULL AS ENGINEERING_LEAD,
+    NULL AS LOB
+WHERE NOT EXISTS (
+    -- Subquery to check if any certificates are missing expiration dates
+    SELECT 1
+    FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
+    WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%'
+    AND NOT_VALID_ATER_UTC_TIMESTAMP IS NULL
+    AND NOT_VALID_ATER_UTC_TIMESTAMP > DATEADD('DAY', -365, CURRENT_TIMESTAMP)
+);
