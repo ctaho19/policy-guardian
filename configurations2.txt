@@ -1,87 +1,36 @@
--- Tier 1 Query
-WITH LATEST_TIMESTAMP AS (
-    -- Get the most recent data load timestamp to ensure fresh data
-    SELECT MAX(SF_LOAD_TIMESTAMP) AS LATEST_TS
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-),
-RANKRECORDS AS (
-    -- Get the latest records and rank them to avoid duplicates
-    -- We rank by account/region/ASV/resource_type to get the most recent record for each combination
-    SELECT 
-        *,
-        ROW_NUMBER() OVER (
-            PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE 
-            ORDER BY BATCH_ID DESC
-        ) AS RANK
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    WHERE BATCH_ID = (
-        -- Only look at the most recent batch
-        SELECT MAX(BATCH_ID) 
-        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    )
-    AND SF_LOAD_TIMESTAMP = (SELECT LATEST_TS FROM LATEST_TIMESTAMP)
-    AND CONTROL_ID = '<your_control_id>'
-    AND INVENTORY_COUNT >= 0  -- Exclude negative inventory counts which indicate errors
-),
-RESOURCE_COUNTS AS (
-    -- Calculate total resources and how many were evaluated
-    -- LEAST function ensures evaluated count cannot exceed inventory count
-    SELECT 
-        SUM(INVENTORY_COUNT) AS TOTAL_RESOURCES,
-        SUM(LEAST(EVALUATED_COUNT, INVENTORY_COUNT)) AS EVALUATED_RESOURCES
-    FROM RANKRECORDS
-    WHERE RANK = 1  -- Only use the most recent record for each combination
-)
-
--- Calculate final metric and determine compliance status
-SELECT 
-    CURRENT_DATE AS DATE,
-    'MNTR-XXXXX-T1' AS MONITORING_METRIC_NUMBER,
-    -- Calculate percentage of resources evaluated
-    ROUND(100.0 * EVALUATED_RESOURCES / NULLIF(TOTAL_RESOURCES, 0), 2) AS MONITORING_METRIC,
-    -- Determine status based on evaluation coverage
-    CASE 
-        WHEN (EVALUATED_RESOURCES / NULLIF(TOTAL_RESOURCES, 0)) >= 0.9 THEN 'GREEN'   -- 90% or more evaluated
-        WHEN (EVALUATED_RESOURCES / NULLIF(TOTAL_RESOURCES, 0)) >= 0.8 THEN 'YELLOW'  -- 80-89% evaluated
-        ELSE 'RED'                                                                     -- Less than 80% evaluated
-    END AS COMPLIANCE_STATUS
-FROM RESOURCE_COUNTS;
-
--- Tier 2 Query
-WITH LATEST_INVENTORY AS (
-    -- Get the total number of resources from most recent QER data
-    SELECT SUM(TOTAL_EVALUATIONS_COUNT) AS TOTAL_RESOURCES
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    WHERE BATCH_ID = (
-        SELECT MAX(BATCH_ID) 
-        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    )
-    AND CONTROL_ID = '<your_control_id>'
-),
-
-NON_COMPLIANT_RESOURCES AS (
-    -- Count currently non-compliant resources
-    -- Excludes resources that have been marked as closed/remediated
-    SELECT COUNT(DISTINCT ID) AS NON_COMPLIANT_COUNT
-    FROM CLCN_DB.PHDP_CLOUD.ozone_non_compliant_resource_history_v07_V2
-    WHERE CONTROL_ID = '<your_control_id>'
-    AND ID NOT IN (
-        SELECT ID FROM CLCN_DB.PHDP_CLOUD.OZONE_CLOSED_NON_COMPLIANT_RESOURCES_V04
-    )
-)
-
--- Calculate final compliance rate and determine status
-SELECT 
-    CURRENT_DATE AS DATE,
-    'MNTR-XXXXX-T2' AS MONITORING_METRIC_NUMBER,
-    -- Calculate percentage of compliant resources
-    ROUND(100.0 * (TOTAL_RESOURCES - NON_COMPLIANT_COUNT) / 
-        NULLIF(TOTAL_RESOURCES, 0), 2) AS MONITORING_METRIC,
-    -- Determine status based on compliance percentage
-    CASE 
-        WHEN ((TOTAL_RESOURCES - NON_COMPLIANT_COUNT) / NULLIF(TOTAL_RESOURCES, 0)) >= 0.95 THEN 'GREEN'   -- 95% or more compliant
-        WHEN ((TOTAL_RESOURCES - NON_COMPLIANT_COUNT) / NULLIF(TOTAL_RESOURCES, 0)) >= 0.90 THEN 'YELLOW'  -- 90-94% compliant
-        ELSE 'RED'                                                                                          -- Less than 90% compliant
-    END AS COMPLIANCE_STATUS
-FROM LATEST_INVENTORY, NON_COMPLIANT_RESOURCES;
-
+Work Items & Deliverables
+Monitoring Procedures for JIRA 1105727 (Assigned 1/24):
+Despite two dedicated meetings (1/28 and 1/29) to review requirements and answer questions, the contractor failed to document key details during the initial walkthrough.
+Procedures were largely drafted by senior team members (Chris/Kevin), with specific revisions clearly outlined. The contractor did not proactively seek clarification or engage in problem-solving, despite explicit instructions in JIRA comments to communicate questions.
+JIRA Tickets 1077128 & 1076435:
+No progress made on either ticket despite multiple hour-long meetings to review procedures.
+Required extensive hand-holding for basic tasks (e.g., executing VLOOKUP functions, navigating JIRA comments, interpreting platform-specific feedback). Senior team members ultimately completed the work to meet deadlines.
+---
+Performance Observations
+Attendance & Communication:
+Repeated tardiness and absence without prior notice (e.g., 1/17 CMT S1 meeting, 1/29 late login).
+Delayed responses on Slack and failure to notify the team of schedule changes, impacting collaboration.
+Technical Competency:
+Struggles with foundational tools critical to the role (JIRA, G-Suite, Slack).
+Inability to independently troubleshoot basic technical issues, despite repeated training (e.g., accessing ControlsHub, reviewing email notifications).
+Initiative & Problem-Solving:
+Relies excessively on step-by-step guidance for repetitive tasks, even after detailed walkthroughs.
+Fails to document or reference prior instructions, resulting in redundant questions and stalled progress.
+Minimal evidence of independent research or effort to resolve blockers between check-ins.
+---
+Key Concerns
+Communication Gaps:
+Consistent failure to proactively flag challenges, delays, or knowledge gaps.
+Over-reliance on team members to initiate progress updates, creating workflow inefficiencies.
+Role-Specific Skills:
+Inability to retain or apply training on core platforms/tools, raising concerns about scalability as role complexity increases.
+Limited technical aptitude for data analysis (e.g., Excel functions) and task management (e.g., JIRA navigation).
+Ownership & Accountability:
+Repeatedly requires re-explanation of tasks, indicating a lack of engagement with provided resources.
+Fails to follow through on action items without direct oversight, delaying project timelines.
+---
+Recommendation
+Based on the contractor’s performance during the onboarding period, there are significant concerns regarding their suitability for this role. The role demands a high degree of autonomy, technical proficiency, and proactive communication—competencies that have not been demonstrated consistently.
+Suggested Next Steps:
+Formalize a 30-day performance improvement plan (PIP) with clear benchmarks for communication, task ownership, and tool proficiency.
+If no measurable progress is observed within the PIP window, consider terminating the contract to minimize further project delays and team resource strain.
