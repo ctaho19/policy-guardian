@@ -1,97 +1,71 @@
--- Control Scope Check
-SELECT 
-    'CM-2.AWS.12.v02' AS CONTROL_ID,
-    APPLICABLE_AWS_ROLE_TYPES AS APPLIES_TO,
+-- Query 1: Check for mixed Role_Types within BA/Account combinations
+
+WITH MACHINE_BA_ACCOUNT AS (
+    SELECT DISTINCT ASV AS BA, ACCOUNT_NUMBER
+    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
+    WHERE ROLE_TYPE = 'MACHINE'
+      AND RESOURCE_TYPE = 'AWS::IAM::Role'
+),
+
+IAM_ROLES_WITH_VIOLATIONS AS (
+    SELECT iam.RESOURCE_ID, iam.BA, iam.ACCOUNT, viol.ROLE_TYPE
+    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE iam
+    LEFT JOIN EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 viol
+        ON iam.AMAZON_RESOURCE_NAME = viol.RESOURCE_NAME
+       AND viol.CONTROL_ID = 'CM-2.AWS.12.v02'
+    WHERE iam.TYPE = 'role'
+)
+
+SELECT DISTINCT iam.BA, iam.ACCOUNT, viol.ROLE_TYPE
+FROM IAM_ROLES_WITH_VIOLATIONS iam
+JOIN MACHINE_BA_ACCOUNT mba
+    ON iam.BA = mba.BA AND iam.ACCOUNT = mba.ACCOUNT_NUMBER
+WHERE viol.ROLE_TYPE IS NOT NULL
+ORDER BY iam.BA, iam.ACCOUNT, viol.ROLE_TYPE;
+
+-- Query 2: Check the distribution of Role_Types in the Violations dataset
+
+SELECT viol.ROLE_TYPE, COUNT(*) AS ROLE_COUNT
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 viol
+WHERE viol.CONTROL_ID = 'CM-2.AWS.12.v02'
+GROUP BY viol.ROLE_TYPE
+ORDER BY ROLE_COUNT DESC;
+
+
+-- Query 3: Identify BAs present in IAM_RESOURCES but missing in OZONE_DATA
+
+SELECT DISTINCT iam.BA
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE iam
+WHERE iam.TYPE = 'role'
+EXCEPT
+SELECT DISTINCT ASV
+FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4;
+
+-- Query 4: Compare the freshness of data between OZONE_DATA and IAM_RESOURCES
+
+-- Get the latest BATCH_ID from OZONE_DATA
+SELECT MAX(BATCH_ID) AS LATEST_OZONE_BATCH_ID
+FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4;
+
+-- Get the latest UPDATE_DATE from IAM_RESOURCES
+SELECT MAX(UPDATE_DATE) AS LATEST_IAM_UPDATE_DATE
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+WHERE TYPE = 'role';
+
+-- Query 5: Retrieve the APPLICABLE_AWS_ROLE_TYPES for the control from the metadata
+
+SELECT
+    CONTROL_ID,
+    APPLICABLE_AWS_ROLE_TYPES,
     CONTROL_DESCRIPTION
 FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROL_METADATA_STREAM_1_V2
 WHERE CONTROL_ID = 'CM-2.AWS.12.v02';
 
 
--- True Machine Roles
-WITH MACHINE_DEPARTMENTS AS (
-    SELECT DISTINCT 
-        ACCOUNT_NUMBER, 
-        ASV AS BA 
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    WHERE ROLE_TYPE = 'MACHINE'
-    AND RESOURCE_TYPE = 'AWS::IAM::Role'
-    AND BATCH_ID = '202502041005' -- Your latest batch
-)
+-- Query 6: Check if there are roles with the same BA and Account but different types
 
-SELECT COUNT(*) AS TRUE_TOTAL_ROLES
+SELECT iam.BA, iam.ACCOUNT, iam.TYPE, COUNT(*) AS ROLE_COUNT
 FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE iam
-JOIN MACHINE_DEPARTMENTS dept
-    ON iam.ACCOUNT = dept.ACCOUNT_NUMBER
-    AND iam.BA = dept.BA
-WHERE iam.TYPE = 'role';
-
--- Unevaluated Roles
-WITH MACHINE_ROLES AS (
-    SELECT AMAZON_RESOURCE_NAME
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE iam
-    JOIN CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4 ozone
-        ON iam.BA = ozone.ASV
-        AND iam.ACCOUNT = ozone.ACCOUNT_NUMBER
-    WHERE ozone.ROLE_TYPE = 'MACHINE'
-    AND ozone.BATCH_ID = '202502041005'
-),
-
-EVALUATED_ROLES AS (
-    SELECT DISTINCT RESOURCE_NAME
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
-    WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
-)
-
-SELECT 
-    mr.AMAZON_RESOURCE_NAME AS UNEVALUATED_ROLE,
-    iam.BA AS DEPARTMENT,
-    iam.ACCOUNT
-FROM MACHINE_ROLES mr
-LEFT JOIN EVALUATED_ROLES er
-    ON mr.AMAZON_RESOURCE_NAME = er.RESOURCE_NAME
-JOIN EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE iam
-    ON mr.AMAZON_RESOURCE_NAME = iam.AMAZON_RESOURCE_NAME
-WHERE er.RESOURCE_NAME IS NULL;
-
-graph TD
-    A[Control Metadata] -->|Defines Scope| B[Tier 1 Metric]
-    A -->|Applies To| C[Violation Records]
-    B -->|Uses| D[OZONE Quarterly Data]
-    C -->|Evaluates| E[IAM Resources]
-    D -->|Maps BA/Account| E
-    E -->|Ground Truth| F[True Count]
-    F -->|Compare| B
-    C -->|Compare| F
-
-    style A fill:#f9f,stroke:#333
-    style B fill:#cff,stroke:#333
-    style C fill:#fbb,stroke:#333
-    style D fill:#9f9,stroke:#333
-    style E fill:#fc3,stroke:#333
-    style F fill:#f96,stroke:#333
-
-
-Key Relationships
-1. Control Metadata (Purple)
-Defines which roles should be evaluated (MACHINE)
-Acts as the "rulebook"
-2. Tier 1 Metric (Light Blue)
-Uses aggregated OZONE data (Green)
-Must align with Control Metadata's scope
-3. OZONE Data (Green)
-Maps departments (BA) and accounts to role types
-Provides denominator (total roles)
-4. IAM Resources (Orange)
-Ground truth of actual roles
-Connected via BA/account mapping
-5. Violation Records (Red)
-Proof of evaluations
-Must cover all in-scope IAM resources
-6. True Count (Peach)
-Final validation point
-Compares OZONE vs IAM vs Violations
-Validation Flow
-1. Start with Control Metadata to understand rules
-2. Check OZONE data against IAM resources (True Count)
-3. Verify Violation Records cover all True Count roles
-4. Compare results to Tier 1 Metric
+WHERE iam.TYPE = 'role'
+GROUP BY iam.BA, iam.ACCOUNT, iam.TYPE
+ORDER BY ROLE_COUNT DESC;
