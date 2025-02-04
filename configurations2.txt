@@ -16,12 +16,12 @@ IAM_ROLES_WITH_VIOLATIONS AS (
     WHERE iam.TYPE = 'role'
 )
 
-SELECT DISTINCT iam.BA, iam.ACCOUNT, viol.ROLE_TYPE
+SELECT DISTINCT iam.BA, iam.ACCOUNT, iam.ROLE_TYPE
 FROM IAM_ROLES_WITH_VIOLATIONS iam
 JOIN MACHINE_BA_ACCOUNT mba
     ON iam.BA = mba.BA AND iam.ACCOUNT = mba.ACCOUNT_NUMBER
-WHERE viol.ROLE_TYPE IS NOT NULL
-ORDER BY iam.BA, iam.ACCOUNT, viol.ROLE_TYPE;
+WHERE iam.ROLE_TYPE IS NOT NULL
+ORDER BY iam.BA, iam.ACCOUNT, iam.ROLE_TYPE;
 
 -- Query 2: Check the distribution of Role_Types in the Violations dataset
 
