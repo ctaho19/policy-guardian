@@ -1,1 +1,115 @@
 
+-- After identifying specific BA/Account combinations with large differences,
+-- use this to see the actual roles in IAM_RESOURCES:
+
+WITH SIGNIFICANT_DIFFERENCE AS (
+    -- Use a specific BA/Account combination identified from Step 3
+    SELECT 'YOUR_BA_HERE' AS BA, 'YOUR_ACCOUNT_HERE' AS ACCOUNT_NUMBER
+)
+
+SELECT 
+    iam.RESOURCE_ID,
+    iam.AMAZON_RESOURCE_NAME,
+    iam.BA,
+    iam.ACCOUNT,
+    viol.ROLE_TYPE
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE iam
+LEFT JOIN EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 viol
+    ON iam.AMAZON_RESOURCE_NAME = viol.RESOURCE_NAME
+    AND viol.CONTROL_ID = 'CM-2.AWS.12.v02'
+WHERE iam.BA = (SELECT BA FROM SIGNIFICANT_DIFFERENCE)
+AND iam.ACCOUNT = (SELECT ACCOUNT_NUMBER FROM SIGNIFICANT_DIFFERENCE)
+AND iam.TYPE = 'role'
+ORDER BY iam.AMAZON_RESOURCE_NAME;
+
+Prompt for GitHub Copilot:
+---
+Title: Analyzing Discrepancies in Counts of Machine IAM Roles Between OZONE and IAM Resources Datasets
+Background:
+I am working on a data analysis project involving two datasets to validate the count of Machine IAM Roles and ensure the accuracy of our Tier 1 compliance metric. Below are the details of the datasets and the objectives:
+OZONE Data:
+Purpose: Provides aggregated counts of cloud resources at the Business Application (BA) and Account level.
+Key Fields:
+ASV (Application Service Version): Equivalent to BA.
+ACCOUNT_NUMBER: Cloud account number.
+ROLE_TYPE: Type of role (MACHINE, HUMAN, etc.).
+INVENTORY_COUNT: Total number of resources.
+EVALUATIONS_COUNT: Number of resources evaluated for compliance.
+Notes: Used in calculating the Tier 1 compliance metric.
+IAM Resources:
+Purpose: Contains detailed information about IAM resources.
+Key Fields:
+RESOURCE_ID: Unique identifier for each IAM resource.
+AMAZON_RESOURCE_NAME (ARN): Amazon Resource Name of the IAM resource.
+BA: Business Application.
+ACCOUNT: Cloud account number.
+TYPE: Type of IAM resource (role, user, etc.).
+Notes: Used to get detailed counts of IAM roles.
+Objective:
+Goal: Compare counts of Machine IAM Roles between the OZONE and IAM Resources datasets at the BA and Account level.
+Validate the total number of Machine IAM Roles (denominator of the Tier 1 metric).
+Compare the number of evaluated Machine IAM Roles (numerator of the Tier 1 metric).
+Identify discrepancies between the datasets to understand root causes.
+Current Phase:
+I have executed a SQL query that aggregates counts from both datasets and compares them. Here's what I've done:
+Aggregated OZONE Data:
+Grouped by BA and Account.
+Calculated OZONE_TOTAL (sum of INVENTORY_COUNT for Machine roles).
+Calculated OZONE_EVALUATED (sum of EVALUATIONS_COUNT for Machine roles).
+Aggregated IAM Resources Data:
+Grouped by BA and Account.
+Counted distinct RESOURCE_IDs of type 'role' to get IAM_COUNT.
+Comparison Output:
+Merged both summaries to produce a table containing:
+BA
+ACCOUNT
+OZONE_TOTAL
+OZONE_EVALUATED
+IAM_COUNT
+COMPARISON_RESULT (indicates if OZONE_TOTAL is higher, IAM_COUNT is higher, or counts are equal)
+COUNT_DIFFERENCE (absolute difference between OZONE_TOTAL and IAM_COUNT)
+Issue:
+There are significant discrepancies between OZONE_TOTAL and IAM_COUNT in many BA/Account combinations.
+In the query output, COMPARISON_RESULT is rarely 'EQUAL', and sometimes either OZONE_TOTAL, OZONE_EVALUATED, or IAM_COUNT is NULL.
+This suggests that some BA/Account combinations are present in one dataset but not the other.
+It's unexpected that an ASV (BA)/Account would be present in OZONE but not in IAM Resources, or vice versa.
+Goal:
+Analyze the query output to identify patterns or reasons for discrepancies.
+Investigate BA/Account combinations with the largest differences.
+Determine if discrepancies are due to:
+Missing data in one of the datasets.
+Misclassification of role types.
+Data ingestion or synchronization issues.
+Identify next steps to reconcile these differences and validate our Tier 1 metric.
+Next Steps:
+Analyze the Query Output:
+Examine the BA/Account combinations where COUNT_DIFFERENCE is significant.
+Note any patterns or commonalities (e.g., certain BAs, accounts, regions).
+Investigate Specific BA/Account Combinations:
+For BA/Account combinations with large discrepancies, extract detailed role information from the IAM Resources dataset.
+Use the following SQL query as a starting point:
+;
+Replace 'BA_VALUE' and 'ACCOUNT_NUMBER_VALUE' with the actual BA and Account Number.
+Compare Detailed Role Data:
+Determine which roles exist in IAM Resources but not in OZONE, and vice versa.
+Check if roles have the correct ROLE_TYPE classification.
+Identify any roles present in IAM Resources that are missing in the compliance evaluations.
+Identify Root Causes:
+Possible causes might include:
+Roles not properly classified as 'MACHINE' in one dataset.
+Time lags between data refresh cycles causing synchronization issues.
+Data ingestion errors or omissions.
+Recommend Actions:
+Suggest steps to resolve discrepancies, such as:
+Updating data ingestion processes.
+Ensuring consistent classification rules across datasets.
+Coordinating data refresh schedules.
+Attached Files:
+Query Output File: Contains the comparison of OZONE and IAM counts at the BA and Account level as described above.
+Request:
+Analyze the Query Output:
+Identify BA/Account combinations with significant discrepancies.
+Provide possible explanations for these discrepancies based on the data.
+Recommend Next Steps:
+Suggest strategies to investigate and resolve the differences.
+Advise on how to validate our Tier 1 metric successfully.
