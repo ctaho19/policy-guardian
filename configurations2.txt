@@ -1,81 +1,99 @@
-WITH OZONE_SUMMARY AS (
-    SELECT 
-        ASV AS BA,
-        ACCOUNT_NUMBER,
-        SUM(CASE 
-            WHEN ROLE_TYPE = 'MACHINE' 
-            AND RESOURCE_TYPE = 'AWS::IAM::Role' 
-            AND INVENTORY_COUNT > 0
-            AND CLOUD_PROVIDER = 'AWS'
-            AND REGION = 'us-east-1'
-            AND BATCH_ID = (
-                SELECT MAX(BATCH_ID) 
-                FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-            )
-            THEN INVENTORY_COUNT 
-            ELSE 0 
-        END) AS TOTAL_RESOURCES,
-        SUM(CASE 
-            WHEN ROLE_TYPE = 'MACHINE' 
-            AND RESOURCE_TYPE = 'AWS::IAM::Role' 
-            AND INVENTORY_COUNT > 0
-            AND CLOUD_PROVIDER = 'AWS'
-            AND REGION = 'us-east-1'
-            AND BATCH_ID = (
-                SELECT MAX(BATCH_ID) 
-                FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-            )
-            THEN EVALUATIONS_COUNT 
-            ELSE 0 
-        END) AS EVALUATED_RESOURCES
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    WHERE ROLE_TYPE = 'MACHINE'
-    AND RESOURCE_TYPE = 'AWS::IAM::Role'
-    AND CLOUD_PROVIDER = 'AWS'
-    AND CLOUD_REGION = 'us-east-1'
-    AND BATCH_ID = (
-        SELECT MAX(BATCH_ID) 
-        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    )
-    GROUP BY ASV, ACCOUNT_NUMBER
-),
-IAM_MACHINE_SUMMARY AS (
-    SELECT 
-        iam.BA,
-        iam.ACCOUNT,
-        COUNT(DISTINCT iam.RESOURCE_ID) AS IAM_MACHINE_ROLES
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE iam
-    JOIN (
-        SELECT DISTINCT ASV AS BA, ACCOUNT_NUMBER
-        FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-        WHERE ROLE_TYPE = 'MACHINE'
-        AND RESOURCE_TYPE = 'AWS::IAM::Role'
-    ) mba 
-    ON iam.BA = mba.BA
-    AND iam.ACCOUNT = mba.ACCOUNT_NUMBER
-    WHERE iam.TYPE = 'role'
-    GROUP BY iam.BA, iam.ACCOUNT
-)
+flowchart TD
+    %% Datasets
+    subgraph Datasets
+        A[OZONE Data]
+        B[IAM Resources]
+        C[Control Violations]
+        D[Control Metadata]
+    end
 
-SELECT 
-    COALESCE(o.BA, i.BA) AS BA,
-    COALESCE(o.ACCOUNT_NUMBER, i.ACCOUNT) AS ACCOUNT,
-    o.TOTAL_RESOURCES AS OZONE_TOTAL,
-    o.EVALUATED_RESOURCES AS OZONE_EVALUATED,
-    i.IAM_MACHINE_ROLES AS IAM_COUNT,
-    CASE 
-        WHEN o.TOTAL_RESOURCES > i.IAM_MACHINE_ROLES THEN 'OZONE_HIGHER'
-        WHEN o.TOTAL_RESOURCES < i.IAM_MACHINE_ROLES THEN 'IAM_HIGHER'
-        ELSE 'EQUAL'
-    END AS COMPARISON_RESULT,
-    ABS(COALESCE(o.TOTAL_RESOURCES, 0) - COALESCE(i.IAM_MACHINE_ROLES, 0)) AS COUNT_DIFFERENCE
-FROM OZONE_SUMMARY o
-FULL OUTER JOIN IAM_MACHINE_SUMMARY i
-    ON o.BA = i.BA 
-    AND o.ACCOUNT_NUMBER = i.ACCOUNT
-WHERE COALESCE(o.TOTAL_RESOURCES, 0) > 0 
-   OR COALESCE(i.IAM_MACHINE_ROLES, 0) > 0
-ORDER BY 
-    COUNT_DIFFERENCE DESC,
-    BA,
-    ACCOUNT;
+    %% Validation Process
+    subgraph Validation_Process
+        E[Step 1: Extract BA/Account with Machine Roles from OZONE]
+        F[Step 2: Join BA/Account with IAM Resources]
+        G[Step 3: Aggregate Counts by BA and Account]
+        H[Step 4: Compare Counts and Identify Discrepancies]
+        I[Step 5: Investigate Discrepancies]
+    end
+
+    %% Data Flow
+    A -- Provides BA/Account with ROLE_TYPE='MACHINE' --> E
+    E -- BA & Account Mapping --> F
+    F -- Retrieve Machine IAM Roles --> B
+    F -- Generate IAM Role Counts --> G
+    A -- OZONE Aggregated Counts by BA & Account --> G
+    G -- Aggregated Counts Comparison --> H
+    H -- Discrepancy Report --> I
+    I -- Analysis & Resolution --> J[Final Validation]
+
+    %% Additional Relationships
+    D -- Control Definition --> C
+    C -- Evaluated Roles via RESOURCE_NAME --> B
+    B -- IAM Resource Details --> C
+    C -- Evaluation Results --> H
+
+    %% Styling
+    classDef dataset fill:#bbf,stroke:#333,stroke-width:2px
+    classDef process fill:#ccf,stroke:#333,stroke-width:2px
+    classDef dataflow stroke:#333,stroke-width:1.5px,stroke-dasharray: 5,5
+
+    class A,B,C,D dataset
+    class E,F,G,H,I process
+    linkStyle 0,1,2,3,4 stroke:#333,stroke-width:1.5px
+    linkStyle 5,6 stroke:#f66,stroke-width:1.5px,stroke-dasharray: 5,5
+
+    %% Annotations
+    D:::dataset
+    class J milestone
+    style J fill:#8f8,stroke:#333,stroke-width:2px
+
+
+Diagram Explanation
+Datasets:
+OZONE Data (A): Contains aggregated counts of cloud resources, including ASV (which is equivalent to BA), ACCOUNT_NUMBER, ROLE_TYPE, INVENTORY_COUNT, and EVALUATIONS_COUNT.
+IAM Resources (B): Lists all IAM resources with details like RESOURCE_ID, AMAZON_RESOURCE_NAME (ARN), BA, ACCOUNT, and TYPE.
+Control Violations (C): Records compliance evaluations and any violations, linked back to IAM resources via RESOURCE_NAME (ARN).
+Control Metadata (D): Provides details about compliance controls, including CONTROL_ID, APPLICABLE_AWS_ROLE_TYPES, and CONTROL_DESCRIPTION.
+Validation Process Steps:
+Step 1 (E): Extract BA/Account with Machine Roles from OZONE
+We extract BA and Account combinations from OZONE Data where ROLE_TYPE is 'MACHINE'.
+Step 2 (F): Join BA/Account with IAM Resources
+Using the BA and Account combinations from Step 1, we join with IAM Resources to retrieve the list of Machine IAM Roles.
+Step 3 (G): Aggregate Counts by BA and Account
+Aggregate counts of Machine IAM Roles from both OZONE Data and IAM Resources at the BA and Account level.
+Step 4 (H): Compare Counts and Identify Discrepancies
+Compare the aggregated counts to identify discrepancies between the datasets.
+Step 5 (I): Investigate Discrepancies
+Analyze discrepancies to determine root causes, such as data ingestion issues, misclassifications, or timing differences.
+Final Validation (J):
+After investigating and resolving discrepancies, we reach the final validation of the Tier 1 metric.
+Additional Relationships:
+Control Metadata (D) to Control Violations (C):
+Control Metadata defines the compliance controls, specifying that the control applies to ROLE_TYPE = 'MACHINE'.
+Control Violations (C) to IAM Resources (B):
+Control Violations uses RESOURCE_NAME (ARN) to link back to IAM Resources, indicating which roles have been evaluated for compliance.
+Control Violations (C) to Step 4 (H):
+Evaluation results from Control Violations are used in Step 4 to assess the number of evaluated roles versus total roles.
+Styling Notes:
+Datasets (A, B, C, D): Represented in blue blocks to indicate source data.
+Validation Process (E, F, G, H, I): Represented in light blue blocks to indicate the steps taken.
+Data Flows: Solid lines indicate primary data flow; dashed lines represent supporting information or feedback loops.
+Final Validation (J): Represented in green to indicate the successful completion of the validation process.
+---
+Narrative Walkthrough
+Extracting Machine Role Identifiers:
+We start with OZONE Data (A) to identify all BA and Account combinations where ROLE_TYPE is 'MACHINE'.
+Mapping to IAM Resources:
+These BA and Account combinations are used to join with IAM Resources (B) in Step 2 (F), allowing us to retrieve detailed information on Machine IAM Roles.
+Aggregating and Comparing Counts:
+In Step 3 (G), we aggregate the counts of Machine IAM Roles from both the OZONE Data and the IAM Resources at the BA and Account level.
+Step 4 (H) involves comparing these aggregated counts to identify discrepancies.
+Utilizing Control Data:
+Control Metadata (D) specifies that the control applies to Machine roles.
+Control Violations (C) provides evaluation results, indicating which roles have been evaluated for compliance.
+The evaluation data feeds back into our comparison in Step 4 (H) to assess compliance coverage.
+Investigating Discrepancies:
+Discrepancies identified in Step 4 (H) are investigated in Step 5 (I) to determine their root causes.
+Possible issues include data ingestion errors, mismatches in role classification, or synchronization timing differences between datasets.
+Finalizing Validation:
+After resolving discrepancies, we arrive at Final Validation (J), where we confirm the accuracy of the Tier 1 metric.
