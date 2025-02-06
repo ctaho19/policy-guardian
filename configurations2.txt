@@ -1,5 +1,5 @@
--- Get all IAM roles
-WITH All_IAM_Roles AS (
+-- Using a sample of IAM roles (limit to one specific ACCOUNT for testing)
+WITH Sample_IAM_Roles AS (
     SELECT
         RESOURCE_ID,
         AMAZON_RESOURCE_NAME,
@@ -9,30 +9,35 @@ WITH All_IAM_Roles AS (
         EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
     WHERE
         TYPE = 'role'
+        AND ACCOUNT = '123456789012'  -- Replace with a test account number
+    FETCH FIRST 1000 ROWS ONLY      -- Limit rows to speed up testing
 ),
-
--- Assign known ROLE_TYPEs based on patterns
-Role_Type_Assigned AS (
-    SELECT
-        iam.*,
-        rtp.ROLE_TYPE
-    FROM
-        All_IAM_Roles iam
-    LEFT JOIN
-        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_ROLE_TYPE_PATTERNS_STREAM_V2 rtp
-    ON
-        iam.AMAZON_RESOURCE_NAME LIKE rtp.PATTERN
+-- Optionally, you can also pre-aggregate the distinct patterns from the patterns table.
+Distinct_Patterns AS (
+    SELECT DISTINCT PATTERN, ROLE_TYPE
+    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_ROLE_TYPE_PATTERNS_STREAM_V2
+    WHERE ROLE_TYPE IN ('HUMAN', 'SERVICE', 'ENTERPRISE')
 )
-
--- Assign MACHINE to roles with NULL ROLE_TYPE (unmatched patterns)
 SELECT
-    *,
+    s.RESOURCE_ID,
+    s.AMAZON_RESOURCE_NAME,
     CASE
-        WHEN ROLE_TYPE IS NULL THEN 'MACHINE'
-        ELSE ROLE_TYPE
+        WHEN EXISTS (
+            SELECT 1
+            FROM Distinct_Patterns p
+            WHERE s.AMAZON_RESOURCE_NAME LIKE p.PATTERN
+        ) THEN (
+            -- Get the role type from the first matching pattern.
+            -- Alternatively, you could use a subquery with LIMIT 1 if your SQL dialect supports it.
+            SELECT p2.ROLE_TYPE
+            FROM Distinct_Patterns p2
+            WHERE s.AMAZON_RESOURCE_NAME LIKE p2.PATTERN
+            FETCH FIRST 1 ROWS ONLY
+        )
+        ELSE 'MACHINE'
     END AS ASSIGNED_ROLE_TYPE
 FROM
-    Role_Type_Assigned;
+    Sample_IAM_Roles s;
 
 SELECT
     CONTROL_ID,
