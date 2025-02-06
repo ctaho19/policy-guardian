@@ -10,34 +10,42 @@ WITH Sample_IAM_Roles AS (
     WHERE
         TYPE = 'role'
         AND ACCOUNT = '123456789012'  -- Replace with a test account number
-    FETCH FIRST 1000 ROWS ONLY      -- Limit rows to speed up testing
+    FETCH FIRST 1000 ROWS ONLY
 ),
--- Optionally, you can also pre-aggregate the distinct patterns from the patterns table.
+-- Get distinct patterns
 Distinct_Patterns AS (
-    SELECT DISTINCT PATTERN, ROLE_TYPE
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_ROLE_TYPE_PATTERNS_STREAM_V2
-    WHERE ROLE_TYPE IN ('HUMAN', 'SERVICE', 'ENTERPRISE')
+    SELECT DISTINCT 
+        PATTERN, 
+        ROLE_TYPE
+    FROM 
+        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_ROLE_TYPE_PATTERNS_STREAM_V2
+    WHERE 
+        ROLE_TYPE IN ('HUMAN', 'SERVICE', 'ENTERPRISE')
+),
+-- Join roles with patterns
+Roles_With_Types AS (
+    SELECT
+        s.RESOURCE_ID,
+        s.AMAZON_RESOURCE_NAME,
+        s.BA,
+        s.ACCOUNT,
+        p.ROLE_TYPE
+    FROM
+        Sample_IAM_Roles s
+    LEFT JOIN
+        Distinct_Patterns p
+    ON
+        s.AMAZON_RESOURCE_NAME LIKE p.PATTERN
 )
+-- Final selection with role type assignment
 SELECT
-    s.RESOURCE_ID,
-    s.AMAZON_RESOURCE_NAME,
-    CASE
-        WHEN EXISTS (
-            SELECT 1
-            FROM Distinct_Patterns p
-            WHERE s.AMAZON_RESOURCE_NAME LIKE p.PATTERN
-        ) THEN (
-            -- Get the role type from the first matching pattern.
-            -- Alternatively, you could use a subquery with LIMIT 1 if your SQL dialect supports it.
-            SELECT p2.ROLE_TYPE
-            FROM Distinct_Patterns p2
-            WHERE s.AMAZON_RESOURCE_NAME LIKE p2.PATTERN
-            FETCH FIRST 1 ROWS ONLY
-        )
-        ELSE 'MACHINE'
-    END AS ASSIGNED_ROLE_TYPE
+    RESOURCE_ID,
+    AMAZON_RESOURCE_NAME,
+    BA,
+    ACCOUNT,
+    COALESCE(ROLE_TYPE, 'MACHINE') AS ASSIGNED_ROLE_TYPE
 FROM
-    Sample_IAM_Roles s;
+    Roles_With_Types;
 
 SELECT
     CONTROL_ID,
