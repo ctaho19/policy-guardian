@@ -4,7 +4,8 @@ WITH Random_Sample AS (
         AMAZON_RESOURCE_NAME
     FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
     WHERE TYPE = 'role'
-    SAMPLE (1000 ROWS)  -- Random 1000-role sample
+    TABLESAMPLE BERNOULLI (0.1)  -- Random 0.1% sample (~1000 rows)
+    LIMIT 1000  -- Hard cap for safety
 )
 
 SELECT 
@@ -15,24 +16,23 @@ SELECT
             FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 v
             WHERE v.RESOURCE_NAME = rs.AMAZON_RESOURCE_NAME
                 AND v.ROLE_TYPE = 'MACHINE'
+            LIMIT 1  -- Optimization for EXISTS
         ) THEN 'MACHINE' 
         ELSE 'OTHER' 
-    END AS predicted_type,
-    COUNT(*) AS sample_count
-FROM Random_Sample rs
-GROUP BY 1,2;
+    END AS predicted_type
+FROM Random_Sample rs;
 
-WITH Violation_Stats AS (
+WITH Recent_Violations AS (
     SELECT 
-        COUNT(DISTINCT RESOURCE_NAME) AS distinct_machine_resources,
+        COUNT(DISTINCT RESOURCE_NAME) AS distinct_machine_roles,
         COUNT(*) AS total_violations
     FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
     WHERE ROLE_TYPE = 'MACHINE'
-        AND EVALUATION_DATE >= CURRENT_DATE - 30  -- Last 30 days only
+        AND EVALUATION_DATE >= DATEADD(DAY, -30, CURRENT_DATE())
 )
 
 SELECT 
-    (SELECT COUNT(*) FROM Violation_Stats) AS violation_records,
-    (SELECT distinct_machine_resources FROM Violation_Stats) AS unique_machine_roles,
-    (SELECT total_violations FROM Violation_Stats) AS total_violations,
-    (SELECT unique_machine_roles / NULLIF(total_violations, 0)) AS violations_per_role;
+    distinct_machine_roles AS unique_machine_roles_in_violations,
+    total_violations,
+    (total_violations / NULLIF(distinct_machine_roles, 0))::FLOAT AS avg_violations_per_role
+FROM Recent_Violations;
