@@ -1,27 +1,38 @@
--- DIAGNOSTIC QUERY 1: Validate join key relationship
-WITH Violation_Resources AS (
-    SELECT DISTINCT 
-        v.RESOURCE_NAME AS violation_resource_name,
-        r.RESOURCE_ID AS iam_resource_id
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 v
-    LEFT JOIN EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_iam_resource r
-        ON v.RESOURCE_NAME = r.AMAZON_RESOURCE_NAME
-    WHERE v.ROLE_TYPE = 'MACHINE'
+WITH Random_Sample AS (
+    SELECT 
+        RESOURCE_ID,
+        AMAZON_RESOURCE_NAME
+    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+    WHERE TYPE = 'role'
+    SAMPLE (1000 ROWS)  -- Random 1000-role sample
 )
-SELECT 
-    COUNT(DISTINCT violation_resource_name) AS total_violation_names,
-    COUNT(DISTINCT iam_resource_id) AS matched_iam_resources,
-    COUNT(*) AS total_violation_records
-FROM Violation_Resources;
 
--- DIAGNOSTIC QUERY 2: Identify unmatched violations
 SELECT 
-    v.RESOURCE_NAME,
-    v.CONTROL_ID,
-    v.EVALUATION_DATE
-FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 v
-LEFT JOIN EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_iam_resource r
-    ON v.RESOURCE_NAME = r.AMAZON_RESOURCE_NAME
-WHERE v.ROLE_TYPE = 'MACHINE'
-    AND r.RESOURCE_ID IS NULL
-LIMIT 100;
+    rs.AMAZON_RESOURCE_NAME,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 v
+            WHERE v.RESOURCE_NAME = rs.AMAZON_RESOURCE_NAME
+                AND v.ROLE_TYPE = 'MACHINE'
+        ) THEN 'MACHINE' 
+        ELSE 'OTHER' 
+    END AS predicted_type,
+    COUNT(*) AS sample_count
+FROM Random_Sample rs
+GROUP BY 1,2;
+
+WITH Violation_Stats AS (
+    SELECT 
+        COUNT(DISTINCT RESOURCE_NAME) AS distinct_machine_resources,
+        COUNT(*) AS total_violations
+    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+    WHERE ROLE_TYPE = 'MACHINE'
+        AND EVALUATION_DATE >= CURRENT_DATE - 30  -- Last 30 days only
+)
+
+SELECT 
+    (SELECT COUNT(*) FROM Violation_Stats) AS violation_records,
+    (SELECT distinct_machine_resources FROM Violation_Stats) AS unique_machine_roles,
+    (SELECT total_violations FROM Violation_Stats) AS total_violations,
+    (SELECT unique_machine_roles / NULLIF(total_violations, 0)) AS violations_per_role;
