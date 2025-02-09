@@ -1,103 +1,50 @@
--- Using a sample of IAM roles (limit to one specific ACCOUNT for testing)
-WITH Sample_IAM_Roles AS (
-    SELECT
+WITH Recent_Control_Violations AS (
+    SELECT /*+ MATERIALIZE */
+        RESOURCE_NAME AS AMAZON_RESOURCE_NAME
+    FROM 
+        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+    WHERE 
+        ROLE_TYPE = 'MACHINE'
+        AND CONTROL_ID = 'CM-2.AWS.12.v02'  -- Specific control ID filter
+        AND EVALUATION_DATE >= DATEADD(DAY, -90, CURRENT_DATE())  -- 90-day window
+    GROUP BY 
+        RESOURCE_NAME  -- Deduplicate at source
+),
+
+Filtered_IAM_Roles AS (
+    SELECT 
         RESOURCE_ID,
         AMAZON_RESOURCE_NAME,
         BA,
         ACCOUNT
-    FROM
-        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
-    WHERE
-        TYPE = 'role'
-        AND ACCOUNT = '123456789012'  -- Replace with a test account number
-    FETCH FIRST 1000 ROWS ONLY
-),
--- Get distinct patterns
-Distinct_Patterns AS (
-    SELECT DISTINCT 
-        PATTERN, 
-        ROLE_TYPE
     FROM 
-        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_ROLE_TYPE_PATTERNS_STREAM_V2
+        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
     WHERE 
-        ROLE_TYPE IN ('HUMAN', 'SERVICE', 'ENTERPRISE')
-),
--- Join roles with patterns
-Roles_With_Types AS (
-    SELECT
-        s.RESOURCE_ID,
-        s.AMAZON_RESOURCE_NAME,
-        s.BA,
-        s.ACCOUNT,
-        p.ROLE_TYPE
-    FROM
-        Sample_IAM_Roles s
-    LEFT JOIN
-        Distinct_Patterns p
-    ON
-        s.AMAZON_RESOURCE_NAME LIKE p.PATTERN
-)
--- Final selection with role type assignment
-SELECT
-    RESOURCE_ID,
-    AMAZON_RESOURCE_NAME,
-    BA,
-    ACCOUNT,
-    COALESCE(ROLE_TYPE, 'MACHINE') AS ASSIGNED_ROLE_TYPE
-FROM
-    Roles_With_Types;
-
-SELECT
-    CONTROL_ID,
-    CONTROL_DESCRIPTION
-FROM
-    EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROL_METADATA_STREAM_1_V2
-WHERE
-    APPLICABLE_AWS_ROLE_TYPES LIKE '%MACHINE%';
-
--- Continue from Step 1
-
--- Filter for MACHINE roles
-Machine_IAM_Roles AS (
-    SELECT
-        RESOURCE_ID,
-        AMAZON_RESOURCE_NAME,
-        BA,
-        ACCOUNT,
-        ASSIGNED_ROLE_TYPE
-    FROM
-        (Result from Step 1)
-    WHERE
-        ASSIGNED_ROLE_TYPE = 'MACHINE'
-)
-SELECT
-    COUNT(DISTINCT RESOURCE_ID) AS Total_Machine_Roles
-FROM
-    Machine_IAM_Roles;
-
-
-Evaluated_Machine_Roles AS (
-    SELECT DISTINCT
-        RESOURCE_NAME AS AMAZON_RESOURCE_NAME
-    FROM
-        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
-    WHERE
-        CONTROL_ID = 'CM-2.AWS.12.v02'
-        AND ROLE_TYPE = 'MACHINE'
+        TYPE = 'role'
+        AND ACCOUNT IN (  -- Focus on specific accounts
+            '123456789012', 
+            '234567890123'
+        )
+        AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'  -- AWS role pattern
+    QUALIFY 
+        ROW_NUMBER() OVER (
+            PARTITION BY AMAZON_RESOURCE_NAME 
+            ORDER BY LAST_MODIFIED_DATE DESC
+        ) = 1  -- Get latest version of each role
 )
 
--- Join Evaluated Roles with Machine IAM Roles
-Evaluated_Machine_IAM_Roles AS (
-    SELECT
-        m.*
-    FROM
-        Machine_IAM_Roles m
-    INNER JOIN
-        Evaluated_Machine_Roles e
-    ON
-        m.AMAZON_RESOURCE_NAME = e.AMAZON_RESOURCE_NAME
-)
-SELECT
-    COUNT(DISTINCT RESOURCE_ID) AS Evaluated_Machine_Roles
-FROM
-    Evaluated_Machine_IAM_Roles;
+SELECT 
+    i.RESOURCE_ID,
+    i.AMAZON_RESOURCE_NAME,
+    i.BA,
+    i.ACCOUNT,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Recent_Control_Violations cv
+            WHERE cv.AMAZON_RESOURCE_NAME = i.AMAZON_RESOURCE_NAME
+        ) THEN 'MACHINE' 
+        ELSE 'OTHER' 
+    END AS ASSIGNED_ROLE_TYPE
+FROM 
+    Filtered_IAM_Roles i;
