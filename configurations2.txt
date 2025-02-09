@@ -1,50 +1,27 @@
-WITH Recent_Control_Violations AS (
-    SELECT /*+ MATERIALIZE */
-        RESOURCE_NAME AS AMAZON_RESOURCE_NAME
-    FROM 
-        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
-    WHERE 
-        ROLE_TYPE = 'MACHINE'
-        AND CONTROL_ID = 'CM-2.AWS.12.v02'  -- Specific control ID filter
-        AND EVALUATION_DATE >= DATEADD(DAY, -90, CURRENT_DATE())  -- 90-day window
-    GROUP BY 
-        RESOURCE_NAME  -- Deduplicate at source
-),
-
-Filtered_IAM_Roles AS (
-    SELECT 
-        RESOURCE_ID,
-        AMAZON_RESOURCE_NAME,
-        BA,
-        ACCOUNT
-    FROM 
-        EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
-    WHERE 
-        TYPE = 'role'
-        AND ACCOUNT IN (  -- Focus on specific accounts
-            '123456789012', 
-            '234567890123'
-        )
-        AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'  -- AWS role pattern
-    QUALIFY 
-        ROW_NUMBER() OVER (
-            PARTITION BY AMAZON_RESOURCE_NAME 
-            ORDER BY LAST_MODIFIED_DATE DESC
-        ) = 1  -- Get latest version of each role
+-- DIAGNOSTIC QUERY 1: Validate join key relationship
+WITH Violation_Resources AS (
+    SELECT DISTINCT 
+        v.RESOURCE_NAME AS violation_resource_name,
+        r.RESOURCE_ID AS iam_resource_id
+    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 v
+    LEFT JOIN EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_iam_resource r
+        ON v.RESOURCE_NAME = r.AMAZON_RESOURCE_NAME
+    WHERE v.ROLE_TYPE = 'MACHINE'
 )
-
 SELECT 
-    i.RESOURCE_ID,
-    i.AMAZON_RESOURCE_NAME,
-    i.BA,
-    i.ACCOUNT,
-    CASE 
-        WHEN EXISTS (
-            SELECT 1 
-            FROM Recent_Control_Violations cv
-            WHERE cv.AMAZON_RESOURCE_NAME = i.AMAZON_RESOURCE_NAME
-        ) THEN 'MACHINE' 
-        ELSE 'OTHER' 
-    END AS ASSIGNED_ROLE_TYPE
-FROM 
-    Filtered_IAM_Roles i;
+    COUNT(DISTINCT violation_resource_name) AS total_violation_names,
+    COUNT(DISTINCT iam_resource_id) AS matched_iam_resources,
+    COUNT(*) AS total_violation_records
+FROM Violation_Resources;
+
+-- DIAGNOSTIC QUERY 2: Identify unmatched violations
+SELECT 
+    v.RESOURCE_NAME,
+    v.CONTROL_ID,
+    v.EVALUATION_DATE
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 v
+LEFT JOIN EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_iam_resource r
+    ON v.RESOURCE_NAME = r.AMAZON_RESOURCE_NAME
+WHERE v.ROLE_TYPE = 'MACHINE'
+    AND r.RESOURCE_ID IS NULL
+LIMIT 100;
