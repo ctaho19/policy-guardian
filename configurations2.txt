@@ -1,18 +1,18 @@
--- This query returns the unmapped IAM roles (TYPE = 'role') 
--- where no matching RESOURCE_NAME exists in the controls violations dataset for machine roles.
+-- This query returns IAM roles (TYPE = 'role') from the IAM Resource Stream
+-- that do not have any matching RESOURCE_NAME in the Controls Violations dataset.
+-- This should return roughly the 30,035 roles that did not map to a role type.
 WITH Mapped_Violations AS (
     SELECT /*+ MATERIALIZE */
-        DISTINCT RESOURCE_NAME
+         DISTINCT RESOURCE_NAME
     FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
-    WHERE ROLE_TYPE = 'MACHINE'
 ),
 IAM_Roles AS (
     SELECT 
-        RESOURCE_ID,
-        AMAZON_RESOURCE_NAME,
-        BA,
-        ACCOUNT,
-        CREATE_DATE
+         RESOURCE_ID,
+         AMAZON_RESOURCE_NAME,
+         BA,
+         ACCOUNT,
+         CREATE_DATE
     FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
     WHERE TYPE = 'role'
       AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
@@ -24,7 +24,7 @@ SELECT
     r.ACCOUNT
 FROM IAM_Roles r
 WHERE NOT EXISTS (
-    SELECT 1 
+    SELECT 1
     FROM Mapped_Violations m
     WHERE m.RESOURCE_NAME = r.AMAZON_RESOURCE_NAME
 )
