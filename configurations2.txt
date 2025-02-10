@@ -1,9 +1,9 @@
--- Tier 2 Metric for control 'CM-2.AWS.12.v02'
--- This metric calculates the percentage of evaluated AWS IAM MACHINE roles that are compliant.
--- Denom: The count of evaluated machine roles (i.e. from the controls violations for this control).
--- Numerator: The count of those evaluated roles whose COMPLIANCE_STATUS indicates compliance.
+-- Supporting Evidence Query for Tier 2 Metric for control 'CM-2.AWS.12.v02'
+-- This query returns detailed information for evaluated AWS IAM MACHINE roles that are non-compliant.
+-- If no such roles are found, a single row is returned stating "No non-compliant machine roles found".
+
 WITH 
-  -- Select evaluated records for the given control from the controls violations dataset
+  -- Step 1: Get deduplicated evaluation records from the controls violations dataset for the control.
   Evaluated AS (
       SELECT 
           RESOURCE_NAME,
@@ -14,46 +14,60 @@ WITH
       WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
         AND ROLE_TYPE = 'MACHINE'
   ),
-  -- Deduplicate so that each evaluated resource appears only once (latest record)
   Eval_Distinct AS (
-      SELECT RESOURCE_NAME, COMPLIANCE_STATUS
+      SELECT RESOURCE_NAME, COMPLIANCE_STATUS, CREATE_DATE
       FROM Evaluated
       WHERE rn = 1
   ),
-  -- Calculate the total evaluated count (denom) and the compliant count (numerator).
-  Count_Calculations AS (
-      SELECT
-          COUNT(*) AS denominator,
-          COUNT(CASE 
-                    WHEN COMPLIANCE_STATUS IN (
-                         'CompliantException',
-                         'CompliantSuppression',
-                         'Compliant',
-                         'CompliantControlAllowance',
-                         'CompliantPlatformException'
-                    ) THEN 1 
-                 END) AS numerator
-      FROM Eval_Distinct
+  -- Step 2: Get IAM role details from the resource stream (filtering to valid role ARNs).
+  IAM_Roles AS (
+      SELECT 
+          RESOURCE_ID,
+          AMAZON_RESOURCE_NAME,
+          BA,
+          ACCOUNT,
+          CREATE_DATE
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+      WHERE TYPE = 'role'
+        AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
   ),
-  Combined AS (
-      SELECT
-          denominator,
-          numerator,
-          CASE 
-              WHEN denominator = 0 THEN 0 
-              ELSE ROUND(100.0 * numerator / denominator, 2)
-          END AS metric_value
-      FROM Count_Calculations
+  Mapping AS (
+      -- Deduplicate IAM resource rows by ARN, taking the most recent record per ARN.
+      SELECT 
+          r.RESOURCE_ID,
+          r.AMAZON_RESOURCE_NAME,
+          r.BA,
+          r.ACCOUNT,
+          r.CREATE_DATE AS IAM_CREATE_DATE
+      FROM IAM_Roles r
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY r.AMAZON_RESOURCE_NAME ORDER BY r.CREATE_DATE DESC) = 1
+  ),
+  -- Step 3: Join the mapping with evaluated (deduplicated) records and filter for NonCompliant outcomes.
+  NonCompliant AS (
+      SELECT 
+          m.RESOURCE_ID,
+          m.AMAZON_RESOURCE_NAME,
+          m.BA,
+          m.ACCOUNT,
+          e.CREATE_DATE,
+          e.COMPLIANCE_STATUS
+      FROM Mapping m
+      INNER JOIN Eval_Distinct e
+          ON m.AMAZON_RESOURCE_NAME = e.RESOURCE_NAME
+      WHERE e.COMPLIANCE_STATUS = 'NonCompliant'
   )
-SELECT
-    CURRENT_DATE() AS DATE,
-    'MNTR-1071824-T2' AS MONITORING_METRIC_NUMBER,
-    metric_value AS MONITORING_METRIC,
-    CASE 
-        WHEN metric_value >= 95 THEN 'GREEN'
-        WHEN metric_value >= 85 THEN 'YELLOW'
-        ELSE 'RED'
-    END AS COMPLIANCE_STATUS,
-    numerator AS NUMERATOR,
-    denominator AS DENOMINATOR
-FROM Combined;
+  
+-- Return non-compliant machine roles; if none exist, return a row stating so.
+SELECT *
+FROM NonCompliant
+
+UNION ALL
+
+SELECT 
+    'N/A' AS RESOURCE_ID,
+    'No non-compliant machine roles found' AS AMAZON_RESOURCE_NAME,
+    NULL AS BA,
+    NULL AS ACCOUNT,
+    NULL AS CREATE_DATE,
+    NULL AS COMPLIANCE_STATUS
+WHERE NOT EXISTS (SELECT 1 FROM NonCompliant);
