@@ -1,38 +1,34 @@
-WITH Random_Sample AS (
-    SELECT 
-        RESOURCE_ID,
-        AMAZON_RESOURCE_NAME
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
-    WHERE TYPE = 'role'
-    TABLESAMPLE BERNOULLI (0.1)  -- Random 0.1% sample (~1000 rows)
-    LIMIT 1000  -- Hard cap for safety
-)
+-- This query returns unmapped IAM roles (TYPE = 'role') from the resource stream dataset that are not present in the controls violations dataset for machine roles.
 
-SELECT 
-    rs.AMAZON_RESOURCE_NAME,
-    CASE 
-        WHEN EXISTS (
-            SELECT 1 
-            FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 v
-            WHERE v.RESOURCE_NAME = rs.AMAZON_RESOURCE_NAME
-                AND v.ROLE_TYPE = 'MACHINE'
-            LIMIT 1  -- Optimization for EXISTS
-        ) THEN 'MACHINE' 
-        ELSE 'OTHER' 
-    END AS predicted_type
-FROM Random_Sample rs;
-
-WITH Recent_Violations AS (
-    SELECT 
-        COUNT(DISTINCT RESOURCE_NAME) AS distinct_machine_roles,
-        COUNT(*) AS total_violations
+WITH Mapped_Violations AS (
+    SELECT /*+ MATERIALIZE */
+        DISTINCT RESOURCE_NAME
     FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
     WHERE ROLE_TYPE = 'MACHINE'
-        AND EVALUATION_DATE >= DATEADD(DAY, -30, CURRENT_DATE())
+),
+IAM_Roles AS (
+    SELECT 
+        RESOURCE_ID,
+        AMAZON_RESOURCE_NAME,
+        BA,
+        ACCOUNT,
+        CREATE_DATE
+    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+    WHERE TYPE = 'role'
+      AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'  -- Filter for valid AWS role ARNs only
 )
-
 SELECT 
-    distinct_machine_roles AS unique_machine_roles_in_violations,
-    total_violations,
-    (total_violations / NULLIF(distinct_machine_roles, 0))::FLOAT AS avg_violations_per_role
-FROM Recent_Violations;
+    r.RESOURCE_ID,
+    r.AMAZON_RESOURCE_NAME,
+    r.BA,
+    r.ACCOUNT
+FROM IAM_Roles r
+WHERE NOT EXISTS (
+    SELECT 1 
+    FROM Mapped_Violations m
+    WHERE m.RESOURCE_NAME = r.AMAZON_RESOURCE_NAME
+)
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY r.AMAZON_RESOURCE_NAME 
+    ORDER BY r.CREATE_DATE DESC
+) = 1;
