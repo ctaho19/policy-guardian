@@ -71,3 +71,44 @@ SELECT
     NULL AS CREATE_DATE,
     NULL AS COMPLIANCE_STATUS
 WHERE NOT EXISTS (SELECT 1 FROM NonCompliant);
+
+Mapping Role Types to Resources
+Source Tables:
+IAM Resource Stream: Contains all IAM roles along with metadata and their ARNs.
+Controls Violations Dataset: Contains evaluation records for controls, including RESOURCE_NAME (the ARN), ROLE_TYPE, CONTROL_ID, COMPLIANCE_STATUS, and CREATE_DATE.
+Deduplication via Window Functions:
+We use ROW_NUMBER() partitioned by RESOURCE_NAME (or AMAZON_RESOURCE_NAME for IAM roles) and ordered by CREATE_DATE DESC to select the most recent record for any given resource.
+This ensures that both the evaluation records and the IAM resource records don’t contain duplicate entries that could interfere with correct matches.
+Joining Logic:
+A left join is performed between the IAM Resource Stream and the deduplicated controls violations view on the ARN (i.e. AMAZON_RESOURCE_NAME equals RESOURCE_NAME).
+The mapping assigns a role type by using COALESCE to output the violation’s ROLE_TYPE if available, or 'NOT FOUND' if there is no matching evaluation.
+--
+Tier 1 Metric (Coverage)
+Objective:
+The Tier 1 metric calculates the percentage of evaluated AWS IAM MACHINE roles relative to all MACHINE roles available in the IAM resource stream.
+Denominator: Count of IAM roles (from the IAM resource stream) that are deduced to be MACHINE roles via our mapping logic.
+Numerator: Count of those roles that have a corresponding evaluation record for control CM-2.AWS.12.v02.
+Query Structure:
+Mapping CTE: Integrates the deduplicated IAM roles with the deduplicated violation records to assign each role a status (ROLE_TYPE), ensuring a one-to-one relationship by ARNs.
+Evaluated Roles CTE: Extracts distinct evaluated resource names from the controls violations dataset filtered by the control ID.
+Count Calculation: Joins the mapping with evaluated roles and applies a LEFT JOIN to ensure that only the evaluated MACHINE roles contribute to the numerator.
+The final select rounds the percentage and provides a standardized output with current date, metric number, compliance status (based on threshold conditions), and numerator/denominator counts.
+3. Supporting Evidence (Tier 1_SEQ):
+Returns metadata for IAM MACHINE roles that did not receive an evaluation for the control.
+Uses a similar mapping logic, then performs a LEFT JOIN with evaluated roles and filters out roles where no match is found.
+If none are found, a unioned row with an informative message is returned.
+---
+Tier 2 Metric (Compliance)
+Objective:
+Tier 2 measures the compliance percentage among the evaluated machine roles.
+Here, the denominator is exactly the numerator from Tier 1 (i.e. all evaluated machine roles).
+The numerator is the count of evaluated roles that are considered compliant (i.e. having one of the compliant statuses: CompliantException, CompliantSuppression, Compliant, CompliantControlAllowance, or CompliantPlatformException).
+Query Structure:
+Evaluated CTE: Retrieves and deduplicates evaluation records (using a window function) from the controls violations dataset for the specified control and machine roles.
+Count Calculation CTE: Uses conditional aggregation (COUNT(CASE WHEN ... THEN 1 END)) to capture the compliant roles among the evaluated ones.
+Metric Calculation: Computes the compliance percentage.
+The query outputs the standardized fields along with compliance status thresholds (green/yellow/red).
+3. Supporting Evidence (Tier2_SEQ):
+Retrieves detailed information on all evaluated machine roles that are flagged as NonCompliant.
+Uses the deduplicated evaluated view and joins against IAM resource details.
+Ensures that if no non-compliant roles exist, a single informational message is returned.
