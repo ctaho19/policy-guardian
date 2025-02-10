@@ -1,34 +1,43 @@
--- This query returns IAM roles (TYPE = 'role') from the IAM Resource Stream
--- that do not have any matching RESOURCE_NAME in the Controls Violations dataset.
--- This should return roughly the 30,035 roles that did not map to a role type.
-WITH Mapped_Violations AS (
-    SELECT /*+ MATERIALIZE */
-         DISTINCT RESOURCE_NAME
+-- This query maps all IAM roles (TYPE = 'role') from the resource stream dataset
+-- to the corresponding controls violation record by resource ARN.
+-- It returns the assigned role type from the violation dataset (e.g. MACHINE, ENTERPRISE, SERVICE, etc.)
+-- or 'NOT FOUND' if no violation record exists for that role.
+WITH Violation_Raw AS (
+    SELECT
+        RESOURCE_NAME,
+        ROLE_TYPE,
+        CREATE_DATE,
+        ROW_NUMBER() OVER (PARTITION BY RESOURCE_NAME ORDER BY CREATE_DATE DESC) AS rn
     FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
 ),
+Violation_Roles AS (
+    SELECT
+        RESOURCE_NAME,
+        ROLE_TYPE
+    FROM Violation_Raw
+    WHERE rn = 1
+),
 IAM_Roles AS (
-    SELECT 
-         RESOURCE_ID,
-         AMAZON_RESOURCE_NAME,
-         BA,
-         ACCOUNT,
-         CREATE_DATE
+    SELECT
+        RESOURCE_ID,
+        AMAZON_RESOURCE_NAME,
+        BA,
+        ACCOUNT,
+        CREATE_DATE
     FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
     WHERE TYPE = 'role'
       AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
 )
-SELECT 
+SELECT
     r.RESOURCE_ID,
     r.AMAZON_RESOURCE_NAME,
     r.BA,
-    r.ACCOUNT
+    r.ACCOUNT,
+    COALESCE(v.ROLE_TYPE, 'NOT FOUND') AS ASSIGNED_ROLE_TYPE
 FROM IAM_Roles r
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM Mapped_Violations m
-    WHERE m.RESOURCE_NAME = r.AMAZON_RESOURCE_NAME
-)
+LEFT JOIN Violation_Roles v
+    ON r.AMAZON_RESOURCE_NAME = v.RESOURCE_NAME
 QUALIFY ROW_NUMBER() OVER (
-    PARTITION BY r.AMAZON_RESOURCE_NAME 
+    PARTITION BY r.AMAZON_RESOURCE_NAME
     ORDER BY r.CREATE_DATE DESC
 ) = 1;
