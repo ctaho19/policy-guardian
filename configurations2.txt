@@ -1,63 +1,146 @@
--- Tier 1 Metric for control 'CM-2.AWS.12.v02' for AWS IAM MACHINE roles,
--- integrating the mapping logic from the resource mapping query.
--- Denom: Count of IAM roles (from the Resource Stream) that are mapped as MACHINE.
--- Numerator: Among these, the count of roles that have at least one evaluation for control 'CM-2.AWS.12.v02'.
+-- Tier 1 Metric for control 'CM-2.AWS.12.v02' for AWS IAM MACHINE roles.
+-- Denom: Count of MACHINE roles (as deduced from the IAM resource stream using mapping logic)
+-- Numerator: Count of those roles that were evaluated for control 'CM-2.AWS.12.v02'
 
-WITH Violation_Raw AS (
-    SELECT 
-        RESOURCE_NAME,
-        ROLE_TYPE,
-        CREATE_DATE,
-        ROW_NUMBER() OVER (PARTITION BY RESOURCE_NAME ORDER BY CREATE_DATE DESC) AS rn
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
-),
-Violation_Roles AS (
-    -- For every distinct resource, pick the most recent violation record.
-    SELECT 
-        RESOURCE_NAME,
-        ROLE_TYPE
-    FROM Violation_Raw
-    WHERE rn = 1
-),
-IAM_Roles AS (
-    -- Select IAM roles from the Resource Stream. (We filter using an ARN pattern.)
-    SELECT 
-        RESOURCE_ID,
-        AMAZON_RESOURCE_NAME,
-        BA,
-        ACCOUNT,
-        CREATE_DATE
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
-    WHERE TYPE = 'role'
-      AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
-),
-Mapping AS (
-    -- Integrate the two sets to deduce each role’s type.
-    SELECT
-        r.RESOURCE_ID,
-        r.AMAZON_RESOURCE_NAME,
-        r.BA,
-        r.ACCOUNT,
-        COALESCE(v.ROLE_TYPE, 'NOT FOUND') AS ASSIGNED_ROLE_TYPE
-    FROM IAM_Roles r
-    LEFT JOIN Violation_Roles v
-        ON r.AMAZON_RESOURCE_NAME = v.RESOURCE_NAME
-    QUALIFY ROW_NUMBER() OVER (
-               PARTITION BY r.AMAZON_RESOURCE_NAME 
-               ORDER BY r.CREATE_DATE DESC
-           ) = 1
-),
-Evaluated_Roles AS (
-    -- Distinct list of IAM roles that were evaluated for control 'CM-2.AWS.12.v02'
-    SELECT DISTINCT RESOURCE_NAME
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
-    WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
-)
+WITH 
+  -- Step 1: Deduplicate Violation records (keeping the most recent per resource)
+  Violation_Raw AS (
+      SELECT 
+          RESOURCE_NAME,
+          ROLE_TYPE,
+          CREATE_DATE,
+          ROW_NUMBER() OVER (PARTITION BY RESOURCE_NAME ORDER BY CREATE_DATE DESC) AS rn
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+  ),
+  Violation_Roles AS (
+      SELECT RESOURCE_NAME, ROLE_TYPE
+      FROM Violation_Raw
+      WHERE rn = 1
+  ),
+  -- Step 2: Get IAM Roles from the Resource Stream (filtered for valid role ARNs)
+  IAM_Roles AS (
+      SELECT 
+          RESOURCE_ID,
+          AMAZON_RESOURCE_NAME,
+          BA,
+          ACCOUNT,
+          CREATE_DATE
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+      WHERE TYPE = 'role'
+        AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
+  ),
+  -- Step 3: Integrate mapping logic to assign a role type (from violation data) to each IAM role
+  Mapping AS (
+      SELECT
+          r.RESOURCE_ID,
+          r.AMAZON_RESOURCE_NAME,
+          r.BA,
+          r.ACCOUNT,
+          COALESCE(v.ROLE_TYPE, 'NOT FOUND') AS ASSIGNED_ROLE_TYPE,
+          r.CREATE_DATE
+      FROM IAM_Roles r
+      LEFT JOIN Violation_Roles v
+          ON r.AMAZON_RESOURCE_NAME = v.RESOURCE_NAME
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY r.AMAZON_RESOURCE_NAME ORDER BY r.CREATE_DATE DESC) = 1
+  ),
+  -- Step 4: Identify distinct evaluated roles for control 'CM-2.AWS.12.v02'
+  Evaluated_Roles AS (
+      SELECT DISTINCT RESOURCE_NAME
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+      WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
+  ),
+  -- Step 5: Calculate numerator and denominator counts among deduced MACHINE roles
+  Count_Calculations AS (
+      SELECT
+          COUNT(*) AS denominator,
+          COUNT(CASE WHEN er.RESOURCE_NAME IS NOT NULL THEN 1 END) AS numerator,
+          (COUNT(CASE WHEN er.RESOURCE_NAME IS NOT NULL THEN 1 END)*100.0 / COUNT(*)) AS metric_value
+      FROM Mapping m
+      LEFT JOIN Evaluated_Roles er
+          ON m.AMAZON_RESOURCE_NAME = er.RESOURCE_NAME
+      WHERE m.ASSIGNED_ROLE_TYPE = 'MACHINE'
+  )
 SELECT
-    COUNT(*) AS Denom_Machine_Roles,  -- Total machine roles in scope (machine roles from Mapping)
-    COUNT(CASE WHEN er.RESOURCE_NAME IS NOT NULL THEN 1 END) AS Numerator_Roles_Evaluated,
-    (COUNT(CASE WHEN er.RESOURCE_NAME IS NOT NULL THEN 1 END) * 100.0 / COUNT(*)) AS Evaluation_Percentage
-FROM Mapping m
-LEFT JOIN Evaluated_Roles er
-    ON m.AMAZON_RESOURCE_NAME = er.RESOURCE_NAME
-WHERE m.ASSIGNED_ROLE_TYPE = 'MACHINE';
+    CURRENT_DATE() AS DATE,
+    'MNTR-CM2AWS12-TX' AS MONITORING_METRIC_NUMBER,
+    ROUND(100.0 * numerator / denominator, 2) AS MONITORING_METRIC,
+    CASE
+        WHEN ROUND(100.0 * numerator / denominator, 2) >= 98 THEN 'GREEN'
+        WHEN ROUND(100.0 * numerator / denominator, 2) >= 95 THEN 'YELLOW'
+        ELSE 'RED'
+    END AS COMPLIANCE_STATUS,
+    numerator AS NUMERATOR,
+    denominator AS DENOMINATOR
+FROM Count_Calculations;
+
+
+-- Supporting evidence for Tier 1 Metric for control 'CM-2.AWS.12.v02'
+-- This query outputs the MACHINE roles (with metadata) from the resource stream
+-- that did not receive an evaluation record for the control.
+WITH 
+  Violation_Raw AS (
+      SELECT 
+          RESOURCE_NAME,
+          ROLE_TYPE,
+          CREATE_DATE,
+          ROW_NUMBER() OVER (PARTITION BY RESOURCE_NAME ORDER BY CREATE_DATE DESC) AS rn
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+  ),
+  Violation_Roles AS (
+      SELECT RESOURCE_NAME, ROLE_TYPE
+      FROM Violation_Raw
+      WHERE rn = 1
+  ),
+  IAM_Roles AS (
+      SELECT 
+          RESOURCE_ID,
+          AMAZON_RESOURCE_NAME,
+          BA,
+          ACCOUNT,
+          CREATE_DATE
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+      WHERE TYPE = 'role'
+        AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
+  ),
+  Mapping AS (
+      SELECT
+          r.RESOURCE_ID,
+          r.AMAZON_RESOURCE_NAME,
+          r.BA,
+          r.ACCOUNT,
+          COALESCE(v.ROLE_TYPE, 'NOT FOUND') AS ASSIGNED_ROLE_TYPE,
+          r.CREATE_DATE
+      FROM IAM_Roles r
+      LEFT JOIN Violation_Roles v
+          ON r.AMAZON_RESOURCE_NAME = v.RESOURCE_NAME
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY r.AMAZON_RESOURCE_NAME ORDER BY r.CREATE_DATE DESC) = 1
+  ),
+  Evaluated_Roles AS (
+      SELECT DISTINCT RESOURCE_NAME
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+      WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
+  ),
+  UnEvaluated AS (
+      SELECT
+          m.RESOURCE_ID,
+          m.AMAZON_RESOURCE_NAME,
+          m.BA,
+          m.ACCOUNT,
+          m.CREATE_DATE
+      FROM Mapping m
+      LEFT JOIN Evaluated_Roles er
+          ON m.AMAZON_RESOURCE_NAME = er.RESOURCE_NAME
+      WHERE m.ASSIGNED_ROLE_TYPE = 'MACHINE'
+        AND er.RESOURCE_NAME IS NULL
+  )
+-- Return the unevaluated roles; if none exist, return a row stating so.
+SELECT *
+FROM UnEvaluated
+UNION ALL
+SELECT 
+  'N/A' AS RESOURCE_ID,
+  'No unevaluated machine roles found' AS AMAZON_RESOURCE_NAME,
+  NULL AS BA,
+  NULL AS ACCOUNT,
+  NULL AS CREATE_DATE
+WHERE NOT EXISTS (SELECT 1 FROM UnEvaluated);
