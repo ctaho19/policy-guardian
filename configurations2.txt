@@ -1,5 +1,5 @@
--- This query returns unmapped IAM roles (TYPE = 'role') from the resource stream dataset that are not present in the controls violations dataset for machine roles.
-
+-- This query returns the unmapped IAM roles (TYPE = 'role') 
+-- where no matching RESOURCE_NAME exists in the controls violations dataset for machine roles.
 WITH Mapped_Violations AS (
     SELECT /*+ MATERIALIZE */
         DISTINCT RESOURCE_NAME
@@ -15,7 +15,7 @@ IAM_Roles AS (
         CREATE_DATE
     FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
     WHERE TYPE = 'role'
-      AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'  -- Filter for valid AWS role ARNs only
+      AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
 )
 SELECT 
     r.RESOURCE_ID,
