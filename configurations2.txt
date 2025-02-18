@@ -1,1 +1,96 @@
+base_query = """
+WITH 
+  Violation_Raw AS (
+      SELECT 
+          RESOURCE_NAME,
+          ROLE_TYPE,
+          CREATE_DATE,
+          ROW_NUMBER() OVER (PARTITION BY RESOURCE_NAME ORDER BY CREATE_DATE DESC) AS rn
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+  ),
+  Violation_Roles AS (
+      SELECT RESOURCE_NAME, ROLE_TYPE
+      FROM Violation_Raw
+      WHERE rn = 1
+  ),
+  IAM_Roles AS (
+      SELECT 
+          RESOURCE_ID,
+          AMAZON_RESOURCE_NAME,
+          BA,
+          ACCOUNT,
+          CREATE_DATE
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+      WHERE TYPE = 'role'
+        AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
+        AND NOT REGEXP_LIKE(FULL_RECORD, '.*(Deny[-]?All|QuarantinePolicy).*')
+  ),
+  Evaluated_Roles AS (
+      SELECT DISTINCT RESOURCE_NAME
+      FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+      WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
+  )
+SELECT
+    r.RESOURCE_ID,
+    r.AMAZON_RESOURCE_NAME,
+    r.BA,
+    r.ACCOUNT,
+    r.CREATE_DATE,
+    v.ROLE_TYPE,
+    CASE WHEN er.RESOURCE_NAME IS NOT NULL THEN 1 ELSE 0 END as IS_EVALUATED
+FROM IAM_Roles r
+LEFT JOIN Violation_Roles v
+    ON r.AMAZON_RESOURCE_NAME = v.RESOURCE_NAME
+LEFT JOIN Evaluated_Roles er
+    ON r.AMAZON_RESOURCE_NAME = er.RESOURCE_NAME
+QUALIFY ROW_NUMBER() OVER (PARTITION BY r.AMAZON_RESOURCE_NAME ORDER BY r.CREATE_DATE DESC) = 1
+"""
+
+try:
+    # Load the base data from Snowflake
+    df_snowflake = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", base_query) \
+        .load()
+
+    # Join with account numbers
+    df_filtered = df_snowflake.join(
+        df_spark,
+        df_snowflake["ACCOUNT"] == df_spark["accountNumber"],
+        "inner"
+    )
+
+    # Calculate metrics using Spark SQL
+    df_filtered.createOrReplaceTempView("filtered_roles")
+    
+    final_query = """
+    WITH Count_Calculations AS (
+        SELECT
+            COUNT(*) as denominator,
+            SUM(CASE WHEN IS_EVALUATED = 1 AND COALESCE(ROLE_TYPE, 'NOT FOUND') = 'MACHINE' THEN 1 ELSE 0 END) as numerator
+        FROM filtered_roles
+        WHERE COALESCE(ROLE_TYPE, 'NOT FOUND') = 'MACHINE'
+    )
+    SELECT
+        CURRENT_DATE() AS DATE,
+        'MNTR-1071824-T1' AS MONITORING_METRIC_NUMBER,
+        ROUND(100.0 * numerator / denominator, 2) AS MONITORING_METRIC,
+        CASE
+            WHEN ROUND(100.0 * numerator / denominator, 2) >= 98 THEN 'GREEN'
+            WHEN ROUND(100.0 * numerator / denominator, 2) >= 95 THEN 'YELLOW'
+            ELSE 'RED'
+        END AS COMPLIANCE_STATUS,
+        numerator AS NUMERATOR,
+        denominator AS DENOMINATOR
+    FROM Count_Calculations
+    """
+    
+    df_result = spark.sql(final_query)
+    
+    # Display results
+    print("Final Results:")
+    df_result.show()
+
+except Exception as e:
+    print(f"Error executing query: {str(e)}")
 
