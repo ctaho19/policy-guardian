@@ -1,4 +1,5 @@
-base_query = """
+# Adapted supporting evidence query with additional IAM role filters
+support_query = """
 WITH 
   Violation_Raw AS (
       SELECT 
@@ -19,78 +20,60 @@ WITH
           AMAZON_RESOURCE_NAME,
           BA,
           ACCOUNT,
-          CREATE_DATE
+          CREATE_DATE,
+          FULL_RECORD
       FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
       WHERE TYPE = 'role'
         AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
+        -- Only include accounts from the API response
+        AND ACCOUNT IN (SELECT accountNumber FROM accounts_view)
+        -- Exclude roles with policy attachments that contain "DenyAll" or "QuarantinePolicy"
         AND NOT REGEXP_LIKE(FULL_RECORD, '.*(Deny[-]?All|QuarantinePolicy).*')
+  ),
+  Mapping AS (
+      SELECT
+          r.RESOURCE_ID,
+          r.AMAZON_RESOURCE_NAME,
+          r.BA,
+          r.ACCOUNT,
+          COALESCE(v.ROLE_TYPE, 'NOT FOUND') AS ASSIGNED_ROLE_TYPE,
+          r.CREATE_DATE
+      FROM IAM_Roles r
+      LEFT JOIN Violation_Roles v
+          ON r.AMAZON_RESOURCE_NAME = v.RESOURCE_NAME
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY r.AMAZON_RESOURCE_NAME ORDER BY r.CREATE_DATE DESC) = 1
   ),
   Evaluated_Roles AS (
       SELECT DISTINCT RESOURCE_NAME
       FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
       WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
+  ),
+  UnEvaluated AS (
+      SELECT
+          m.RESOURCE_ID,
+          m.AMAZON_RESOURCE_NAME,
+          m.BA,
+          m.ACCOUNT,
+          m.CREATE_DATE
+      FROM Mapping m
+      LEFT JOIN Evaluated_Roles er
+          ON m.AMAZON_RESOURCE_NAME = er.RESOURCE_NAME
+      WHERE m.ASSIGNED_ROLE_TYPE = 'MACHINE'
+        AND er.RESOURCE_NAME IS NULL
   )
-SELECT
-    r.RESOURCE_ID,
-    r.AMAZON_RESOURCE_NAME,
-    r.BA,
-    r.ACCOUNT,
-    r.CREATE_DATE,
-    v.ROLE_TYPE,
-    CASE WHEN er.RESOURCE_NAME IS NOT NULL THEN 1 ELSE 0 END as IS_EVALUATED
-FROM IAM_Roles r
-LEFT JOIN Violation_Roles v
-    ON r.AMAZON_RESOURCE_NAME = v.RESOURCE_NAME
-LEFT JOIN Evaluated_Roles er
-    ON r.AMAZON_RESOURCE_NAME = er.RESOURCE_NAME
-QUALIFY ROW_NUMBER() OVER (PARTITION BY r.AMAZON_RESOURCE_NAME ORDER BY r.CREATE_DATE DESC) = 1
+SELECT *
+FROM UnEvaluated
+UNION ALL
+SELECT 
+  'N/A' AS RESOURCE_ID,
+  'No unevaluated machine roles found' AS AMAZON_RESOURCE_NAME,
+  NULL AS BA,
+  NULL AS ACCOUNT,
+  NULL AS CREATE_DATE
+WHERE NOT EXISTS (SELECT 1 FROM UnEvaluated)
 """
 
-try:
-    # Load the base data from Snowflake
-    df_snowflake = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
-        .options(**sfOptions) \
-        .option("query", base_query) \
-        .load()
-
-    # Join with account numbers
-    df_filtered = df_snowflake.join(
-        df_spark,
-        df_snowflake["ACCOUNT"] == df_spark["accountNumber"],
-        "inner"
-    )
-
-    # Calculate metrics using Spark SQL
-    df_filtered.createOrReplaceTempView("filtered_roles")
-    
-    final_query = """
-    WITH Count_Calculations AS (
-        SELECT
-            COUNT(*) as denominator,
-            SUM(CASE WHEN IS_EVALUATED = 1 AND COALESCE(ROLE_TYPE, 'NOT FOUND') = 'MACHINE' THEN 1 ELSE 0 END) as numerator
-        FROM filtered_roles
-        WHERE COALESCE(ROLE_TYPE, 'NOT FOUND') = 'MACHINE'
-    )
-    SELECT
-        CURRENT_DATE() AS DATE,
-        'MNTR-1071824-T1' AS MONITORING_METRIC_NUMBER,
-        ROUND(100.0 * numerator / denominator, 2) AS MONITORING_METRIC,
-        CASE
-            WHEN ROUND(100.0 * numerator / denominator, 2) >= 98 THEN 'GREEN'
-            WHEN ROUND(100.0 * numerator / denominator, 2) >= 95 THEN 'YELLOW'
-            ELSE 'RED'
-        END AS COMPLIANCE_STATUS,
-        numerator AS NUMERATOR,
-        denominator AS DENOMINATOR
-    FROM Count_Calculations
-    """
-    
-    df_result = spark.sql(final_query)
-    
-    # Display results
-    print("Final Results:")
-    df_result.show()
-
-except Exception as e:
-    print(f"Error executing query: {str(e)}")
+# Execute the adapted supporting evidence query
+df_support = spark.sql(support_query)
+df_support.show()
 
