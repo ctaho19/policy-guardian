@@ -1,15 +1,26 @@
-# First, let's see what columns we actually have
-print("Column names in unmapped_validation_with_status:")
-unmapped_validation_with_status.columns
-
-# Then, select the columns using the exact names
-additional_mapped_roles = unmapped_validation_with_status.select(
-    unmapped_validation_with_status.columns[0].alias("Resource_ID"),  # Select first Resource_ID column
-    col("ROLE_TYPE").alias("Role_Type")
+# First, find unmapped resources
+unmapped_resources_df = All_Roles_DF.join(
+    Mapping_Roles_DF,
+    All_Roles_DF["RESOURCE_ID"] == Mapping_Roles_DF["RESOURCE_ID"],
+    "left_anti"
 )
 
-# Alternatively, if you know which one you want:
+# Then join with Distinct_Roles_DF, but this time specify which columns we want
+unmapped_validation_df = unmapped_resources_df.join(
+    Distinct_Roles_DF.select("RESOURCE_ID", "ROLE_TYPE"),  # Only select the columns we need
+    ["RESOURCE_ID"],  # Join on this column and keep only one copy
+    "left"
+)
+
+# Add validation status
+unmapped_validation_with_status = unmapped_validation_df.withColumn(
+    "Validation_Status",
+    when(col("ROLE_TYPE").isNull(), "Truly Not Present in Role Type Dataset")
+    .otherwise("Found in Role Type Dataset - Investigate Why Not Mapped")
+)
+
+# Now when we select, there should only be one RESOURCE_ID column
 additional_mapped_roles = unmapped_validation_with_status.select(
-    col("RESOURCE_ID").alias("Resource_ID"),  # Note: using exact case as shown in error
+    col("RESOURCE_ID"),
     col("ROLE_TYPE").alias("Role_Type")
 )
