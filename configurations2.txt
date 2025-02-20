@@ -1,73 +1,31 @@
-# Find resources that weren't mapped at all
-unmapped_resources_df = All_Roles_DF.join(
-    Mapping_Roles_DF,
-    All_Roles_DF.Resource_ID == Mapping_Roles_DF.Resource_ID,
-    "left_anti"  # Returns only the rows from All_Roles_DF that don't have matches
+from pyspark.sql.functions import when, concat, lit, col
+
+# 1. First, let's select just the columns we need from Mapping_Roles_DF
+mapped_roles_simplified = Mapping_Roles_DF.select(
+    col("Resource_ID"),
+    col("Assigned_Role_Type").alias("Role_Type")  # Renaming to match with other DataFrame
 )
 
-# Show count of unmapped resources
-print(f"Total unmapped resources: {unmapped_resources_df.count()}")
-display(unmapped_resources_df)
-
-
-# Check if these unmapped resources exist in Distinct_Roles_DF
-unmapped_validation_df = unmapped_resources_df.join(
-    Distinct_Roles_DF,
-    unmapped_resources_df.Resource_ID == Distinct_Roles_DF.Resource_ID,
-    "left"
+# 2. From unmapped_validation_with_status, select and prepare the columns we need
+# Note: Adjust the column selection based on your actual validation status column name
+additional_mapped_roles = unmapped_validation_with_status.select(
+    col("Resource_ID"),
+    col("Role_Type")
 )
 
-# Add a validation status column
-unmapped_validation_with_status = unmapped_validation_df.withColumn(
-    "Validation_Status",
-    when(col("Role_Type").isNull(), "Truly Not Present in Role Type Dataset")
-    .otherwise("Found in Role Type Dataset - Investigate Why Not Mapped")
+# 3. Union the two DataFrames
+all_mapped_roles = mapped_roles_simplified.union(additional_mapped_roles)
+
+# 4. Get count of MACHINE roles and save as single-column DataFrame
+machine_roles_count = all_mapped_roles.filter(
+    col("Role_Type") == "MACHINE"
+).agg(
+    count("*").alias("Machine_Roles_Count")
 )
 
-# Show results
-print("Validation of Unmapped Resources:")
-display(unmapped_validation_with_status)
-
-# Get counts by validation status
-unmapped_validation_with_status.groupBy("Validation_Status").count().show()
-
-
-# Find resources mapped as "Not Found"
-not_found_roles_df = Mapping_Roles_DF.filter(
-    col("Assigned_Role_Type") == "Not Found"
-)
-
-# Validate against Distinct_Roles_DF
-not_found_validation_df = not_found_roles_df.join(
-    Distinct_Roles_DF,
-    not_found_roles_df.Resource_ID == Distinct_Roles_DF.Resource_ID,
-    "left"
-)
-
-# Add validation status
-not_found_validation_with_status = not_found_validation_df.withColumn(
-    "Validation_Status",
-    when(col("Role_Type").isNull(), "No Role Type Data Available")
-    .when(col("Role_Type").isin(["HUMAN", "ENTERPRISE", "MACHINE", "SERVICE"]), 
-          concat(lit("Role Type Found: "), col("Role_Type")))
-    .otherwise("Unexpected Role Type Value")
-)
-
-# Show results
-print("\nValidation of 'Not Found' Role Types:")
-display(not_found_validation_with_status)
-
-# Get counts by validation status
-print("\nSummary of 'Not Found' Role Types:")
-not_found_validation_with_status.groupBy("Validation_Status").count().show()
-
-# Print overall summary
-print("\nOverall Summary:")
-print(f"Total Resources in Inventory: {All_Roles_DF.count()}")
-print(f"Total Mapped Resources: {Mapping_Roles_DF.count()}")
-print(f"Total Unmapped Resources: {unmapped_resources_df.count()}")
-print(f"Total 'Not Found' Role Types: {not_found_roles_df.count()}")
-
-# Distribution of Role Types in Mapping_Roles_DF
-print("\nDistribution of Assigned Role Types:")
-Mapping_Roles_DF.groupBy("Assigned_Role_Type").count().orderBy("count", ascending=False).show()
+# Display results
+print("Total Mapped Roles:", all_mapped_roles.count())
+print("\nDistribution of Role Types:")
+all_mapped_roles.groupBy("Role_Type").count().orderBy("count", ascending=False).show()
+print("\nFinal Machine Roles Count:")
+display(machine_roles_count)
