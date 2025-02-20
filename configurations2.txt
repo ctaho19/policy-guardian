@@ -1,31 +1,15 @@
-from pyspark.sql.functions import when, concat, lit, col
+# First, let's see what columns we actually have
+print("Column names in unmapped_validation_with_status:")
+unmapped_validation_with_status.columns
 
-# 1. First, let's select just the columns we need from Mapping_Roles_DF
-mapped_roles_simplified = Mapping_Roles_DF.select(
-    col("Resource_ID"),
-    col("Assigned_Role_Type").alias("Role_Type")  # Renaming to match with other DataFrame
-)
-
-# 2. From unmapped_validation_with_status, select and prepare the columns we need
-# Note: Adjust the column selection based on your actual validation status column name
+# Then, select the columns using the exact names
 additional_mapped_roles = unmapped_validation_with_status.select(
-    col("Resource_ID"),
-    col("Role_Type")
+    unmapped_validation_with_status.columns[0].alias("Resource_ID"),  # Select first Resource_ID column
+    col("ROLE_TYPE").alias("Role_Type")
 )
 
-# 3. Union the two DataFrames
-all_mapped_roles = mapped_roles_simplified.union(additional_mapped_roles)
-
-# 4. Get count of MACHINE roles and save as single-column DataFrame
-machine_roles_count = all_mapped_roles.filter(
-    col("Role_Type") == "MACHINE"
-).agg(
-    count("*").alias("Machine_Roles_Count")
+# Alternatively, if you know which one you want:
+additional_mapped_roles = unmapped_validation_with_status.select(
+    col("RESOURCE_ID").alias("Resource_ID"),  # Note: using exact case as shown in error
+    col("ROLE_TYPE").alias("Role_Type")
 )
-
-# Display results
-print("Total Mapped Roles:", all_mapped_roles.count())
-print("\nDistribution of Role Types:")
-all_mapped_roles.groupBy("Role_Type").count().orderBy("count", ascending=False).show()
-print("\nFinal Machine Roles Count:")
-display(machine_roles_count)
