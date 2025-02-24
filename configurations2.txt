@@ -1,33 +1,59 @@
-from pyspark.sql.functions import current_date, lit, round, when
-from pyspark.sql.types import StructType, StructField, DateType, StringType, DoubleType, LongType
+import logging
+from pyspark.sql.functions import col, count
 
-# Get the KEYS_EVALUATED value
-keys_evaluated = df_ozone_value.collect()[0][0]
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    filename='databricks_debug.log')  # Logs to a file; use console for immediate output by removing filename
 
-# Create initial DataFrame with the numeric values
-base_df = spark.createDataFrame([(keys_evaluated, level1_resource_count)], ["numerator", "denominator"])
+logger = logging.getLogger(__name__)
 
-# Create the final monitoring metric DataFrame with all calculations as column operations
-monitoring_metric_df = base_df.select(
-    current_date().alias("DATE"),
-    lit("MNTR-1071824-T1").alias("MONITORING_METRIC_NUMBER"),
-    round((col("numerator") * 100.0) / col("denominator"), 2).alias("MONITORING_METRIC"),
-    when((col("numerator") * 100.0) / col("denominator") >= 98, "GREEN")
-    .when((col("numerator") * 100.0) / col("denominator") >= 95, "YELLOW")
-    .otherwise("RED").alias("COMPLIANCE_STATUS"),
-    col("numerator").alias("NUMERATOR"),
-    col("denominator").alias("DENOMINATOR")
-)
+# Function to log DataFrame details
+def log_dataframe_details(df, name):
+    logger.info(f"Inspecting DataFrame: {name}")
+    logger.info(f"Schema: {df.schema}")
+    logger.info(f"Row count: {df.count()}")
+    logger.info(f"Show first 5 rows: {df.show(5, truncate=False)}")
+    logger.info(f"Is cached: {df.is_cached}")
+    logger.info(f"Storage level: {df.storageLevel}")
 
-# Display the result
-display(monitoring_metric_df)
+try:
+    # Assuming mapped_roles_simplified and additional_mapped_roles are defined
+    logger.info("Starting union of mapped roles DataFrames")
+    
+    all_mapped_roles = mapped_roles_simplified.union(additional_mapped_roles)
+    log_dataframe_details(all_mapped_roles, "all_mapped_roles")
 
+    logger.info("Filtering and aggregating Machine roles")
+    machine_roles_count = all_mapped_roles.filter(
+        col("Role_Type") == "MACHINE"
+    ).agg(
+        count("*").alias("Machine_Roles_Count")
+    )
+    log_dataframe_details(machine_roles_count, "machine_roles_count")
 
+    # Test output with show (safer than collect)
+    logger.info("Attempting to display machine_roles_count with show")
+    machine_roles_count.show()
 
+    # Optionally test collect with logging for debugging
+    logger.info("Attempting to collect machine_roles_count (if needed)")
+    try:
+        machine_count_value = machine_roles_count.collect()[0]["Machine_Roles_Count"]
+        logger.info(f"Successfully collected count: {machine_count_value}")
+        print(machine_count_value)
+    except Exception as e:
+        logger.error(f"Error during collect: {str(e)}")
 
-monitoring_metric_df.write \
-    .format(SNOWFLAKE_SOURCE_NAME) \
-    .options(**sfOptions) \
-    .option("dbtable", "YOUR_TARGET_TABLE") \
-    .mode("append") \
-    .save()
+    # Optionally test display if show works
+    logger.info("Attempting to display machine_roles_count with Databricks display")
+    display(machine_roles_count)
+
+except Exception as e:
+    logger.error(f"Unexpected error in pipeline: {str(e)}")
+    raise
+
+# Log Databricks runtime version for reference
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.getOrCreate()
+logger.info(f"Databricks Runtime Version: {spark.version}")
