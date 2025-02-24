@@ -1,69 +1,411 @@
-import logging
-from pyspark.sql.functions import col, count
-from pyspark.sql import SparkSession
+# DataBricks Notebook - Pipeline3
+"""
+This notebook combines the functionality of Pipeline1 and Pipeline2 to:
+1. Accurately identify machine roles from IAM resources
+2. Filter roles based on approved accounts from API
+3. Calculate compliance metrics for machine roles
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(levelname)s - %(message)s',
-                    filename='databricks_debug.log')  # Logs to a file; use console by removing filename
+Dependencies:
+- Access to EIAM_DB.PHDP_CYBR_IAM database
+- Valid API credentials for account retrieval
+- PySpark environment
+"""
 
-logger = logging.getLogger(__name__)
+# Validate DataBricks Environment
+if not 'spark' in locals():
+    raise Exception("No Spark session found. This notebook must be run in DataBricks.")
 
-# Function to log DataFrame details safely, checking for emptiness
-def log_dataframe_details_safely(df, name):
-    logger.info(f"Inspecting DataFrame: {name}")
-    logger.info(f"Schema: {df.schema}")
+# Import required packages
+try:
+    import requests
+    import pandas as pd
+    from pyspark.sql.functions import (
+        col, count, when, round, lit, max as sql_max, min as sql_min, 
+        coalesce, upper, regexp_replace, current_timestamp
+    )
+    from typing import List, Dict, Optional
+    from datetime import datetime
+    from requests.adapters import HTTPAdapter
+    from requests.packages.urllib3.util.retry import Retry
+except ImportError as e:
+    raise ImportError(f"Required package not found: {str(e)}. Please ensure all dependencies are installed.")
+
+# Configure requests with retry logic
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[500, 502, 503, 504]
+)
+http = requests.Session()
+http.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+
+def log_step(step_name: str, details: Optional[str] = None) -> None:
+    """Log execution step with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n[{timestamp}] {step_name}")
+    if details:
+        print(f"Details: {details}")
+
+def validate_dataframe(
+    df: "pyspark.sql.DataFrame",
+    expected_cols: List[str],
+    min_count: int = 1
+) -> bool:
+    """
+    Validate DataFrame meets minimum requirements.
+    
+    Args:
+        df: DataFrame to validate
+        expected_cols: List of required columns
+        min_count: Minimum number of records required
+        
+    Returns:
+        bool: True if validation passes
+    """
+    # Check for required columns
+    missing_cols = [col for col in expected_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+    
+    # Check minimum record count
+    count = df.count()
+    if count < min_count:
+        raise ValueError(f"DataFrame has insufficient records. Expected >= {min_count}, got {count}")
+    
+    return True
+
+# Snowflake Connection Setup
+username = dbutils.secrets.get(scope="", key="")
+password = dbutils.secrets.get(scope="", key="")
+
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowfalke"
+sfOptions = dict(
+    sfUrl="",
+    sfUser=username,
+    sfPassword=password,
+    sfDatabase="",
+    sfWarehouse=""
+)
+
+# CodeBlock 2: API Configuration and Call
+url = ""
+auth_token = ""
+
+headers = {
+    'X-Cloud-Accounts-Buinsess-Application': '',
+    'Authorization': f'Bearer {auth_token}',
+    'Accept': 'application/json;v=2',
+    'Content-Type': 'application/json'
+}
+
+params = {
+    'accountStatus': 'Active',
+    'region': ['listofregions']
+}
+
+def get_approved_accounts() -> "pyspark.sql.DataFrame":
+    """
+    Retrieve approved accounts via API call.
+    
+    Returns:
+        DataFrame with validated account numbers
+    
+    Raises:
+        Exception: If API call fails or no valid accounts found
+    """
     try:
-        # Use take(1) to check for rows without triggering count()
-        sample_rows = df.take(1)  # Safely fetch up to 1 row
-        is_empty = len(sample_rows) == 0
-        logger.info(f"Is empty: {is_empty}")
-        if not is_empty:
-            logger.info(f"Sample row: {sample_rows}")
+        log_step("Retrieving approved accounts via API")
+        
+        response = requests.get(url, headers=headers, params=params, verify=False)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Extract and validate account numbers
+            account_numbers = [
+                acc['accountNumber'] for acc in data['accounts']
+                if acc.get('accountNumber') and acc['accountNumber'].strip()
+            ]
+            
+            if not account_numbers:
+                raise ValueError("No valid account numbers received from API")
+                
+            df_approved_accounts = spark.createDataFrame(
+                [(acc,) for acc in account_numbers],
+                ['accountNumber']
+            )
+            
+            log_step("API account retrieval successful", 
+                    f"Retrieved {len(account_numbers)} approved accounts")
+            
+            validate_dataframe(
+                df_approved_accounts,
+                expected_cols=['accountNumber'],
+                min_count=1
+            )
+            
+            return df_approved_accounts
+            
         else:
-            logger.info("No rows found in DataFrame")
+            raise Exception(f"API Call Failed with Status Code {response.status_code}: {response.text}")
+
     except Exception as e:
-        logger.error(f"Error fetching sample row: {str(e)}")
-    logger.info(f"Is cached: {df.is_cached}")
-    logger.info(f"Storage level: {df.storageLevel}")
-    logger.info(f"Number of partitions: {df.rdd.getNumPartitions()}")
+        log_step("ERROR in API call", str(e))
+        raise
+
+# CodeBlock 3: Base Queries
+# Query to get all IAM roles, using uppercase for case-insensitive matching
+all_iam_roles_query = """
+SELECT DISTINCT
+    RESOURCE_ID,
+    UPPER(AMAZON_RESOURCE_NAME) as AMAZON_RESOURCE_NAME,
+    BA,
+    ACCOUNT,
+    CREATE_DATE,
+    TYPE,
+    FULL_RECORD,
+    CURRENT_TIMESTAMP() as LOAD_TIMESTAMP
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+WHERE TYPE = 'role'
+    AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
+    AND NOT REGEXP_LIKE(UPPER(FULL_RECORD), '.*(DENY[-]?ALL|QUARANTINEPOLICY).*')
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY RESOURCE_ID 
+    ORDER BY CREATE_DATE DESC
+) = 1
+"""
+
+# Query to get role type mappings, handling duplicates and nulls
+violation_roles_query = """
+WITH Violation_Raw AS (
+    SELECT 
+        UPPER(RESOURCE_NAME) as RESOURCE_NAME,
+        ROLE_TYPE,
+        CREATE_DATE,
+        ROW_NUMBER() OVER (
+            PARTITION BY RESOURCE_NAME 
+            ORDER BY CREATE_DATE DESC, ROLE_TYPE
+        ) AS rn
+    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+    WHERE ROLE_TYPE IS NOT NULL
+)
+SELECT 
+    RESOURCE_NAME,
+    ROLE_TYPE,
+    CREATE_DATE
+FROM Violation_Raw
+WHERE rn = 1
+"""
+
+# Query to get evaluated roles
+evaluated_roles_query = """
+SELECT DISTINCT 
+    UPPER(RESOURCE_NAME) as RESOURCE_NAME
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
+"""
 
 try:
-    # Log initial state
-    logger.info("Starting analysis of mapped roles DataFrames")
+    # Get approved accounts
+    df_approved_accounts = get_approved_accounts()
 
-    # Log schemas and emptiness of input DataFrames before union
-    logger.info("Inspecting mapped_roles_simplified:")
-    log_dataframe_details_safely(mapped_roles_simplified, "mapped_roles_simplified")
-    logger.info("Inspecting additional_mapped_roles:")
-    log_dataframe_details_safely(additional_mapped_roles, "additional_mapped_roles")
+    # Step 1: Load all IAM roles with their full information
+    log_step("Loading IAM roles")
+    df_all_iam_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", all_iam_roles_query) \
+        .load()
+    
+    # Validate account numbers and basic role information
+    df_all_iam_roles = df_all_iam_roles.filter(
+        col("ACCOUNT").isNotNull() & 
+        (col("ACCOUNT") != "") & 
+        regexp_replace(col("ACCOUNT"), "[^0-9]", "").cast("string") == col("ACCOUNT")
+    )
+    
+    validate_dataframe(
+        df_all_iam_roles,
+        expected_cols=['RESOURCE_ID', 'AMAZON_RESOURCE_NAME', 'ACCOUNT'],
+        min_count=1
+    )
+    log_step("IAM roles loaded", f"Total Valid IAM Roles: {df_all_iam_roles.count()}")
 
-    # Perform union and log immediately
-    logger.info("Performing union of mapped roles DataFrames")
-    all_mapped_roles = mapped_roles_simplified.union(additional_mapped_roles)
-    log_dataframe_details_safely(all_mapped_roles, "all_mapped_roles")
+    # Step 2: Load violation roles mapping
+    log_step("Loading violation roles mapping")
+    df_violation_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", violation_roles_query) \
+        .load()
+    
+    validate_dataframe(
+        df_violation_roles,
+        expected_cols=['RESOURCE_NAME', 'ROLE_TYPE'],
+        min_count=1
+    )
+    log_step("Violation roles loaded", f"Total Violation Roles: {df_violation_roles.count()}")
 
-    # Process further if not empty
-    if len(all_mapped_roles.take(1)) > 0:  # Safe check for emptiness
-        logger.info("Filtering and aggregating Machine roles")
-        machine_roles_count = all_mapped_roles.filter(
-            col("Role_Type") == "MACHINE"
-        ).agg(
-            count("*").alias("Machine_Roles_Count")
+    # Step 3: Load evaluated roles
+    log_step("Loading evaluated roles")
+    df_evaluated_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", evaluated_roles_query) \
+        .load()
+    
+    validate_dataframe(
+        df_evaluated_roles,
+        expected_cols=['RESOURCE_NAME'],
+        min_count=1
+    )
+    log_step("Evaluated roles loaded", f"Total Evaluated Roles: {df_evaluated_roles.count()}")
+
+    # Step 4: Create initial mapping with full role information
+    log_step("Creating initial role mapping")
+    df_initial_mapping = df_all_iam_roles \
+        .join(
+            df_violation_roles,
+            df_all_iam_roles.AMAZON_RESOURCE_NAME == df_violation_roles.RESOURCE_NAME,
+            "left"
+        ) \
+        .join(
+            df_evaluated_roles,
+            df_all_iam_roles.AMAZON_RESOURCE_NAME == df_evaluated_roles.RESOURCE_NAME,
+            "left"
+        ) \
+        .select(
+            df_all_iam_roles.RESOURCE_ID,
+            df_all_iam_roles.AMAZON_RESOURCE_NAME,
+            df_all_iam_roles.BA,
+            df_all_iam_roles.ACCOUNT,
+            df_all_iam_roles.CREATE_DATE,
+            df_all_iam_roles.LOAD_TIMESTAMP,
+            coalesce(df_violation_roles.ROLE_TYPE, lit("NOT FOUND")).alias("ROLE_TYPE"),
+            when(df_evaluated_roles.RESOURCE_NAME.isNotNull(), 1).otherwise(0).alias("IS_EVALUATED"),
+            lit("INITIAL_MAPPING").alias("MAPPING_SOURCE")
         )
-        log_dataframe_details_safely(machine_roles_count, "machine_roles_count")
+    
+    log_step("Initial mapping complete", f"Initially Mapped Roles: {df_initial_mapping.count()}")
 
-        # Test output with show (safer than collect)
-        logger.info("Attempting to display machine_roles_count with show")
-        machine_roles_count.show()
-    else:
-        logger.warning("all_mapped_roles is empty, skipping further processing")
+    # Step 5: Find unmapped resources
+    log_step("Finding unmapped resources")
+    df_unmapped = df_all_iam_roles.join(
+        df_initial_mapping,
+        df_all_iam_roles.RESOURCE_ID == df_initial_mapping.RESOURCE_ID,
+        "left_anti"
+    )
+    log_step("Unmapped resources identified", f"Unmapped Roles: {df_unmapped.count()}")
 
-    # Log Spark and Databricks runtime versions
-    spark = SparkSession.builder.getOrCreate()
-    logger.info(f"Spark Version: {spark.version}")
-    logger.info(f"Databricks Runtime Version: {spark.conf.get('spark.databricks.clusterUsageTags.databricksRuntimeVersion', 'Unknown')}")
+    # Step 6: Check unmapped resources in violations dataset
+    log_step("Validating unmapped resources")
+    df_unmapped_validation = df_unmapped.join(
+        df_violation_roles,
+        df_unmapped.AMAZON_RESOURCE_NAME == df_violation_roles.RESOURCE_NAME,
+        "left"
+    ).select(
+        df_unmapped.RESOURCE_ID,
+        df_unmapped.AMAZON_RESOURCE_NAME,
+        df_unmapped.BA,
+        df_unmapped.ACCOUNT,
+        df_unmapped.CREATE_DATE,
+        df_unmapped.LOAD_TIMESTAMP,
+        coalesce(df_violation_roles.ROLE_TYPE, lit("NOT FOUND")).alias("ROLE_TYPE"),
+        lit(0).alias("IS_EVALUATED"),
+        lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
+    )
+    log_step("Unmapped validation complete", 
+             f"Validated Unmapped Roles: {df_unmapped_validation.count()}")
+
+    # Step 7: Combine all roles and deduplicate
+    log_step("Combining and deduplicating roles")
+    df_all_roles = df_initial_mapping.union(df_unmapped_validation) \
+        .dropDuplicates(["RESOURCE_ID"]) \
+        .orderBy(col("LOAD_TIMESTAMP").desc())
+
+    # Validate role type distribution
+    role_type_dist = df_all_roles.groupBy("ROLE_TYPE", "MAPPING_SOURCE").count()
+    log_step("Role combination complete", "Role Type Distribution by Mapping Source:")
+    role_type_dist.show()
+
+    # Step 8: Filter for machine roles only
+    log_step("Filtering for machine roles")
+    df_machine_roles = df_all_roles.filter(col("ROLE_TYPE") == "MACHINE")
+    log_step("Machine roles filtered", f"Total Machine Roles Found: {df_machine_roles.count()}")
+
+    # Step 9: Join with approved accounts
+    log_step("Filtering for approved accounts")
+    df_filtered = df_machine_roles.join(
+        df_approved_accounts,
+        upper(df_machine_roles.ACCOUNT) == upper(df_approved_accounts.accountNumber),
+        "inner"
+    )
+    log_step("Account filtering complete", 
+             f"Machine Roles in Approved Accounts: {df_filtered.count()}")
+
+    # Create temporary view for final metrics calculation
+    df_filtered.createOrReplaceTempView("filtered_machine_roles")
+    
+    # Calculate final compliance metrics
+    log_step("Calculating compliance metrics")
+    final_metrics_query = """
+    WITH Count_Calculations AS (
+        SELECT
+            COUNT(*) as denominator,
+            SUM(CASE WHEN IS_EVALUATED = 1 THEN 1 ELSE 0 END) as numerator
+        FROM filtered_machine_roles
+    )
+    SELECT
+        CURRENT_DATE() AS DATE,
+        'MNTR-1071824-T1' AS MONITORING_METRIC_NUMBER,
+        ROUND(100.0 * numerator / denominator, 2) AS MONITORING_METRIC,
+        CASE
+            WHEN ROUND(100.0 * numerator / denominator, 2) >= 98 THEN 'GREEN'
+            WHEN ROUND(100.0 * numerator / denominator, 2) >= 95 THEN 'YELLOW'
+            ELSE 'RED'
+        END AS COMPLIANCE_STATUS,
+        numerator AS NUMERATOR,
+        denominator AS DENOMINATOR
+    FROM Count_Calculations
+    """
+    
+    df_result = spark.sql(final_metrics_query)
+    
+    # Display final results
+    log_step("Pipeline Execution Summary")
+    print("\nDetailed Pipeline Results:")
+    print(f"1. Total Valid IAM Roles: {df_all_iam_roles.count()}")
+    print(f"2. Initially Mapped Roles: {df_initial_mapping.count()}")
+    print(f"3. Unmapped Roles Found: {df_unmapped.count()}")
+    print(f"4. Validated Unmapped Roles: {df_unmapped_validation.count()}")
+    print(f"5. Total Combined Roles: {df_all_roles.count()}")
+    print(f"6. Total Machine Roles: {df_machine_roles.count()}")
+    print(f"7. Machine Roles in Approved Accounts: {df_filtered.count()}")
+    
+    print("\nRole Type Distribution:")
+    df_all_roles.groupBy("ROLE_TYPE", "MAPPING_SOURCE") \
+        .count() \
+        .orderBy("ROLE_TYPE", "count") \
+        .show()
+    
+    print("\nFinal Compliance Metrics:")
+    df_result.show()
+
+    # Validate final results
+    if df_result.count() == 0:
+        raise ValueError("No compliance metrics generated")
+    
+    log_step("Pipeline execution completed successfully")
 
 except Exception as e:
-    logger.error(f"Unexpected error in pipeline: {str(e)}")
+    log_step("ERROR", f"Pipeline execution failed: {str(e)}")
     raise
+
+finally:
+    # Clean up resources
+    log_step("Cleanup", "Removing temporary views and cached DataFrames")
+    spark.catalog.dropTempView("filtered_machine_roles")
+    # Unpersist cached DataFrames if any
+    for df in [df_all_roles, df_filtered]:
+        try:
+            if df and df.is_cached:
+                df.unpersist()
+        except Exception:
+            pass  # Ignore cleanup errors
