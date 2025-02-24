@@ -77,45 +77,58 @@ try:
         ) \
         .dropDuplicates(["RESOURCE_ID"])  # Ensure no duplicates after joins
     
-    log_step("Initial mapping complete", f"Initially Mapped Roles: {df_initial_mapping.count()}")
+    initial_mapping_count = df_initial_mapping.count()
+    log_step("Initial mapping complete", f"Initially Mapped Roles: {initial_mapping_count}")
 
-    # Step 5: Find unmapped resources
-    log_step("Finding unmapped resources")
-    df_unmapped = df_all_iam_roles.alias("iam") \
-        .join(
-            df_initial_mapping.alias("init"),
-            col("iam.RESOURCE_ID") == col("init.RESOURCE_ID"),
-            "left_anti"
-        )
-    log_step("Unmapped resources identified", f"Unmapped Roles: {df_unmapped.count()}")
+    # Check if we need to process unmapped roles
+    if initial_mapping_count < df_all_iam_roles.count():
+        log_step("Processing unmapped roles", "Found potentially unmapped roles, starting validation")
+        
+        # Step 5: Find unmapped resources
+        log_step("Finding unmapped resources")
+        df_unmapped = df_all_iam_roles.alias("iam") \
+            .join(
+                df_initial_mapping.alias("init"),
+                col("iam.RESOURCE_ID") == col("init.RESOURCE_ID"),
+                "left_anti"
+            )
+        unmapped_count = df_unmapped.count()
+        log_step("Unmapped resources identified", f"Unmapped Roles: {unmapped_count}")
 
-    # Step 6: Check unmapped resources in violations dataset
-    log_step("Validating unmapped resources")
-    df_unmapped_validation = df_unmapped.alias("unmap") \
-        .join(
-            df_violation_roles.alias("viol"),
-            col("unmap.AMAZON_RESOURCE_NAME") == col("viol.RESOURCE_NAME"),
-            "left"
-        ) \
-        .select(
-            col("unmap.RESOURCE_ID"),
-            col("unmap.AMAZON_RESOURCE_NAME"),
-            col("unmap.BA"),
-            col("unmap.ACCOUNT"),
-            col("unmap.CREATE_DATE"),
-            col("unmap.LOAD_TIMESTAMP"),
-            coalesce(col("viol.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
-            lit(0).alias("IS_EVALUATED"),
-            lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
-        )
-    log_step("Unmapped validation complete", 
-             f"Validated Unmapped Roles: {df_unmapped_validation.count()}")
+        if unmapped_count > 0:
+            # Step 6: Check unmapped resources in violations dataset
+            log_step("Validating unmapped resources")
+            df_unmapped_validation = df_unmapped.alias("unmap") \
+                .join(
+                    df_violation_roles.alias("viol"),
+                    col("unmap.AMAZON_RESOURCE_NAME") == col("viol.RESOURCE_NAME"),
+                    "left"
+                ) \
+                .select(
+                    col("unmap.RESOURCE_ID"),
+                    col("unmap.AMAZON_RESOURCE_NAME"),
+                    col("unmap.BA"),
+                    col("unmap.ACCOUNT"),
+                    col("unmap.CREATE_DATE"),
+                    col("unmap.LOAD_TIMESTAMP"),
+                    coalesce(col("viol.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
+                    lit(0).alias("IS_EVALUATED"),
+                    lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
+                )
+            log_step("Unmapped validation complete", 
+                    f"Validated Unmapped Roles: {df_unmapped_validation.count()}")
 
-    # Step 7: Combine all roles and deduplicate
-    log_step("Combining and deduplicating roles")
-    df_all_roles = df_initial_mapping.union(df_unmapped_validation) \
-        .dropDuplicates(["RESOURCE_ID"]) \
-        .orderBy(col("LOAD_TIMESTAMP").desc())
+            # Step 7: Combine all roles and deduplicate
+            log_step("Combining and deduplicating roles")
+            df_all_roles = df_initial_mapping.union(df_unmapped_validation) \
+                .dropDuplicates(["RESOURCE_ID"]) \
+                .orderBy(col("LOAD_TIMESTAMP").desc())
+        else:
+            log_step("Skipping unmapped validation", "No unmapped roles found")
+            df_all_roles = df_initial_mapping
+    else:
+        log_step("Skipping unmapped processing", "All roles are already mapped in initial mapping")
+        df_all_roles = df_initial_mapping
 
     # Step 8: Filter for machine roles only
     log_step("Filtering for machine roles")
@@ -138,3 +151,83 @@ try:
 except Exception as e:
     log_step("ERROR in data processing", f"Pipeline execution failed during data processing: {str(e)}")
     raise
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 6. Metrics Calculation and Results
+# MAGIC Calculate and display compliance metrics
+# MAGIC - Create temporary views
+# MAGIC - Calculate compliance metrics
+# MAGIC - Display detailed results and summaries
+# MAGIC - Perform cleanup operations
+
+try:
+    # Create temporary view for final metrics calculation
+    df_filtered.createOrReplaceTempView("filtered_machine_roles")
+    
+    # Calculate final compliance metrics
+    log_step("Calculating compliance metrics")
+    final_metrics_query = """
+    WITH Count_Calculations AS (
+        SELECT
+            COUNT(*) as denominator,
+            SUM(CASE WHEN IS_EVALUATED = 1 THEN 1 ELSE 0 END) as numerator
+        FROM filtered_machine_roles
+    )
+    SELECT
+        CURRENT_DATE() AS DATE,
+        'MNTR-1071824-T1' AS MONITORING_METRIC_NUMBER,
+        ROUND(100.0 * numerator / denominator, 2) AS MONITORING_METRIC,
+        CASE
+            WHEN ROUND(100.0 * numerator / denominator, 2) >= 98 THEN 'GREEN'
+            WHEN ROUND(100.0 * numerator / denominator, 2) >= 95 THEN 'YELLOW'
+            ELSE 'RED'
+        END AS COMPLIANCE_STATUS,
+        numerator AS NUMERATOR,
+        denominator AS DENOMINATOR
+    FROM Count_Calculations
+    """
+    
+    df_result = spark.sql(final_metrics_query)
+    
+    # Display final results
+    log_step("Pipeline Execution Summary")
+    print("\nDetailed Pipeline Results:")
+    print(f"1. Total Valid IAM Roles: {df_all_iam_roles.count()}")
+    print(f"2. Initially Mapped Roles: {df_initial_mapping.count()}")
+    print(f"3. Unmapped Roles Found: {df_unmapped.count()}")
+    print(f"4. Validated Unmapped Roles: {df_unmapped_validation.count()}")
+    print(f"5. Total Combined Roles: {df_all_roles.count()}")
+    print(f"6. Total Machine Roles: {df_machine_roles.count()}")
+    print(f"7. Machine Roles in Approved Accounts: {df_filtered.count()}")
+    
+    print("\nRole Type Distribution:")
+    df_all_roles.groupBy("ROLE_TYPE", "MAPPING_SOURCE") \
+        .count() \
+        .orderBy("ROLE_TYPE", "count") \
+        .show()
+    
+    print("\nFinal Compliance Metrics:")
+    df_result.show()
+
+    # Validate final results
+    if df_result.count() == 0:
+        raise ValueError("No compliance metrics generated")
+    
+    log_step("Pipeline execution completed successfully")
+
+except Exception as e:
+    log_step("ERROR in metrics calculation", f"Pipeline execution failed during metrics calculation: {str(e)}")
+    raise
+
+finally:
+    # Clean up resources
+    log_step("Cleanup", "Removing temporary views and cached DataFrames")
+    spark.catalog.dropTempView("filtered_machine_roles")
+    # Unpersist cached DataFrames if any
+    for df in [df_all_roles, df_filtered]:
+        try:
+            if df and df.is_cached:
+                df.unpersist()
+        except Exception:
+            pass  # Ignore cleanup errors
