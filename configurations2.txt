@@ -1,236 +1,3 @@
-# DataBricks Notebook - Pipeline3
-"""
-This notebook combines the functionality of Pipeline1 and Pipeline2 to:
-1. Accurately identify machine roles from IAM resources
-2. Filter roles based on approved accounts from API
-3. Calculate compliance metrics for machine roles
-
-Dependencies:
-- Access to EIAM_DB.PHDP_CYBR_IAM database
-- Valid API credentials for account retrieval
-- PySpark environment
-"""
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 1. Environment Setup and Imports
-# MAGIC Setup Spark environment, import required packages, and configure logging
-
-# Validate DataBricks Environment
-if not 'spark' in locals():
-    raise Exception("No Spark session found. This notebook must be run in DataBricks.")
-
-# Import required packages
-try:
-    import requests
-    import pandas as pd
-    from pyspark.sql.functions import (
-        col, count, when, round, lit, max as sql_max, min as sql_min, 
-        coalesce, upper, regexp_replace, current_timestamp
-    )
-    from typing import List, Dict, Optional
-    from datetime import datetime
-    from requests.adapters import HTTPAdapter
-    from requests.packages.urllib3.util.retry import Retry
-except ImportError as e:
-    raise ImportError(f"Required package not found: {str(e)}. Please ensure all dependencies are installed.")
-
-# Configure requests with retry logic
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[500, 502, 503, 504]
-)
-http = requests.Session()
-http.mount("https://", HTTPAdapter(max_retries=retry_strategy))
-
-def log_step(step_name: str, details: Optional[str] = None) -> None:
-    """Log execution step with timestamp."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n[{timestamp}] {step_name}")
-    if details:
-        print(f"Details: {details}")
-
-def validate_dataframe(
-    df: "pyspark.sql.DataFrame",
-    expected_cols: List[str],
-    min_count: int = 1
-) -> bool:
-    """
-    Validate DataFrame meets minimum requirements.
-    
-    Args:
-        df: DataFrame to validate
-        expected_cols: List of required columns
-        min_count: Minimum number of records required
-        
-    Returns:
-        bool: True if validation passes
-    """
-    # Check for required columns
-    missing_cols = [col for col in expected_cols if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
-    
-    # Check minimum record count
-    count = df.count()
-    if count < min_count:
-        raise ValueError(f"DataFrame has insufficient records. Expected >= {min_count}, got {count}")
-    
-    return True
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 2. Snowflake Connection Configuration
-# MAGIC Configure credentials and connection parameters for Snowflake
-
-# Snowflake Connection Setup
-username = dbutils.secrets.get(scope="", key="")
-password = dbutils.secrets.get(scope="", key="")
-
-SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowfalke"
-sfOptions = dict(
-    sfUrl="",
-    sfUser=username,
-    sfPassword=password,
-    sfDatabase="",
-    sfWarehouse=""
-)
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 3. API Configuration and Helper Functions
-# MAGIC Setup API parameters and define helper functions for account retrieval
-
-url = ""
-auth_token = ""
-
-headers = {
-    'X-Cloud-Accounts-Buinsess-Application': '',
-    'Authorization': f'Bearer {auth_token}',
-    'Accept': 'application/json;v=2',
-    'Content-Type': 'application/json'
-}
-
-params = {
-    'accountStatus': 'Active',
-    'region': ['listofregions']
-}
-
-def get_approved_accounts() -> "pyspark.sql.DataFrame":
-    """
-    Retrieve approved accounts via API call.
-    
-    Returns:
-        DataFrame with validated account numbers
-    
-    Raises:
-        Exception: If API call fails or no valid accounts found
-    """
-    try:
-        log_step("Retrieving approved accounts via API")
-        
-        response = requests.get(url, headers=headers, params=params, verify=False)
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Extract and validate account numbers
-            account_numbers = [
-                acc['accountNumber'] for acc in data['accounts']
-                if acc.get('accountNumber') and acc['accountNumber'].strip()
-            ]
-            
-            if not account_numbers:
-                raise ValueError("No valid account numbers received from API")
-                
-            df_approved_accounts = spark.createDataFrame(
-                [(acc,) for acc in account_numbers],
-                ['accountNumber']
-            )
-            
-            log_step("API account retrieval successful", 
-                    f"Retrieved {len(account_numbers)} approved accounts")
-            
-            validate_dataframe(
-                df_approved_accounts,
-                expected_cols=['accountNumber'],
-                min_count=1
-            )
-            
-            return df_approved_accounts
-            
-        else:
-            raise Exception(f"API Call Failed with Status Code {response.status_code}: {response.text}")
-
-    except Exception as e:
-        log_step("ERROR in API call", str(e))
-        raise
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 4. SQL Query Definitions
-# MAGIC Define base queries for retrieving IAM roles and violations data
-
-# Query to get all IAM roles, using uppercase for case-insensitive matching
-all_iam_roles_query = """
-SELECT DISTINCT
-    RESOURCE_ID,
-    UPPER(AMAZON_RESOURCE_NAME) as AMAZON_RESOURCE_NAME,
-    BA,
-    ACCOUNT,
-    CREATE_DATE,
-    TYPE,
-    FULL_RECORD,
-    CURRENT_TIMESTAMP() as LOAD_TIMESTAMP
-FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
-WHERE TYPE = 'role'
-    AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
-    AND NOT REGEXP_LIKE(UPPER(FULL_RECORD), '.*(DENY[-]?ALL|QUARANTINEPOLICY).*')
-QUALIFY ROW_NUMBER() OVER (
-    PARTITION BY RESOURCE_ID 
-    ORDER BY CREATE_DATE DESC
-) = 1
-"""
-
-# Query to get role type mappings, handling duplicates and nulls
-violation_roles_query = """
-WITH Violation_Raw AS (
-    SELECT 
-        UPPER(RESOURCE_NAME) as RESOURCE_NAME,
-        ROLE_TYPE,
-        CREATE_DATE,
-        ROW_NUMBER() OVER (
-            PARTITION BY RESOURCE_NAME 
-            ORDER BY CREATE_DATE DESC, ROLE_TYPE
-        ) AS rn
-    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
-    WHERE ROLE_TYPE IS NOT NULL
-)
-SELECT 
-    RESOURCE_NAME,
-    ROLE_TYPE,
-    CREATE_DATE
-FROM Violation_Raw
-WHERE rn = 1
-"""
-
-# Query to get evaluated roles
-evaluated_roles_query = """
-SELECT DISTINCT 
-    UPPER(RESOURCE_NAME) as RESOURCE_NAME
-FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
-WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
-"""
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 5. Main Pipeline Execution
-# MAGIC Process and transform data through the pipeline
-# MAGIC - Load data from various sources
-# MAGIC - Map and validate roles
-# MAGIC - Filter for machine roles in approved accounts
-
 try:
     # Get approved accounts
     df_approved_accounts = get_approved_accounts()
@@ -244,9 +11,9 @@ try:
     
     # Validate account numbers and basic role information
     df_all_iam_roles = df_all_iam_roles.filter(
-        col("ACCOUNT").isNotNull() & 
-        (col("ACCOUNT") != "") & 
-        regexp_replace(col("ACCOUNT"), "[^0-9]", "").cast("string") == col("ACCOUNT")
+        (col("ACCOUNT").isNotNull()) &  # Check for null
+        (col("ACCOUNT") != "") &        # Check for empty string
+        (col("ACCOUNT").rlike("^[0-9]+$"))  # Check for only digits using regex pattern
     )
     
     validate_dataframe(
@@ -286,57 +53,61 @@ try:
 
     # Step 4: Create initial mapping with full role information
     log_step("Creating initial role mapping")
-    df_initial_mapping = df_all_iam_roles \
+    df_initial_mapping = df_all_iam_roles.alias("iam") \
         .join(
-            df_violation_roles,
+            df_violation_roles.alias("viol"),
             df_all_iam_roles.AMAZON_RESOURCE_NAME == df_violation_roles.RESOURCE_NAME,
             "left"
         ) \
         .join(
-            df_evaluated_roles,
+            df_evaluated_roles.alias("eval"),
             df_all_iam_roles.AMAZON_RESOURCE_NAME == df_evaluated_roles.RESOURCE_NAME,
             "left"
         ) \
         .select(
-            df_all_iam_roles.RESOURCE_ID,
-            df_all_iam_roles.AMAZON_RESOURCE_NAME,
-            df_all_iam_roles.BA,
-            df_all_iam_roles.ACCOUNT,
-            df_all_iam_roles.CREATE_DATE,
-            df_all_iam_roles.LOAD_TIMESTAMP,
-            coalesce(df_violation_roles.ROLE_TYPE, lit("NOT FOUND")).alias("ROLE_TYPE"),
-            when(df_evaluated_roles.RESOURCE_NAME.isNotNull(), 1).otherwise(0).alias("IS_EVALUATED"),
+            col("iam.RESOURCE_ID"),
+            col("iam.AMAZON_RESOURCE_NAME"),
+            col("iam.BA"),
+            col("iam.ACCOUNT"),
+            col("iam.CREATE_DATE"),
+            col("iam.LOAD_TIMESTAMP"),
+            coalesce(col("viol.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
+            when(col("eval.RESOURCE_NAME").isNotNull(), 1).otherwise(0).alias("IS_EVALUATED"),
             lit("INITIAL_MAPPING").alias("MAPPING_SOURCE")
-        )
+        ) \
+        .dropDuplicates(["RESOURCE_ID"])  # Ensure no duplicates after joins
     
     log_step("Initial mapping complete", f"Initially Mapped Roles: {df_initial_mapping.count()}")
 
     # Step 5: Find unmapped resources
     log_step("Finding unmapped resources")
-    df_unmapped = df_all_iam_roles.join(
-        df_initial_mapping,
-        df_all_iam_roles.RESOURCE_ID == df_initial_mapping.RESOURCE_ID,
-        "left_anti"
-    )
+    df_unmapped = df_all_iam_roles.alias("iam") \
+        .join(
+            df_initial_mapping.alias("init"),
+            col("iam.RESOURCE_ID") == col("init.RESOURCE_ID"),
+            "left_anti"
+        )
     log_step("Unmapped resources identified", f"Unmapped Roles: {df_unmapped.count()}")
 
     # Step 6: Check unmapped resources in violations dataset
     log_step("Validating unmapped resources")
-    df_unmapped_validation = df_unmapped.join(
-        df_violation_roles,
-        df_unmapped.AMAZON_RESOURCE_NAME == df_violation_roles.RESOURCE_NAME,
-        "left"
-    ).select(
-        df_unmapped.RESOURCE_ID,
-        df_unmapped.AMAZON_RESOURCE_NAME,
-        df_unmapped.BA,
-        df_unmapped.ACCOUNT,
-        df_unmapped.CREATE_DATE,
-        df_unmapped.LOAD_TIMESTAMP,
-        coalesce(df_violation_roles.ROLE_TYPE, lit("NOT FOUND")).alias("ROLE_TYPE"),
-        lit(0).alias("IS_EVALUATED"),
-        lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
-    )
+    df_unmapped_validation = df_unmapped.alias("unmap") \
+        .join(
+            df_violation_roles.alias("viol"),
+            col("unmap.AMAZON_RESOURCE_NAME") == col("viol.RESOURCE_NAME"),
+            "left"
+        ) \
+        .select(
+            col("unmap.RESOURCE_ID"),
+            col("unmap.AMAZON_RESOURCE_NAME"),
+            col("unmap.BA"),
+            col("unmap.ACCOUNT"),
+            col("unmap.CREATE_DATE"),
+            col("unmap.LOAD_TIMESTAMP"),
+            coalesce(col("viol.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
+            lit(0).alias("IS_EVALUATED"),
+            lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
+        )
     log_step("Unmapped validation complete", 
              f"Validated Unmapped Roles: {df_unmapped_validation.count()}")
 
@@ -367,83 +138,3 @@ try:
 except Exception as e:
     log_step("ERROR in data processing", f"Pipeline execution failed during data processing: {str(e)}")
     raise
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## 6. Metrics Calculation and Results
-# MAGIC Calculate and display compliance metrics
-# MAGIC - Create temporary views
-# MAGIC - Calculate compliance metrics
-# MAGIC - Display detailed results and summaries
-# MAGIC - Perform cleanup operations
-
-try:
-    # Create temporary view for final metrics calculation
-    df_filtered.createOrReplaceTempView("filtered_machine_roles")
-    
-    # Calculate final compliance metrics
-    log_step("Calculating compliance metrics")
-    final_metrics_query = """
-    WITH Count_Calculations AS (
-        SELECT
-            COUNT(*) as denominator,
-            SUM(CASE WHEN IS_EVALUATED = 1 THEN 1 ELSE 0 END) as numerator
-        FROM filtered_machine_roles
-    )
-    SELECT
-        CURRENT_DATE() AS DATE,
-        'MNTR-1071824-T1' AS MONITORING_METRIC_NUMBER,
-        ROUND(100.0 * numerator / denominator, 2) AS MONITORING_METRIC,
-        CASE
-            WHEN ROUND(100.0 * numerator / denominator, 2) >= 98 THEN 'GREEN'
-            WHEN ROUND(100.0 * numerator / denominator, 2) >= 95 THEN 'YELLOW'
-            ELSE 'RED'
-        END AS COMPLIANCE_STATUS,
-        numerator AS NUMERATOR,
-        denominator AS DENOMINATOR
-    FROM Count_Calculations
-    """
-    
-    df_result = spark.sql(final_metrics_query)
-    
-    # Display final results
-    log_step("Pipeline Execution Summary")
-    print("\nDetailed Pipeline Results:")
-    print(f"1. Total Valid IAM Roles: {df_all_iam_roles.count()}")
-    print(f"2. Initially Mapped Roles: {df_initial_mapping.count()}")
-    print(f"3. Unmapped Roles Found: {df_unmapped.count()}")
-    print(f"4. Validated Unmapped Roles: {df_unmapped_validation.count()}")
-    print(f"5. Total Combined Roles: {df_all_roles.count()}")
-    print(f"6. Total Machine Roles: {df_machine_roles.count()}")
-    print(f"7. Machine Roles in Approved Accounts: {df_filtered.count()}")
-    
-    print("\nRole Type Distribution:")
-    df_all_roles.groupBy("ROLE_TYPE", "MAPPING_SOURCE") \
-        .count() \
-        .orderBy("ROLE_TYPE", "count") \
-        .show()
-    
-    print("\nFinal Compliance Metrics:")
-    df_result.show()
-
-    # Validate final results
-    if df_result.count() == 0:
-        raise ValueError("No compliance metrics generated")
-    
-    log_step("Pipeline execution completed successfully")
-
-except Exception as e:
-    log_step("ERROR in metrics calculation", f"Pipeline execution failed during metrics calculation: {str(e)}")
-    raise
-
-finally:
-    # Clean up resources
-    log_step("Cleanup", "Removing temporary views and cached DataFrames")
-    spark.catalog.dropTempView("filtered_machine_roles")
-    # Unpersist cached DataFrames if any
-    for df in [df_all_roles, df_filtered]:
-        try:
-            if df and df.is_cached:
-                df.unpersist()
-        except Exception:
-            pass  # Ignore cleanup errors
