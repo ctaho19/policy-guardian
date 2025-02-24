@@ -11,6 +11,11 @@ Dependencies:
 - PySpark environment
 """
 
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 1. Environment Setup and Imports
+# MAGIC Setup Spark environment, import required packages, and configure logging
+
 # Validate DataBricks Environment
 if not 'spark' in locals():
     raise Exception("No Spark session found. This notebook must be run in DataBricks.")
@@ -74,6 +79,11 @@ def validate_dataframe(
     
     return True
 
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 2. Snowflake Connection Configuration
+# MAGIC Configure credentials and connection parameters for Snowflake
+
 # Snowflake Connection Setup
 username = dbutils.secrets.get(scope="", key="")
 password = dbutils.secrets.get(scope="", key="")
@@ -87,7 +97,11 @@ sfOptions = dict(
     sfWarehouse=""
 )
 
-# CodeBlock 2: API Configuration and Call
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 3. API Configuration and Helper Functions
+# MAGIC Setup API parameters and define helper functions for account retrieval
+
 url = ""
 auth_token = ""
 
@@ -153,7 +167,11 @@ def get_approved_accounts() -> "pyspark.sql.DataFrame":
         log_step("ERROR in API call", str(e))
         raise
 
-# CodeBlock 3: Base Queries
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 4. SQL Query Definitions
+# MAGIC Define base queries for retrieving IAM roles and violations data
+
 # Query to get all IAM roles, using uppercase for case-insensitive matching
 all_iam_roles_query = """
 SELECT DISTINCT
@@ -204,6 +222,14 @@ SELECT DISTINCT
 FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
 WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
 """
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 5. Main Pipeline Execution
+# MAGIC Process and transform data through the pipeline
+# MAGIC - Load data from various sources
+# MAGIC - Map and validate roles
+# MAGIC - Filter for machine roles in approved accounts
 
 try:
     # Get approved accounts
@@ -320,11 +346,6 @@ try:
         .dropDuplicates(["RESOURCE_ID"]) \
         .orderBy(col("LOAD_TIMESTAMP").desc())
 
-    # Validate role type distribution
-    role_type_dist = df_all_roles.groupBy("ROLE_TYPE", "MAPPING_SOURCE").count()
-    log_step("Role combination complete", "Role Type Distribution by Mapping Source:")
-    role_type_dist.show()
-
     # Step 8: Filter for machine roles only
     log_step("Filtering for machine roles")
     df_machine_roles = df_all_roles.filter(col("ROLE_TYPE") == "MACHINE")
@@ -340,6 +361,23 @@ try:
     log_step("Account filtering complete", 
              f"Machine Roles in Approved Accounts: {df_filtered.count()}")
 
+    # Cache the filtered results for metrics calculation
+    df_filtered.cache()
+
+except Exception as e:
+    log_step("ERROR in data processing", f"Pipeline execution failed during data processing: {str(e)}")
+    raise
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 6. Metrics Calculation and Results
+# MAGIC Calculate and display compliance metrics
+# MAGIC - Create temporary views
+# MAGIC - Calculate compliance metrics
+# MAGIC - Display detailed results and summaries
+# MAGIC - Perform cleanup operations
+
+try:
     # Create temporary view for final metrics calculation
     df_filtered.createOrReplaceTempView("filtered_machine_roles")
     
@@ -395,7 +433,7 @@ try:
     log_step("Pipeline execution completed successfully")
 
 except Exception as e:
-    log_step("ERROR", f"Pipeline execution failed: {str(e)}")
+    log_step("ERROR in metrics calculation", f"Pipeline execution failed during metrics calculation: {str(e)}")
     raise
 
 finally:
