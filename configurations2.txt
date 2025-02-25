@@ -1,7 +1,7 @@
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## 8. Tier 2 Compliance Analysis
-# MAGIC Analyze compliance status of evaluated roles
+# MAGIC Calculate compliance metrics for evaluated roles
 
 try:
     # Get thresholds for Tier 2
@@ -60,6 +60,21 @@ try:
     
     df_tier2_result = spark.createDataFrame(tier2_metrics_data, tier2_metrics_schema)
     
+    # Display results
+    log_step("Tier 2 Metrics")
+    df_tier2_result.show()
+    
+except Exception as e:
+    log_step("ERROR in Tier 2 analysis", 
+             f"Failed to generate Tier 2 metrics: {str(e)}")
+    raise
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 9. Tier 2 Supporting Evidence
+# MAGIC Display details of non-compliant evaluated roles
+
+try:
     # Create supporting evidence DataFrame
     evidence_schema = StructType([
         StructField("RESOURCE_ID", StringType(), True),
@@ -91,13 +106,10 @@ try:
         ], evidence_schema)
     
     # Display results
-    log_step("Tier 2 Metrics")
-    df_tier2_result.show()
-    
     log_step("Tier 2 Supporting Evidence")
     df_tier2_evidence.show(20, truncate=False)
     
 except Exception as e:
-    log_step("ERROR in Tier 2 analysis", 
-             f"Failed to generate Tier 2 metrics: {str(e)}")
+    log_step("ERROR in Tier 2 supporting evidence", 
+             f"Failed to generate supporting evidence: {str(e)}")
     raise
