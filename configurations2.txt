@@ -1,63 +1,385 @@
+# Validate DataBricks Environment
+if not 'spark' in locals():
+    raise Exception("No Spark session found. This notebook must be run in DataBricks.")
+
+# Import required packages
 try:
-    # Get thresholds from Snowflake
-    threshold_query = """
+    import requests
+    import pandas as pd
+    from pyspark.sql.functions import (
+        col, count, when, round, lit, max as sql_max, min as sql_min, 
+        coalesce, upper, regexp_replace, current_timestamp, current_date,
+        row_number
+    )
+    from pyspark.sql import Window
+    from typing import List, Dict, Optional
+    from datetime import datetime
+    from requests.adapters import HTTPAdapter
+    from requests.packages.urllib3.util.retry import Retry
+    from pyspark.sql.types import StructType, StructField, DateType, StringType, DoubleType, LongType, TimestampType
+except ImportError as e:
+    raise ImportError(f"Required package not found: {str(e)}. Please ensure all dependencies are installed.")
+
+# Configure requests with retry logic
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[500, 502, 503, 504]
+)
+http = requests.Session()
+http.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+
+def log_step(step_name: str, details: Optional[str] = None) -> None:
+    """Log execution step with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n[{timestamp}] {step_name}")
+    if details:
+        print(f"Details: {details}")
+
+def validate_dataframe(df: "pyspark.sql.DataFrame", name: str) -> bool:
+    """Validate DataFrame is not empty and has expected columns."""
+    try:
+        count = df.count()
+        if count == 0:
+            raise ValueError(f"DataFrame {name} is empty")
+        log_step(f"Validated {name}", f"Count: {count}")
+        return True
+    except Exception as e:
+        log_step(f"ERROR validating {name}", str(e))
+        raise
+
+# Snowflake Connection Setup
+username = dbutils.secrets.get(scope="your-scope", key="username-key")
+password = dbutils.secrets.get(scope="your-scope", key="password-key")
+
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+sfOptions = dict(
+    sfUrl="your-snowflake-url",
+    sfUser=username,
+    sfPassword=password,
+    sfDatabase="your-database",
+    sfWarehouse="your-warehouse"
+)
+
+# CodeBlock 2: API Configuration and Call
+url = "your-api-url"
+auth_token = "your-auth-token"
+
+headers = {
+    'X-Cloud-Accounts-Business-Application': 'your-app-name',
+    'Authorization': f'Bearer {auth_token}',
+    'Accept': 'application/json;v=2',
+    'Content-Type': 'application/json'
+}
+
+params = {
+    'accountStatus': 'Active',
+    'region': ['region1', 'region2']
+}
+
+def get_approved_accounts() -> "pyspark.sql.DataFrame":
+    """Get approved accounts from the API."""
+    try:
+        response = requests.get(url, headers=headers, params=params, verify=False)
+        response.raise_for_status()
+        
+        # Convert response to DataFrame
+        accounts_data = response.json().get('accounts', [])
+        account_numbers = [{'ACCOUNT': str(account['accountNumber'])} for account in accounts_data]
+        return spark.createDataFrame(account_numbers)
+        
+    except Exception as e:
+        log_step("ERROR in API call", f"Failed to get approved accounts: {str(e)}")
+        raise
+
+# CodeBlock 3: Base Queries
+# Query to get all IAM roles, using uppercase for case-insensitive matching
+ALL_IAM_ROLES_QUERY = """
+SELECT DISTINCT
+    RESOURCE_ID,
+    UPPER(AMAZON_RESOURCE_NAME) as AMAZON_RESOURCE_NAME,
+    BA,
+    ACCOUNT,
+    CREATE_DATE,
+    TYPE,
+    FULL_RECORD,
+    CURRENT_TIMESTAMP() as LOAD_TIMESTAMP
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE
+WHERE TYPE = 'role'
+    AND AMAZON_RESOURCE_NAME LIKE 'arn:aws:iam::%role/%'
+    AND NOT REGEXP_LIKE(UPPER(FULL_RECORD), '.*(DENY[-]?ALL|QUARANTINEPOLICY).*')
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY RESOURCE_ID 
+    ORDER BY CREATE_DATE DESC
+) = 1
+"""
+
+# Query to get role type mappings, handling duplicates and nulls
+VIOLATION_ROLES_QUERY = """
+WITH Violation_Raw AS (
     SELECT 
-        MONITORING_METRIC_ID,
-        ALERT_THRESHOLD,
-        WARNING_THRESHOLD
-    FROM EIAM_DB.PHDP_CYBR_IAM.CYBER_CONTROLS_MONITORING_THRESHOLD
-    WHERE MONITORING_METRIC_ID = 'MNTR-XXXXX'
-    """
-    
-    thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        UPPER(RESOURCE_NAME) as RESOURCE_NAME,
+        ROLE_TYPE,
+        CREATE_DATE,
+        ROW_NUMBER() OVER (
+            PARTITION BY RESOURCE_NAME 
+            ORDER BY CREATE_DATE DESC, ROLE_TYPE
+        ) AS rn
+    FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+    WHERE ROLE_TYPE IS NOT NULL
+)
+SELECT 
+    RESOURCE_NAME,
+    ROLE_TYPE,
+    CREATE_DATE
+FROM Violation_Raw
+WHERE rn = 1
+"""
+
+# Query to get evaluated roles
+EVALUATED_ROLES_QUERY = """
+SELECT DISTINCT 
+    UPPER(RESOURCE_NAME) as RESOURCE_NAME
+FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+WHERE CONTROL_ID = 'CM-2.AWS.12.v02'
+"""
+
+try:
+    # Step 1: Get all IAM roles
+    log_step("Loading IAM roles")
+    df_all_iam_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
         .options(**sfOptions) \
-        .option("query", threshold_query) \
+        .option("query", ALL_IAM_ROLES_QUERY) \
         .load()
     
-    # Extract threshold values
-    alert_threshold = float(thresholds_df.collect()[0]['ALERT_THRESHOLD'])
-    warning_threshold = float(thresholds_df.collect()[0]['WARNING_THRESHOLD'])
+    # Validate ACCOUNT column contains only digits
+    df_all_iam_roles = df_all_iam_roles.filter(
+        col("ACCOUNT").isNotNull() & 
+        (length(trim(col("ACCOUNT"))) > 0) & 
+        col("ACCOUNT").rlike("^[0-9]+$")
+    )
     
-    # Calculate metrics using DataFrame operations
-    evaluated_count = df_filtered.filter(col("IS_EVALUATED") == 1).count()
-    total_count = df_filtered.count()
+    validate_dataframe(df_all_iam_roles, "IAM Roles")
     
-    # Convert to regular Python numbers for the metrics calculation
-    monitoring_metric_value = round(100.0 * evaluated_count / total_count, 2) if total_count > 0 else 0.0
+    # Step 2: Get violation roles
+    log_step("Loading violation roles")
+    df_violation_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", VIOLATION_ROLES_QUERY) \
+        .load()
     
-    # Simple Python logic for compliance status
-    if warning_threshold is not None and monitoring_metric_value <= warning_threshold:
-        compliance_status = "RED"
-    elif alert_threshold is not None and monitoring_metric_value <= alert_threshold:
-        compliance_status = "YELLOW"
+    validate_dataframe(df_violation_roles, "Violation Roles")
+    
+    # Step 3: Get evaluated roles
+    log_step("Loading evaluated roles")
+    df_evaluated_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", EVALUATED_ROLES_QUERY) \
+        .load()
+    
+    validate_dataframe(df_evaluated_roles, "Evaluated Roles")
+    
+    # Step 4: Create initial mapping with full role information
+    log_step("Creating initial role mapping")
+    
+    # Log pre-join counts
+    log_step("Pre-join counts", 
+             f"IAM Roles: {df_all_iam_roles.count()}, " + 
+             f"Violation Roles: {df_violation_roles.count()}, " +
+             f"Evaluated Roles: {df_evaluated_roles.count()}")
+
+    # Check for duplicates in join keys
+    log_step("Checking for duplicate keys",
+             f"Duplicate ARNs in violations: " +
+             f"{df_violation_roles.groupBy('RESOURCE_NAME').count().filter(col('count') > 1).count()}, " +
+             f"Duplicate ARNs in evaluations: " +
+             f"{df_evaluated_roles.groupBy('RESOURCE_NAME').count().filter(col('count') > 1).count()}")
+
+    # Modified join with duplicate prevention
+    df_initial_mapping = df_all_iam_roles.alias("roles") \
+        .join(
+            # Take latest record for each RESOURCE_NAME in violations
+            df_violation_roles.alias("violations")
+            .withColumn("rn", row_number().over(Window.partitionBy("RESOURCE_NAME").orderBy(desc("LOAD_TIMESTAMP"))))
+            .filter(col("rn") == 1)
+            .drop("rn"),
+            col("roles.AMAZON_RESOURCE_NAME") == col("violations.RESOURCE_NAME"),
+            "left"
+        ) \
+        .join(
+            # Take latest record for each RESOURCE_NAME in evaluations
+            df_evaluated_roles.alias("evaluated")
+            .withColumn("rn", row_number().over(Window.partitionBy("RESOURCE_NAME").orderBy(desc("LOAD_TIMESTAMP"))))
+            .filter(col("rn") == 1)
+            .drop("rn"),
+            col("roles.AMAZON_RESOURCE_NAME") == col("evaluated.RESOURCE_NAME"),
+            "left"
+        ) \
+        .select(
+            col("roles.RESOURCE_ID"),
+            col("roles.AMAZON_RESOURCE_NAME"),
+            col("roles.BA"),
+            col("roles.ACCOUNT"),
+            col("roles.CREATE_DATE"),
+            col("roles.LOAD_TIMESTAMP"),
+            coalesce(col("violations.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
+            when(col("evaluated.RESOURCE_NAME").isNotNull(), lit(1)).otherwise(lit(0)).alias("IS_EVALUATED"),
+            lit("INITIAL_MAPPING").alias("MAPPING_SOURCE")
+        )
+
+    # Log post-join counts
+    log_step("Post-join counts", f"Mapped Roles: {df_initial_mapping.count()}")
+    
+    validate_dataframe(df_initial_mapping, "Initial Mapping")
+
+    # Step 5: Find unmapped resources and validate if needed
+    log_step("Finding unmapped resources")
+    df_unmapped = df_all_iam_roles.alias("all_roles").join(
+        df_initial_mapping.alias("initial_mapping"),
+        col("all_roles.RESOURCE_ID") == col("initial_mapping.RESOURCE_ID"),
+        "left_anti"
+    )
+
+    unmapped_count = df_unmapped.count()
+    log_step("Unmapped resources identified", f"Unmapped Roles: {unmapped_count}")
+
+    if unmapped_count > 0:
+        log_step("Validating unmapped resources")
+        df_unmapped_validation = df_unmapped.alias("unmapped").join(
+            df_violation_roles.alias("violations"),
+            col("unmapped.AMAZON_RESOURCE_NAME") == col("violations.RESOURCE_NAME"),
+            "left"
+        ).select(
+            col("unmapped.RESOURCE_ID"),
+            col("unmapped.AMAZON_RESOURCE_NAME"),
+            col("unmapped.BA"),
+            col("unmapped.ACCOUNT"),
+            col("unmapped.CREATE_DATE"),
+            col("unmapped.LOAD_TIMESTAMP"),
+            coalesce(col("violations.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
+            lit(0).alias("IS_EVALUATED"),
+            lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
+        )
+        
+        df_final_mapping = df_initial_mapping.union(df_unmapped_validation)
+        log_step("Final mapping complete", f"Total Mapped Roles: {df_final_mapping.count()}")
     else:
-        compliance_status = "GREEN"
-    
-    # Create the metrics DataFrame
-    metrics_data = [(
-        current_date(),
-        'MNTR-XXXXX-T1',
-        monitoring_metric_value,
-        compliance_status,
-        evaluated_count,
-        total_count
-    )]
-    
-    metrics_schema = StructType([
-        StructField("DATE", DateType(), False),
-        StructField("MONITORING_METRIC_NUMBER", StringType(), False),
-        StructField("MONITORING_METRIC", DoubleType(), False),
-        StructField("COMPLIANCE_STATUS", StringType(), False),
-        StructField("NUMERATOR", LongType(), False),
-        StructField("DENOMINATOR", LongType(), False)
-    ])
-    
-    df_result = spark.createDataFrame(metrics_data, metrics_schema)
-    
-    # Display results
-    log_step("Final Compliance Metrics")
-    df_result.show()
+        log_step("Skipping unmapped validation", "No unmapped roles found - using initial mapping as final")
+        df_final_mapping = df_initial_mapping
+
+    # Step 8: Filter for approved accounts
+    log_step("Getting approved accounts")
+    df_approved_accounts = get_approved_accounts()
+    validate_dataframe(df_approved_accounts, "Approved Accounts")
+
+    # Filter roles in approved accounts
+    df_filtered = df_final_mapping.join(
+        df_approved_accounts,
+        df_final_mapping["ACCOUNT"] == df_approved_accounts["ACCOUNT"],
+        "inner"
+    )
+
+    log_step("Account filtering complete", f"Machine Roles in Approved Accounts: {df_filtered.count()}")
+
+    # Calculate metrics
+    try:
+        # Get thresholds from Snowflake
+        threshold_query = """
+        SELECT 
+            MONITORING_METRIC_ID,
+            ALERT_THRESHOLD,
+            WARNING_THRESHOLD
+        FROM EIAM_DB.PHDP_CYBR_IAM.CYBER_CONTROLS_MONITORING_THRESHOLD
+        WHERE MONITORING_METRIC_ID = 'MNTR-XXXXX'
+        """
+        
+        thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+            .options(**sfOptions) \
+            .option("query", threshold_query) \
+            .load()
+        
+        # Extract threshold values as Python floats
+        alert_threshold = float(thresholds_df.collect()[0]['ALERT_THRESHOLD'])
+        warning_threshold = float(thresholds_df.collect()[0]['WARNING_THRESHOLD'])
+        
+        # Calculate metrics using DataFrame operations first
+        evaluated_count = df_filtered.filter(col("IS_EVALUATED") == 1).count()
+        total_count = df_filtered.count()
+        
+        # Then do Python calculations
+        monitoring_metric_value = round(100.0 * evaluated_count / total_count, 2) if total_count > 0 else 0.0
+        
+        # Determine compliance status using Python logic
+        if warning_threshold is not None and monitoring_metric_value <= warning_threshold:
+            compliance_status = "RED"
+        elif alert_threshold is not None and monitoring_metric_value <= alert_threshold:
+            compliance_status = "YELLOW"
+        else:
+            compliance_status = "GREEN"
+        
+        # Create metrics DataFrame
+        metrics_data = [(
+            current_date(),
+            'MNTR-XXXXX-T1',
+            monitoring_metric_value,
+            compliance_status,
+            evaluated_count,
+            total_count
+        )]
+        
+        metrics_schema = StructType([
+            StructField("DATE", DateType(), False),
+            StructField("MONITORING_METRIC_NUMBER", StringType(), False),
+            StructField("MONITORING_METRIC", DoubleType(), False),
+            StructField("COMPLIANCE_STATUS", StringType(), False),
+            StructField("NUMERATOR", LongType(), False),
+            StructField("DENOMINATOR", LongType(), False)
+        ])
+        
+        df_result = spark.createDataFrame(metrics_data, metrics_schema)
+        log_step("Final Compliance Metrics")
+        df_result.show()
+        
+    except Exception as e:
+        log_step("ERROR in metrics calculation", f"Pipeline execution failed during metrics calculation: {str(e)}")
+        raise
+
+    # Supporting Evidence
+    try:
+        evidence_schema = StructType([
+            StructField("RESOURCE_ID", StringType(), True),
+            StructField("ARN", StringType(), True),
+            StructField("ACCOUNT", StringType(), True),
+            StructField("BA", StringType(), True),
+            StructField("CREATE_DATE", TimestampType(), True),
+            StructField("ROLE_TYPE", StringType(), True),
+            StructField("NOTES", StringType(), True)
+        ])
+        
+        if evaluated_count < total_count:
+            df_supporting_evidence = df_filtered.filter(col("IS_EVALUATED") == 0) \
+                .select(
+                    col("RESOURCE_ID"),
+                    col("AMAZON_RESOURCE_NAME").alias("ARN"),
+                    col("ACCOUNT"),
+                    col("BA"),
+                    col("CREATE_DATE"),
+                    col("ROLE_TYPE"),
+                    lit(None).cast(StringType()).alias("NOTES")
+                ) \
+                .orderBy(["ACCOUNT", "AMAZON_RESOURCE_NAME"])
+        else:
+            df_supporting_evidence = spark.createDataFrame([
+                (None, None, None, None, None, None, "All Roles Evaluated Against Control")
+            ], evidence_schema)
+        
+        log_step("Supporting Evidence DataFrame Created")
+        df_supporting_evidence.show(20, truncate=False)
+        
+    except Exception as e:
+        log_step("ERROR in supporting evidence", f"Failed to generate supporting evidence: {str(e)}")
+        raise
 
 except Exception as e:
-    log_step("ERROR in metrics calculation", f"Pipeline execution failed during metrics calculation: {str(e)}")
+    log_step("ERROR in main pipeline execution", str(e))
     raise
