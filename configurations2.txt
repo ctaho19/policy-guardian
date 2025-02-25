@@ -1,29 +1,63 @@
-concat(
-    ifelse(Tier 0 Comm = 'Green', 'Green, ', ''),
-    ifelse(Tier 0 Comm = 'Red', 'Red, ', ''),
-    ifelse(Tier 0 Comm = 'Yellow', 'Yellow, ', ''),
-    ifelse(Tier 1 Comm = 'Green', 'Green, ', ''),
-    ifelse(Tier 1 Comm = 'Red', 'Red, ', ''),
-    ifelse(Tier 1 Comm = 'Yellow', 'Yellow, ', ''),
-    ifelse(Tier 2 Comm = 'Green', 'Green, ', ''),
-    ifelse(Tier 2 Comm = 'Red', 'Red, ', ''),
-    ifelse(Tier 2 Comm = 'Yellow', 'Yellow, ', ''),
-    ifelse(Tier 3 Comm = 'Green', 'Green, ', ''),
-    ifelse(Tier 3 Comm = 'Red', 'Red, ', ''),
-    ifelse(Tier 3 Comm = 'Yellow', 'Yellow, ', '')
-)
+try:
+    # Get thresholds from Snowflake
+    threshold_query = """
+    SELECT 
+        MONITORING_METRIC_ID,
+        ALERT_THRESHOLD,
+        WARNING_THRESHOLD
+    FROM EIAM_DB.PHDP_CYBR_IAM.CYBER_CONTROLS_MONITORING_THRESHOLD
+    WHERE MONITORING_METRIC_ID = 'MNTR-XXXXX'
+    """
+    
+    thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", threshold_query) \
+        .load()
+    
+    # Extract threshold values
+    alert_threshold = float(thresholds_df.collect()[0]['ALERT_THRESHOLD'])
+    warning_threshold = float(thresholds_df.collect()[0]['WARNING_THRESHOLD'])
+    
+    # Calculate metrics using DataFrame operations
+    evaluated_count = df_filtered.filter(col("IS_EVALUATED") == 1).count()
+    total_count = df_filtered.count()
+    
+    # Convert to regular Python numbers for the metrics calculation
+    monitoring_metric_value = round(100.0 * evaluated_count / total_count, 2) if total_count > 0 else 0.0
+    
+    # Simple Python logic for compliance status
+    if warning_threshold is not None and monitoring_metric_value <= warning_threshold:
+        compliance_status = "RED"
+    elif alert_threshold is not None and monitoring_metric_value <= alert_threshold:
+        compliance_status = "YELLOW"
+    else:
+        compliance_status = "GREEN"
+    
+    # Create the metrics DataFrame
+    metrics_data = [(
+        current_date(),
+        'MNTR-XXXXX-T1',
+        monitoring_metric_value,
+        compliance_status,
+        evaluated_count,
+        total_count
+    )]
+    
+    metrics_schema = StructType([
+        StructField("DATE", DateType(), False),
+        StructField("MONITORING_METRIC_NUMBER", StringType(), False),
+        StructField("MONITORING_METRIC", DoubleType(), False),
+        StructField("COMPLIANCE_STATUS", StringType(), False),
+        StructField("NUMERATOR", LongType(), False),
+        StructField("DENOMINATOR", LongType(), False)
+    ])
+    
+    df_result = spark.createDataFrame(metrics_data, metrics_schema)
+    
+    # Display results
+    log_step("Final Compliance Metrics")
+    df_result.show()
 
-sum(ifelse(Tier 0 Comm = 'Green', 1, 0) + 
-    ifelse(Tier 1 Comm = 'Green', 1, 0) + 
-    ifelse(Tier 2 Comm = 'Green', 1, 0) + 
-    ifelse(Tier 3 Comm = 'Green', 1, 0))
-
-sum(ifelse(Tier 0 Comm = 'Red', 1, 0) + 
-    ifelse(Tier 1 Comm = 'Red', 1, 0) + 
-    ifelse(Tier 2 Comm = 'Red', 1, 0) + 
-    ifelse(Tier 3 Comm = 'Red', 1, 0))
-
-sum(ifelse(Tier 0 Comm = 'Yellow', 1, 0) + 
-    ifelse(Tier 1 Comm = 'Yellow', 1, 0) + 
-    ifelse(Tier 2 Comm = 'Yellow', 1, 0) + 
-    ifelse(Tier 3 Comm = 'Yellow', 1, 0))
+except Exception as e:
+    log_step("ERROR in metrics calculation", f"Pipeline execution failed during metrics calculation: {str(e)}")
+    raise
