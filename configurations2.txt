@@ -1,73 +1,51 @@
-WITH LATEST_TIMESTAMP AS (
-    SELECT MAX(SF_LOAD_TIMESTAMP) AS LATEST_TS
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-),
-BASE_RANKED_RECORDS AS (
-    SELECT *,
-    ROW_NUMBER() OVER (
-        PARTITION BY ACCOUNT_NUMBER, REGION, ASV, RESOURCE_TYPE 
-        ORDER BY BATCH_ID DESC
-    ) AS RANK
-    FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4
-    WHERE BATCH_ID = (SELECT MAX(BATCH_ID) FROM CLCN_DB.PHDP_CLOUD.OZONE_QUARTERLY_EXAMINER_REVIEW_TOTAL_COUNTS_REPORT_V01_V4)
-    AND CLOUD_PROVIDER = 'AWS'
-    AND ROLE_TYPE IN ('', 'N/A', 'MACHINE')
-    AND CONTROL_ID = '<your_control_id>'
-    AND LOWER(REGION) IN ('ca-central-1', 'eu-west-1', 'eu-west-2', 'us-east-1', 'us-east-2', 'us-west-2', 'global')
-),
-INITIAL_COUNTS AS (
-    SELECT 
-        'Initial Data' as CHECK_POINT,
-        COUNT(*) as RECORD_COUNT,
-        COUNT(DISTINCT CONCAT(ASV, ACCOUNT_NUMBER, REGION, RESOURCE_TYPE)) as GROUP_COUNT,
-        SUM(INVENTORY_COUNT) as INVENTORY_SUM,
-        SUM(TOTAL_EVALUATIONS_COUNT) as EVAL_SUM
-    FROM BASE_RANKED_RECORDS
-    WHERE RANK = 1
-),
-COMPONENT_EVALUATIONS AS (
-    SELECT 
-        ASV,
-        ACCOUNT_NUMBER,
-        REGION,
-        RESOURCE_TYPE,
-        CONTROL_COMPONENT,
-        COUNT(*) as RECORDS_PER_COMPONENT,
-        SUM(TOTAL_EVALUATIONS_COUNT) as COMPONENT_EVAL_COUNT,
-        SUM(INVENTORY_COUNT) as COMPONENT_INVENTORY
-    FROM BASE_RANKED_RECORDS
-    WHERE RANK = 1
-    GROUP BY 
-        ASV,
-        ACCOUNT_NUMBER,
-        REGION,
-        RESOURCE_TYPE,
-        CONTROL_COMPONENT
-),
-COMPONENT_STATS AS (
-    SELECT 
-        'Component Stats' as CHECK_POINT,
-        COUNT(DISTINCT CONTROL_COMPONENT) as RECORD_COUNT,
-        COUNT(DISTINCT CONCAT(ASV, ACCOUNT_NUMBER, REGION, RESOURCE_TYPE)) as GROUP_COUNT,
-        SUM(COMPONENT_INVENTORY) as INVENTORY_SUM,
-        SUM(COMPONENT_EVAL_COUNT) as EVAL_SUM
-    FROM COMPONENT_EVALUATIONS
-)
--- Show both summary statistics with matching columns
-SELECT * FROM INITIAL_COUNTS
-UNION ALL
-SELECT * FROM COMPONENT_STATS;
+# Calculate monitoring metric using DataFrame operations
+monitoring_metric = lit(round(100.0 * numerator / denominator, 2) if denominator > 0 else 0.0)
 
--- Show detailed component breakdown separately
-SELECT 
-    ASV,
-    ACCOUNT_NUMBER,
-    REGION,
-    RESOURCE_TYPE,
-    CONTROL_COMPONENT,
-    COMPONENT_EVAL_COUNT,
-    COMPONENT_INVENTORY,
-    RECORDS_PER_COMPONENT
-FROM COMPONENT_EVALUATIONS
-ORDER BY COMPONENT_EVAL_COUNT DESC
-LIMIT 10;
+# Determine compliance status based on thresholds
+compliance_status = when(
+    (monitoring_metric <= lit(warning_threshold)) & 
+    (lit(warning_threshold).isNotNull()), "RED"
+).when(
+    (monitoring_metric <= lit(alert_threshold)) & 
+    (lit(alert_threshold).isNotNull()), "YELLOW"
+).otherwise("GREEN")
+
+# Calculate metrics
+numerator = df_filtered.filter(col("IS_EVALUATED") == 1).count()
+denominator = df_filtered.count()
+monitoring_metric = lit(round(100.0 * numerator / denominator, 2) if denominator > 0 else 0.0)
+
+# Create metrics DataFrame with proper lit() conversions
+metrics_data = [(
+    current_date(), 
+    'MNTR-XXXXX-T1',
+    float(monitoring_metric),  # Convert to float for DataFrame creation
+    compliance_status,
+    numerator,
+    denominator
+)]
+
+
+# Calculate Tier 2 metrics
+tier2_numerator = compliant_roles.count()
+tier2_denominator = evaluated_roles.count()
+tier2_metric = lit(round(100.0 * tier2_numerator / tier2_denominator, 2) if tier2_denominator > 0 else 0.0)
+
+# Determine compliance status based on thresholds
+tier2_compliance_status = when(
+    (tier2_metric <= lit(tier2_warning_threshold)) & 
+    (lit(tier2_warning_threshold).isNotNull()), "RED"
+).when(
+    (tier2_metric <= lit(tier2_alert_threshold)) & 
+    (lit(tier2_alert_threshold).isNotNull()), "YELLOW"
+).otherwise("GREEN")
+
+# Create Tier 2 metrics DataFrame with proper lit() conversions
+tier2_metrics_data = [(
+    current_date(), 
+    'MNTR-XXXXX-T2',
+    float(tier2_metric),  # Convert to float for DataFrame creation
+    tier2_compliance_status,
+    tier2_numerator,
+    tier2_denominator
+)]
