@@ -1,138 +1,29 @@
-try:
-    # Get approved accounts
-    df_approved_accounts = get_approved_accounts()
+concat(
+    ifelse(Tier 0 Comm = 'Green', 'Green, ', ''),
+    ifelse(Tier 0 Comm = 'Red', 'Red, ', ''),
+    ifelse(Tier 0 Comm = 'Yellow', 'Yellow, ', ''),
+    ifelse(Tier 1 Comm = 'Green', 'Green, ', ''),
+    ifelse(Tier 1 Comm = 'Red', 'Red, ', ''),
+    ifelse(Tier 1 Comm = 'Yellow', 'Yellow, ', ''),
+    ifelse(Tier 2 Comm = 'Green', 'Green, ', ''),
+    ifelse(Tier 2 Comm = 'Red', 'Red, ', ''),
+    ifelse(Tier 2 Comm = 'Yellow', 'Yellow, ', ''),
+    ifelse(Tier 3 Comm = 'Green', 'Green, ', ''),
+    ifelse(Tier 3 Comm = 'Red', 'Red, ', ''),
+    ifelse(Tier 3 Comm = 'Yellow', 'Yellow, ', '')
+)
 
-    # Step 1: Load all IAM roles with their full information
-    log_step("Loading IAM roles")
-    df_all_iam_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
-        .options(**sfOptions) \
-        .option("query", all_iam_roles_query) \
-        .load()
-    
-    # Validate account numbers and basic role information
-    df_all_iam_roles = df_all_iam_roles.filter(
-        col("ACCOUNT").isNotNull() & 
-        (col("ACCOUNT") != "") & 
-        regexp_replace(col("ACCOUNT"), "[^0-9]", "").cast("string") == col("ACCOUNT")
-    )
-    
-    validate_dataframe(
-        df_all_iam_roles,
-        expected_cols=['RESOURCE_ID', 'AMAZON_RESOURCE_NAME', 'ACCOUNT'],
-        min_count=1
-    )
-    log_step("IAM roles loaded", f"Total Valid IAM Roles: {df_all_iam_roles.count()}")
+sum(ifelse(Tier 0 Comm = 'Green', 1, 0) + 
+    ifelse(Tier 1 Comm = 'Green', 1, 0) + 
+    ifelse(Tier 2 Comm = 'Green', 1, 0) + 
+    ifelse(Tier 3 Comm = 'Green', 1, 0))
 
-    # Step 2: Load violation roles mapping
-    log_step("Loading violation roles mapping")
-    df_violation_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
-        .options(**sfOptions) \
-        .option("query", violation_roles_query) \
-        .load()
-    
-    validate_dataframe(
-        df_violation_roles,
-        expected_cols=['RESOURCE_NAME', 'ROLE_TYPE'],
-        min_count=1
-    )
-    log_step("Violation roles loaded", f"Total Violation Roles: {df_violation_roles.count()}")
+sum(ifelse(Tier 0 Comm = 'Red', 1, 0) + 
+    ifelse(Tier 1 Comm = 'Red', 1, 0) + 
+    ifelse(Tier 2 Comm = 'Red', 1, 0) + 
+    ifelse(Tier 3 Comm = 'Red', 1, 0))
 
-    # Step 3: Load evaluated roles
-    log_step("Loading evaluated roles")
-    df_evaluated_roles = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
-        .options(**sfOptions) \
-        .option("query", evaluated_roles_query) \
-        .load()
-    
-    validate_dataframe(
-        df_evaluated_roles,
-        expected_cols=['RESOURCE_NAME'],
-        min_count=1
-    )
-    log_step("Evaluated roles loaded", f"Total Evaluated Roles: {df_evaluated_roles.count()}")
-
-    # Step 4: Create initial mapping with full role information
-    log_step("Creating initial role mapping")
-    df_initial_mapping = df_all_iam_roles.alias("roles") \
-        .join(
-            df_violation_roles.alias("violations"),
-            df_all_iam_roles["AMAZON_RESOURCE_NAME"] == df_violation_roles["RESOURCE_NAME"],
-            "left"
-        ) \
-        .join(
-            df_evaluated_roles.alias("evaluated"),
-            df_all_iam_roles["AMAZON_RESOURCE_NAME"] == df_evaluated_roles["RESOURCE_NAME"],
-            "left"
-        ) \
-        .select(
-            col("roles.RESOURCE_ID"),
-            col("roles.AMAZON_RESOURCE_NAME"),
-            col("roles.BA"),
-            col("roles.ACCOUNT"),
-            col("roles.CREATE_DATE"),
-            col("roles.LOAD_TIMESTAMP"),
-            coalesce(col("violations.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
-            when(col("evaluated.RESOURCE_NAME").isNotNull(), 1).otherwise(0).alias("IS_EVALUATED"),
-            lit("INITIAL_MAPPING").alias("MAPPING_SOURCE")
-        )
-    
-    log_step("Initial mapping complete", f"Initially Mapped Roles: {df_initial_mapping.count()}")
-
-    # Step 5: Find unmapped resources
-    log_step("Finding unmapped resources")
-    df_unmapped = df_all_iam_roles.alias("all_roles").join(
-        df_initial_mapping.alias("initial_mapping"),
-        col("all_roles.RESOURCE_ID") == col("initial_mapping.RESOURCE_ID"),
-        "left_anti"
-    )
-    log_step("Unmapped resources identified", f"Unmapped Roles: {df_unmapped.count()}")
-
-    # Step 6: Check unmapped resources in violations dataset
-    log_step("Validating unmapped resources")
-    df_unmapped_validation = df_unmapped.alias("unmapped").join(
-        df_violation_roles.alias("violations"),
-        col("unmapped.AMAZON_RESOURCE_NAME") == col("violations.RESOURCE_NAME"),
-        "left"
-    ).select(
-        col("unmapped.RESOURCE_ID"),
-        col("unmapped.AMAZON_RESOURCE_NAME"),
-        col("unmapped.BA"),
-        col("unmapped.ACCOUNT"),
-        col("unmapped.CREATE_DATE"),
-        col("unmapped.LOAD_TIMESTAMP"),
-        coalesce(col("violations.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
-        lit(0).alias("IS_EVALUATED"),
-        lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
-    )
-    log_step("Unmapped validation complete", 
-             f"Validated Unmapped Roles: {df_unmapped_validation.count()}")
-
-    # Step 7: Combine all roles and deduplicate
-    log_step("Combining and deduplicating roles")
-    df_all_roles = df_initial_mapping.union(df_unmapped_validation) \
-        .dropDuplicates(["RESOURCE_ID"]) \
-        .orderBy(col("LOAD_TIMESTAMP").desc())
-
-    # Validate role type distribution
-    role_type_dist = df_all_roles.groupBy("ROLE_TYPE", "MAPPING_SOURCE").count()
-    log_step("Role combination complete", "Role Type Distribution by Mapping Source:")
-    role_type_dist.show()
-
-    # Step 8: Filter for machine roles only
-    log_step("Filtering for machine roles")
-    df_machine_roles = df_all_roles.filter(col("ROLE_TYPE") == "MACHINE")
-    log_step("Machine roles filtered", f"Total Machine Roles Found: {df_machine_roles.count()}")
-
-    # Step 9: Join with approved accounts
-    log_step("Filtering for approved accounts")
-    df_filtered = df_machine_roles.join(
-        df_approved_accounts,
-        upper(df_machine_roles.ACCOUNT) == upper(df_approved_accounts.accountNumber),
-        "inner"
-    )
-    log_step("Account filtering complete", 
-             f"Machine Roles in Approved Accounts: {df_filtered.count()}")
-
-except Exception as e:
-    log_step("ERROR in main pipeline execution", str(e))
-    raise
+sum(ifelse(Tier 0 Comm = 'Yellow', 1, 0) + 
+    ifelse(Tier 1 Comm = 'Yellow', 1, 0) + 
+    ifelse(Tier 2 Comm = 'Yellow', 1, 0) + 
+    ifelse(Tier 3 Comm = 'Yellow', 1, 0))
