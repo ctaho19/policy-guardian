@@ -1,61 +1,45 @@
-    # Calculate and display compliance metrics based on thresholds from Snowflake
+ # COMMAND ----------
+    # MAGIC %md
+    # MAGIC ## 7. Tier 1 Supporting Evidence
+    # MAGIC Display details of machine roles that were not evaluated against the control
+
     try:
-        # Get thresholds from Snowflake
-        threshold_query = """
-        SELECT 
-            MONITORING_METRIC_ID,
-            ALERT_THRESHOLD,
-            WARNING_THRESHOLD
-        FROM EIAM_DB.PHDP_CYBR_IAM.CYBER_CONTROLS_MONITORING_THRESHOLD
-        WHERE MONITORING_METRIC_ID = 'MNTR-XXXXX'
-        """
-        
-        thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
-            .options(**sfOptions) \
-            .option("query", threshold_query) \
-            .load()
-        
-        # Extract threshold values
-        alert_threshold = thresholds_df.collect()[0]['ALERT_THRESHOLD']
-        warning_threshold = thresholds_df.collect()[0]['WARNING_THRESHOLD']
-        
-        # Calculate metrics
-        numerator = df_filtered.filter(col("IS_EVALUATED") == 1).count()
-        denominator = df_filtered.count()
-        monitoring_metric = round(100.0 * numerator / denominator, 2) if denominator > 0 else 0.0
-        
-        # Determine compliance status based on thresholds
-        compliance_status = when(
-            col("monitoring_metric") <= lit(warning_threshold), "RED"
-        ).when(
-            col("monitoring_metric") <= lit(alert_threshold), "YELLOW"
-        ).otherwise("GREEN")
-        
-        # Create final metrics DataFrame
-        metrics_data = [(
-            current_date(), 
-            'MNTR-XXXXX',
-            monitoring_metric,
-            compliance_status,
-            numerator,
-            denominator
-        )]
-        
-        metrics_schema = StructType([
-            StructField("DATE", DateType(), False),
-            StructField("MONITORING_METRIC_NUMBER", StringType(), False),
-            StructField("MONITORING_METRIC", DoubleType(), False),
-            StructField("COMPLIANCE_STATUS", StringType(), False),
-            StructField("NUMERATOR", LongType(), False),
-            StructField("DENOMINATOR", LongType(), False)
+        # Define schema for supporting evidence
+        evidence_schema = StructType([
+            StructField("RESOURCE_ID", StringType(), True),
+            StructField("ARN", StringType(), True),
+            StructField("ACCOUNT", StringType(), True),
+            StructField("BA", StringType(), True),
+            StructField("CREATE_DATE", TimestampType(), True),
+            StructField("ROLE_TYPE", StringType(), True),
+            StructField("NOTES", StringType(), True)
         ])
         
-        df_result = spark.createDataFrame(metrics_data, metrics_schema)
+        if numerator < denominator:
+            # Filter for unevaluated machine roles
+            df_supporting_evidence = df_filtered.filter(col("IS_EVALUATED") == 0) \
+                .select(
+                    col("RESOURCE_ID"),
+                    col("AMAZON_RESOURCE_NAME").alias("ARN"),
+                    col("ACCOUNT"),
+                    col("BA"),
+                    col("CREATE_DATE"),
+                    col("ROLE_TYPE"),
+                    lit(None).cast(StringType()).alias("NOTES")
+                ) \
+                .orderBy(["ACCOUNT", "AMAZON_RESOURCE_NAME"])
+        else:
+            # Create single-row DataFrame with message when all roles are evaluated
+            df_supporting_evidence = spark.createDataFrame([
+                (None, None, None, None, None, None, "All Roles Evaluated Against Control")
+            ], evidence_schema)
         
         # Display results
-        log_step("Final Compliance Metrics")
-        df_result.show()
+        log_step("Supporting Evidence DataFrame Created")
+        df_supporting_evidence.show(20, truncate=False)
         
     except Exception as e:
-        log_step("ERROR in metrics calculation", f"Pipeline execution failed during metrics calculation: {str(e)}")
+        log_step("ERROR in supporting evidence", 
+                 f"Failed to generate supporting evidence: {str(e)}")
         raise
+
