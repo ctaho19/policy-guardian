@@ -583,10 +583,10 @@ try:
     print("Tier 1 thresholds:")
     thresholds_df.show()
     
-    # Extract threshold values
+    # Extract threshold values and explicitly convert to Python types
     tier1_row = thresholds_df.collect()[0]
-    alert_threshold = tier1_row['ALERT_THRESHOLD']
-    warning_threshold = tier1_row['WARNING_THRESHOLD']
+    alert_threshold = float(tier1_row['ALERT_THRESHOLD']) if tier1_row['ALERT_THRESHOLD'] is not None else None
+    warning_threshold = float(tier1_row['WARNING_THRESHOLD']) if tier1_row['WARNING_THRESHOLD'] is not None else None
     
     log_step("Tier 1 threshold values", f"Alert: {alert_threshold}, Warning: {warning_threshold}")
     
@@ -722,10 +722,10 @@ try:
     print("Tier 2 thresholds:")
     tier2_thresholds_df.show()
     
-    # Extract threshold values - handle potential nulls
+    # Extract threshold values - handle potential nulls with explicit conversion
     tier2_row = tier2_thresholds_df.collect()[0]
-    tier2_alert_threshold = tier2_row['ALERT_THRESHOLD']    # Could be null
-    tier2_warning_threshold = tier2_row['WARNING_THRESHOLD'] # Could be null
+    tier2_alert_threshold = float(tier2_row['ALERT_THRESHOLD']) if tier2_row['ALERT_THRESHOLD'] is not None else None
+    tier2_warning_threshold = float(tier2_row['WARNING_THRESHOLD']) if tier2_row['WARNING_THRESHOLD'] is not None else None
     
     # Get filtered data from temp view if needed
     if not 'df_filtered' in locals() or df_filtered is None:
