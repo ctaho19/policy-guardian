@@ -583,37 +583,38 @@ try:
     print("Tier 1 thresholds:")
     thresholds_df.show()
     
-    # Extract threshold values and explicitly convert to Python types
+    # Extract threshold values and force conversion to Python primitives
     tier1_row = thresholds_df.collect()[0]
-    alert_threshold = float(tier1_row['ALERT_THRESHOLD']) if tier1_row['ALERT_THRESHOLD'] is not None else None
-    warning_threshold = float(tier1_row['WARNING_THRESHOLD']) if tier1_row['WARNING_THRESHOLD'] is not None else None
+    # Force conversion to Python primitive types
+    alert_threshold_val = float(tier1_row['ALERT_THRESHOLD']) if tier1_row['ALERT_THRESHOLD'] is not None else None
+    warning_threshold_val = float(tier1_row['WARNING_THRESHOLD']) if tier1_row['WARNING_THRESHOLD'] is not None else None
     
-    log_step("Tier 1 threshold values", f"Alert: {alert_threshold}, Warning: {warning_threshold}")
+    log_step("Tier 1 threshold values", f"Alert: {alert_threshold_val}, Warning: {warning_threshold_val}")
     
-    # Calculate metrics
-    # Get data from temp view if needed
+    # Calculate metrics - force conversion to Python primitives
     if not 'df_filtered' in locals() or df_filtered is None:
         df_filtered = spark.table("filtered_machine_roles")
     
-    numerator = df_filtered.filter(col("IS_EVALUATED") == 1).count()
-    denominator = df_filtered.count()
-
-    # Calculate monitoring metric - use Python operations since numerator and denominator are Python values
+    # Force all operations to be Python primitives
+    numerator = int(df_filtered.filter(col("IS_EVALUATED") == 1).count())
+    denominator = int(df_filtered.count())
+    
+    # Use Python arithmetic only
     monitoring_metric_value = round(100.0 * numerator / denominator, 2) if denominator > 0 else 0.0
-
-    # Determine compliance status based on thresholds - as a Python value
-    if warning_threshold is not None and monitoring_metric_value <= warning_threshold:
+    
+    # Pure Python comparison with no PySpark operations
+    if warning_threshold_val is not None and float(monitoring_metric_value) <= float(warning_threshold_val):
         compliance_status_value = "RED"
-    elif alert_threshold is not None and monitoring_metric_value <= alert_threshold:
+    elif alert_threshold_val is not None and float(monitoring_metric_value) <= float(alert_threshold_val):
         compliance_status_value = "YELLOW"
     else:
         compliance_status_value = "GREEN"
-
-    # Create metrics DataFrame with proper lit() conversions
+    
+    # Create metrics DataFrame
     metrics_data = [(
         current_date(), 
         'MNTR-XXXXX-T1',
-        float(monitoring_metric_value),  # Convert to float for DataFrame creation
+        float(monitoring_metric_value),
         compliance_status_value,
         numerator,
         denominator
@@ -722,10 +723,10 @@ try:
     print("Tier 2 thresholds:")
     tier2_thresholds_df.show()
     
-    # Extract threshold values - handle potential nulls with explicit conversion
+    # Extract threshold values and force conversion to Python primitives
     tier2_row = tier2_thresholds_df.collect()[0]
-    tier2_alert_threshold = float(tier2_row['ALERT_THRESHOLD']) if tier2_row['ALERT_THRESHOLD'] is not None else None
-    tier2_warning_threshold = float(tier2_row['WARNING_THRESHOLD']) if tier2_row['WARNING_THRESHOLD'] is not None else None
+    tier2_alert_threshold_val = float(tier2_row['ALERT_THRESHOLD']) if tier2_row['ALERT_THRESHOLD'] is not None else None
+    tier2_warning_threshold_val = float(tier2_row['WARNING_THRESHOLD']) if tier2_row['WARNING_THRESHOLD'] is not None else None
     
     # Get filtered data from temp view if needed
     if not 'df_filtered' in locals() or df_filtered is None:
@@ -750,12 +751,13 @@ try:
     tier2_denominator = evaluated_roles.count()  # Should match Tier 1 numerator
     tier2_metric = round(100.0 * tier2_numerator / tier2_denominator, 2) if tier2_denominator > 0 else 0.0
     
-    # Determine compliance status based on thresholds, handling null cases
-    tier2_compliance_status = (
-        "RED" if tier2_warning_threshold is not None and tier2_metric <= tier2_warning_threshold
-        else "YELLOW" if tier2_alert_threshold is not None and tier2_metric <= tier2_alert_threshold
-        else "GREEN"
-    )
+    # Pure Python comparison
+    if tier2_warning_threshold_val is not None and float(tier2_metric) <= float(tier2_warning_threshold_val):
+        tier2_compliance_status = "RED"
+    elif tier2_alert_threshold_val is not None and float(tier2_metric) <= float(tier2_alert_threshold_val):
+        tier2_compliance_status = "YELLOW"
+    else:
+        tier2_compliance_status = "GREEN"
     
     # Create Tier 2 metrics DataFrame
     tier2_metrics_data = [(
