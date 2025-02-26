@@ -466,24 +466,31 @@ except Exception as e:
 try:
     # Step 6: Check unmapped resources in violations dataset
     log_step("Validating unmapped resources")
-    df_unmapped_validation = df_unmapped.alias("unmapped").join(
-        df_violation_roles.alias("violations"),
-        col("unmapped.AMAZON_RESOURCE_NAME") == col("violations.RESOURCE_NAME"),
-        "left"
-    ).select(
-        col("unmapped.RESOURCE_ID"),
-        col("unmapped.AMAZON_RESOURCE_NAME"),
-        col("unmapped.BA"),
-        col("unmapped.ACCOUNT"),
-        col("unmapped.CREATE_DATE"),
-        col("unmapped.LOAD_TIMESTAMP"),
-        coalesce(col("violations.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
-        lit(0).alias("IS_EVALUATED"),
-        lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
-    )
     
-    log_step("Unmapped validation complete", 
-             f"Validated Unmapped Roles: {df_unmapped_validation.count()}")
+    if unmapped_count > 0:
+        df_unmapped_validation = df_unmapped.alias("unmapped").join(
+            df_violation_roles.alias("violations"),
+            col("unmapped.AMAZON_RESOURCE_NAME") == col("violations.RESOURCE_NAME"),
+            "left"
+        ).select(
+            col("unmapped.RESOURCE_ID"),
+            col("unmapped.AMAZON_RESOURCE_NAME"),
+            col("unmapped.BA"),
+            col("unmapped.ACCOUNT"),
+            col("unmapped.CREATE_DATE"),
+            col("unmapped.LOAD_TIMESTAMP"),
+            coalesce(col("violations.ROLE_TYPE"), lit("NOT FOUND")).alias("ROLE_TYPE"),
+            lit(0).alias("IS_EVALUATED"),
+            lit("VALIDATION_MAPPING").alias("MAPPING_SOURCE")
+        )
+        log_step("Unmapped validation complete", 
+                f"Validated Unmapped Roles: {df_unmapped_validation.count()}")
+    else:
+        # Create empty DataFrame with the same schema if no unmapped resources
+        empty_schema = df_initial_mapping.schema
+        df_unmapped_validation = spark.createDataFrame([], empty_schema)
+        log_step("Unmapped validation skipped", "No unmapped resources to validate")
+    
 except Exception as e:
     log_step("ERROR validating unmapped resources", str(e))
     raise
