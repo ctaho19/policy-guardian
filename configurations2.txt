@@ -583,41 +583,67 @@ try:
     print("Tier 1 thresholds:")
     thresholds_df.show()
     
-    # Extract threshold values and force conversion to Python primitives
-    tier1_row = thresholds_df.collect()[0]
-    # Force conversion to Python primitive types
-    alert_threshold_val = float(tier1_row['ALERT_THRESHOLD']) if tier1_row['ALERT_THRESHOLD'] is not None else None
-    warning_threshold_val = float(tier1_row['WARNING_THRESHOLD']) if tier1_row['WARNING_THRESHOLD'] is not None else None
+    # Extract threshold values with explicit collection
+    threshold_row_list = thresholds_df.collect()
     
-    log_step("Tier 1 threshold values", f"Alert: {alert_threshold_val}, Warning: {warning_threshold_val}")
+    # Debug output
+    print(f"DEBUG - threshold_row_list type: {type(threshold_row_list)}")
     
-    # Calculate metrics - force conversion to Python primitives
+    # Force Python primitive types with complete isolation from Spark context
+    py_alert = None
+    py_warning = None
+    
+    if len(threshold_row_list) > 0:
+        threshold_row = threshold_row_list[0]
+        alert_val = threshold_row['ALERT_THRESHOLD']
+        warning_val = threshold_row['WARNING_THRESHOLD']
+        
+        print(f"DEBUG - alert_val: {alert_val}, type: {type(alert_val)}")
+        print(f"DEBUG - warning_val: {warning_val}, type: {type(warning_val)}")
+        
+        py_alert = float(alert_val) if alert_val is not None else None
+        py_warning = float(warning_val) if warning_val is not None else None
+    
+    print(f"DEBUG - py_alert: {py_alert}, type: {type(py_alert)}")
+    print(f"DEBUG - py_warning: {py_warning}, type: {type(py_warning)}")
+    
+    log_step("Tier 1 threshold values", f"Alert: {py_alert}, Warning: {py_warning}")
+    
+    # Get filtered data
     if not 'df_filtered' in locals() or df_filtered is None:
         df_filtered = spark.table("filtered_machine_roles")
     
-    # Force all operations to be Python primitives
-    numerator = int(df_filtered.filter(col("IS_EVALUATED") == 1).count())
-    denominator = int(df_filtered.count())
+    # Collect counts immediately to Python variables completely isolated from Spark
+    py_numerator = int(df_filtered.filter(col("IS_EVALUATED") == 1).count())
+    py_denominator = int(df_filtered.count())
     
-    # Use Python arithmetic only
-    monitoring_metric_value = round(100.0 * numerator / denominator, 2) if denominator > 0 else 0.0
+    print(f"DEBUG - py_numerator: {py_numerator}, type: {type(py_numerator)}")
+    print(f"DEBUG - py_denominator: {py_denominator}, type: {type(py_denominator)}")
     
-    # Pure Python comparison with no PySpark operations
-    if warning_threshold_val is not None and float(monitoring_metric_value) <= float(warning_threshold_val):
-        compliance_status_value = "RED"
-    elif alert_threshold_val is not None and float(monitoring_metric_value) <= float(alert_threshold_val):
-        compliance_status_value = "YELLOW"
-    else:
-        compliance_status_value = "GREEN"
+    # Completely isolated Python calculation
+    py_metric = 0.0
+    if py_denominator > 0:
+        py_metric = round(100.0 * py_numerator / py_denominator, 2)
     
-    # Create metrics DataFrame
+    print(f"DEBUG - py_metric: {py_metric}, type: {type(py_metric)}")
+    
+    # Pure Python comparison
+    py_status = "GREEN"
+    if py_warning is not None and py_metric <= py_warning:
+        py_status = "RED"
+    elif py_alert is not None and py_metric <= py_alert:
+        py_status = "YELLOW"
+    
+    print(f"DEBUG - py_status: {py_status}, type: {type(py_status)}")
+    
+    # Create metrics DataFrame with fully isolated Python variables
     metrics_data = [(
-        current_date(), 
+        current_date(),
         'MNTR-XXXXX-T1',
-        float(monitoring_metric_value),
-        compliance_status_value,
-        numerator,
-        denominator
+        py_metric,
+        py_status,
+        py_numerator,
+        py_denominator
     )]
     
     metrics_schema = StructType([
@@ -640,10 +666,10 @@ try:
     
     # Store key metrics as global variables for use in later blocks
     # These would be accessible in the notebook context
-    spark.sql(f"SET tier1_numerator = {numerator}")
-    spark.sql(f"SET tier1_denominator = {denominator}")
-    spark.sql(f"SET tier1_metric_value = {monitoring_metric_value}")
-    spark.sql(f"SET tier1_compliance_status = '{compliance_status_value}'")
+    spark.sql(f"SET tier1_numerator = {py_numerator}")
+    spark.sql(f"SET tier1_denominator = {py_denominator}")
+    spark.sql(f"SET tier1_metric_value = {py_metric}")
+    spark.sql(f"SET tier1_compliance_status = '{py_status}'")
     
 except Exception as e:
     log_step("ERROR in Tier 1 metrics calculation", f"Calculation failed: {str(e)}")
@@ -723,10 +749,20 @@ try:
     print("Tier 2 thresholds:")
     tier2_thresholds_df.show()
     
-    # Extract threshold values and force conversion to Python primitives
-    tier2_row = tier2_thresholds_df.collect()[0]
-    tier2_alert_threshold_val = float(tier2_row['ALERT_THRESHOLD']) if tier2_row['ALERT_THRESHOLD'] is not None else None
-    tier2_warning_threshold_val = float(tier2_row['WARNING_THRESHOLD']) if tier2_row['WARNING_THRESHOLD'] is not None else None
+    # Extract threshold values with explicit collection
+    tier2_row_list = tier2_thresholds_df.collect()
+    
+    # Force Python primitive types 
+    py_tier2_alert = None
+    py_tier2_warning = None
+    
+    if len(tier2_row_list) > 0:
+        tier2_row = tier2_row_list[0]
+        tier2_alert_val = tier2_row['ALERT_THRESHOLD']
+        tier2_warning_val = tier2_row['WARNING_THRESHOLD']
+        
+        py_tier2_alert = float(tier2_alert_val) if tier2_alert_val is not None else None
+        py_tier2_warning = float(tier2_warning_val) if tier2_warning_val is not None else None
     
     # Get filtered data from temp view if needed
     if not 'df_filtered' in locals() or df_filtered is None:
@@ -752,9 +788,9 @@ try:
     tier2_metric = round(100.0 * tier2_numerator / tier2_denominator, 2) if tier2_denominator > 0 else 0.0
     
     # Pure Python comparison
-    if tier2_warning_threshold_val is not None and float(tier2_metric) <= float(tier2_warning_threshold_val):
+    if tier2_warning_val is not None and float(tier2_metric) <= float(tier2_warning_val):
         tier2_compliance_status = "RED"
-    elif tier2_alert_threshold_val is not None and float(tier2_metric) <= float(tier2_alert_threshold_val):
+    elif tier2_alert_val is not None and float(tier2_metric) <= float(tier2_alert_val):
         tier2_compliance_status = "YELLOW"
     else:
         tier2_compliance_status = "GREEN"
