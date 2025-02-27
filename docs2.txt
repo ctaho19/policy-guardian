@@ -1,0 +1,34 @@
+Query Requirements for Resolving Evaluation Count Inconsistencies
+Current Issue
+The current query calculates evaluated resources by summing the TOTAL_EVALUATIONS_COUNT from records that have been ranked using ROW_NUMBER() partitioned by account, region, ASV, and resource type. However, when multiple records have the same rank (tied for rank 1), the query selects one arbitrarily, causing inconsistent evaluation counts between runs.
+Key Insights
+
+Inventory counts remain consistent for each control when grouped by ASV/region/account/resource type
+Evaluation counts vary because they are broken down by control component
+The "compliance state" column indicates whether resources are being evaluated against the control
+Some evaluation counts may exceed resource counts due to data refresh timing differences
+
+Solution Requirements
+You need to develop a query that:
+For the Numerator (Evaluation Counts):
+
+Group data by ASV, account, region, and resource type, then by control component
+For each control component within a grouping, sum the evaluation counts
+Calculate the average of evaluation counts within each control component (if multiple records exist for the same component)
+Take the average of these component averages for each ASV/account/region/resource type grouping
+Sum these "definitive evaluation counts" across all groupings to get the total evaluated resources
+
+For the Denominator (Inventory Counts):
+
+Use the same grouping of ASV, account, region, and resource type
+Select one inventory count per grouping (since they are consistent within groups)
+Sum these inventory counts to get the total inventory
+
+Implementation Approach
+
+Start by testing with a single account to verify the approach
+First CTE: Group and sum evaluation counts by control component within each ASV/account/region/resource type grouping
+Second CTE: Calculate the average evaluation count for each component (handling cases where there are multiple records per component)
+Third CTE: Calculate the average across all components for each grouping to get the "definitive" evaluation count
+Final step: Sum the definitive evaluation counts across all groupings and compare to the total inventory count
+Calculate the overall coverage metric by dividing total definitive evaluation counts by total inventory count
