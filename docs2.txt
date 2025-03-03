@@ -1,39 +1,6 @@
-As part of our ongoing efforts to strengthen collaboration across Cyber, we’re gathering insights on how our teams view each other’s roles and contributions. Your honest feedback will help us better understand perceptions within Cyber and identify opportunities to align and support one another. This short survey focuses on the Governance and Risk tower from your perspective—please share your thoughts openly. Responses are anonymous and will be used to foster a stronger Cyber community. Thank you!
-
-
-Questions:
-On a scale of 1 to 5 (1 being not at all, 5 being very much), how familiar are you with the day-to-day work of the Governance and Risk (GR) tower?
-(Quantitative—establishes a baseline for their exposure to GR, which may influence perception.)
-
-In your own words, how would you describe the primary role of the GR tower within Cyber?
-(Qualitative—lets them define GR’s purpose in their terms, revealing assumptions or gaps.)
-
-On a scale of 1 to 5 (1 being not valuable, 5 being very valuable), how valuable do you think GR’s contributions are to the overall mission of Cyber at [Company]?
-(Quantitative—measures perceived value without implying GR is misunderstood.)
-
-What’s one way you’ve seen GR interact with or support your tower (or others) in the past year?
-(Qualitative—prompts a specific example to ground their perception in experience, or lack thereof.)
-
-On a scale of 1 to 5 (1 being not technical, 5 being very technical), how technical do you consider the work of the GR tower compared to other Cyber towers?
-(Quantitative—directly addresses the “not technical enough” perception without bias.)
-
-What’s one strength you associate with the GR tower?
-(Qualitative—encourages positive framing to balance the feedback and reveal what’s appreciated.)
-
-What’s one area where you think GR could align more closely with the needs or goals of your tower?
-(Qualitative—invites constructive input without suggesting GR is deficient.)
-
-On a scale of 1 to 5 (1 being very unclear, 5 being very clear), how clear is GR’s role in supporting Cyber’s technical and operational priorities?
-(Quantitative—probes clarity of GR’s purpose, which could tie to the new-hire misconception.)
-
-Compared to other Cyber towers, how would you describe GR’s approach to collaboration or problem-solving?
-(Qualitative—explores cultural or stylistic perceptions that might influence GR’s image.)
-
-On a scale of 1 to 5 (1 being not at all, 5 being very much), how much do you think GR’s work impacts your tower’s day-to-day responsibilities?
-(Quantitative—gauges perceived relevance and influence of GR on their work.)
-
-If you’ve worked directly with GR, what was your experience like? If not, what’s your impression based on what you’ve heard or observed?
-(Qualitative—separates firsthand experience from hearsay, key for tenured vs. newer staff.)
-
-Is there anything else you’d like to share about how GR fits into the broader Cyber organization?
-(Qualitative—open-ended catch-all for additional insights.)
+ifelse(
+    (Tier 0 Comm = 'Green' OR Tier 1 Comm = 'Green' OR Tier 2 Comm = 'Green' OR Tier 3 Comm = 'Green'), 'Green',
+    (Tier 0 Comm = 'Red' OR Tier 1 Comm = 'Red' OR Tier 2 Comm = 'Red' OR Tier 3 Comm = 'Red'), 'Red',
+    (Tier 0 Comm = 'Yellow' OR Tier 1 Comm = 'Yellow' OR Tier 2 Comm = 'Yellow' OR Tier 3 Comm = 'Yellow'), 'Yellow',
+    'Unknown'
+)
