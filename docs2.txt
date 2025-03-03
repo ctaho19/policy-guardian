@@ -1,6 +1,7 @@
-ifelse(
-    (Tier 0 Comm = 'Green' OR Tier 1 Comm = 'Green' OR Tier 2 Comm = 'Green' OR Tier 3 Comm = 'Green'), 'Green',
-    (Tier 0 Comm = 'Red' OR Tier 1 Comm = 'Red' OR Tier 2 Comm = 'Red' OR Tier 3 Comm = 'Red'), 'Red',
-    (Tier 0 Comm = 'Yellow' OR Tier 1 Comm = 'Yellow' OR Tier 2 Comm = 'Yellow' OR Tier 3 Comm = 'Yellow'), 'Yellow',
-    'Unknown'
-)
+ifelse({Tier 0} = 'Red' OR {Tier 1} = 'Red' OR {Tier 2} = 'Red' OR {Tier 3} = 'Red', 
+'Red', 
+ifelse({Tier 0} = 'Yellow' OR {Tier 1} = 'Yellow' OR {Tier 2} = 'Yellow' OR {Tier 3} = 'Yellow',
+'Yellow',
+ifelse({Tier 0} = 'Green' OR {Tier 1} = 'Green' OR {Tier 2} = 'Green' OR {Tier 3} = 'Green',
+'Green',
+'Unknown')))
