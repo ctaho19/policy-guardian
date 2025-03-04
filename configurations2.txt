@@ -1,0 +1,175 @@
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 12. Tier 2 Metrics Calculation
+# MAGIC Calculate compliance metrics for evaluated roles using a Python-based pipeline
+
+# COMMAND ----------
+from pyspark.sql.functions import col, rand
+import logging
+from datetime import datetime, date
+import pandas as pd
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    # Load Tier 2 thresholds from Snowflake using PySpark
+    logger.info("Loading Tier 2 thresholds from Snowflake")
+    tier2_thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", tier2_threshold_query) \
+        .load()
+    
+    tier2_thresholds_df.show()
+    threshold_data = tier2_thresholds_df.collect()
+    logger.info(f"Threshold data collected: {threshold_data}, type: {type(threshold_data)}")
+    
+    tier2_alert_threshold_raw = threshold_data[0]["ALERT_THRESHOLD"] if threshold_data else None
+    tier2_warning_threshold_raw = threshold_data[0]["WARNING_THRESHOLD"] if threshold_data else None
+    logger.info(f"Tier 2 Alert threshold: {tier2_alert_threshold_raw}, type: {type(tier2_alert_threshold_raw)}")
+    logger.info(f"Tier 2 Warning threshold: {tier2_warning_threshold_raw}, type: {type(tier2_warning_threshold_raw)}")
+
+    # Load filtered roles from PySpark DataFrame
+    logger.info("Loading filtered roles")
+    if not 'df_filtered' in locals() or df_filtered is None:
+        df_filtered = spark.table("filtered_machine_roles")
+    
+    # Convert to Python list and add dummy compliance status
+    filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"], row["ACCOUNT"], 
+                     row["BA"], row["ROLE_TYPE"]) for row in df_filtered.collect()]
+    logger.info(f"Filtered data count: {len(filtered_data)}, type: {type(filtered_data)}")
+    logger.info(f"Sample filtered_data: {filtered_data[:5]}")  # Debug sample
+
+    # Identify evaluated roles and assign dummy compliance status in Python
+    evaluated_data = [(row[0], row[1], "Compliant" if rand() > 0.3 else "NonCompliant") 
+                     for row in filtered_data if row[4] == "MACHINE"]  # Assuming IS_EVALUATED logic via ROLE_TYPE
+    compliant_count = len([status for _, _, status in evaluated_data if status == "Compliant"])
+    evaluated_count = len(evaluated_data)
+    logger.info(f"Compliant count: {compliant_count}, type: {type(compliant_count)}")
+    logger.info(f"Evaluated count: {evaluated_count}, type: {type(evaluated_count)}")
+
+    # Perform metric calculation in Python
+    def calculate_metrics(alert_val, warning_val, compliant_cnt, evaluated_cnt):
+        """Pure Python function to calculate metrics with corrected status logic."""
+        alert = float(alert_val) if alert_val is not None else None
+        warning = float(warning_val) if warning_val is not None else None
+        compliant = int(compliant_cnt)
+        evaluated = int(evaluated_cnt)
+        
+        metric = compliant / evaluated * 100 if evaluated > 0 else 0.0
+        metric = round(metric, 2)  # Python's built-in round
+        
+        # Corrected status logic
+        status = "GREEN"
+        if alert is not None and metric <= alert:
+            status = "RED"
+        elif warning is not None and metric <= warning and metric > alert:
+            status = "YELLOW"
+        logger.info(f"Calculated metric: {metric}, status: {status} with alert={alert}, warning={warning}")
+        return {
+            "metric": metric,
+            "status": status,
+            "numerator": compliant,
+            "denominator": evaluated
+        }
+
+    # Run calculations
+    results = calculate_metrics(tier2_alert_threshold_raw, tier2_warning_threshold_raw, compliant_count, evaluated_count)
+    logger.info(f"Calculation results: {results}")
+
+    # Get current date as a Python object
+    current_date_value = date.today()
+    logger.info(f"Current date: {current_date_value}, type: {type(current_date_value)}")
+
+    # Prepare metrics data as a Python dictionary for pandas DataFrame
+    metrics_data = {
+        "DATE": [current_date_value],
+        "MONITORING_METRIC_NUMBER": ['MNTR-XXXXX-T2'],
+        "MONITORING_METRIC": [results["metric"]],
+        "COMPLIANCE_STATUS": [results["status"]],
+        "NUMERATOR": [results["numerator"]],
+        "DENOMINATOR": [results["denominator"]]
+    }
+    logger.info(f"Metrics data: {metrics_data}")
+    logger.info(f"Metrics data types: {[type(x[0]) for x in metrics_data.values()]}")
+
+    # Convert to pandas DataFrame and then to PySpark DataFrame
+    pd_df = pd.DataFrame(metrics_data)
+    df_result = spark.createDataFrame(pd_df)
+    logger.info("DataFrame created from pandas DataFrame")
+    df_result.printSchema()
+    logger.info("DataFrame content:")
+    df_result.show()
+
+    # Register as temp view and store metrics
+    df_result.createOrReplaceTempView("tier2_metrics")
+    df_result.createOrReplaceTempView("evaluated_roles_with_compliance")  # For supporting evidence later
+    spark.sql(f"SET tier2_numerator = {results['numerator']}")
+    spark.sql(f"SET tier2_denominator = {results['denominator']}")
+    spark.sql(f"SET tier2_metric_value = {results['metric']}")
+    spark.sql(f"SET tier2_compliance_status = '{results['status']}'")
+
+except Exception as e:
+    logger.error(f"ERROR in Tier 2 metrics calculation: {str(e)}")
+    raise
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Unit Tests for Tier 2 Metrics Calculation
+
+# COMMAND ----------
+def test_tier2_metrics_calculation(spark):
+    """Unit test for Tier 2 metrics calculation and DataFrame creation."""
+    # Mock data
+    mock_filtered_data = spark.createDataFrame(
+        [("res1", "arn1", "acc1", "ba1", "MACHINE"),
+         ("res2", "arn2", "acc2", "ba2", "MACHINE"),
+         ("res3", "arn3", "acc3", "ba3", "MACHINE")],
+        ["RESOURCE_ID", "AMAZON_RESOURCE_NAME", "ACCOUNT", "BA", "ROLE_TYPE"]
+    )
+    mock_thresholds = spark.createDataFrame(
+        [(100.0, 80.0)],
+        ["ALERT_THRESHOLD", "WARNING_THRESHOLD"]
+    )
+
+    # Collect data
+    filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"], row["ACCOUNT"], 
+                     row["BA"], row["ROLE_TYPE"]) for row in mock_filtered_data.collect()]
+    threshold_data = mock_thresholds.collect()
+
+    # Simulate evaluated roles with dummy compliance
+    evaluated_data = [(row[0], row[1], "Compliant" if i % 2 == 0 else "NonCompliant") 
+                     for i, row in enumerate(filtered_data) if row[4] == "MACHINE"]
+    compliant_count = len([status for _, _, status in evaluated_data if status == "Compliant"])
+    evaluated_count = len(evaluated_data)
+    alert_threshold = threshold_data[0]["ALERT_THRESHOLD"]
+    warning_threshold = threshold_data[0]["WARNING_THRESHOLD"]
+
+    results = calculate_metrics(alert_threshold, warning_threshold, compliant_count, evaluated_count)
+    
+    # Prepare metrics data
+    metrics_data = {
+        "DATE": [date.today()],
+        "MONITORING_METRIC_NUMBER": ['MNTR-XXXXX-T2'],
+        "MONITORING_METRIC": [results["metric"]],
+        "COMPLIANCE_STATUS": [results["status"]],
+        "NUMERATOR": [results["numerator"]],
+        "DENOMINATOR": [results["denominator"]]
+    }
+
+    # Convert to pandas DataFrame and then to PySpark DataFrame
+    pd_df = pd.DataFrame(metrics_data)
+    df_result = spark.createDataFrame(pd_df)
+
+    # Assertions
+    collected_result = df_result.collect()[0]
+    assert collected_result["NUMERATOR"] == 2, f"Expected numerator 2, got {collected_result['NUMERATOR']}"
+    assert collected_result["DENOMINATOR"] == 3, f"Expected denominator 3, got {collected_result['DENOMINATOR']}"
+    assert round(collected_result["MONITORING_METRIC"], 2) == 66.67, f"Expected metric ~66.67%, got {collected_result['MONITORING_METRIC']}"
+    assert collected_result["COMPLIANCE_STATUS"] == "RED", f"Expected status RED, got {collected_result['COMPLIANCE_STATUS']}"
+    logger.info("Unit test for Tier 2 metrics calculation and DataFrame creation passed!")
+
+# Run unit test
+test_tier2_metrics_calculation(spark)
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
