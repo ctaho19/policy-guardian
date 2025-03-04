@@ -22,18 +22,20 @@ try:
     if not 'df_evaluated_roles' in locals() or df_evaluated_roles is None:
         df_evaluated_roles = spark.table("evaluated_roles")
     
-    # Convert to Python lists
+    # Convert to Python lists, preserving datetime objects
     filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"], row["ACCOUNT"], 
                      row["BA"], row["CREATE_DATE"], row["ROLE_TYPE"]) for row in df_filtered.collect()]
     evaluated_data = [row["RESOURCE_NAME"] for row in df_evaluated_roles.collect()]
     logger.info(f"Filtered data count (denominator): {len(filtered_data)}, type: {type(filtered_data)}")
     logger.info(f"Evaluated data count (numerator): {len(evaluated_data)}, type: {type(evaluated_data)}")
+    logger.info(f"Sample CREATE_DATE type from filtered_data: {type(filtered_data[0][4]) if filtered_data else None}")
 
     # Identify unevaluated roles (from filtered data not in evaluated data)
     evaluated_set = set(evaluated_data)
     unevaluated_data = [row for row in filtered_data if row[1] not in evaluated_set]  # row[1] is AMAZON_RESOURCE_NAME
     logger.info(f"Unevaluated data count: {len(unevaluated_data)}, type: {type(unevaluated_data)}")
     logger.info(f"Sample unevaluated ARNs: {unevaluated_data[:5]}")  # Debug sample
+    logger.info(f"Sample CREATE_DATE type from unevaluated_data: {type(unevaluated_data[0][4]) if unevaluated_data else None}")
 
     # Prepare supporting evidence data as a Python dictionary for pandas
     if unevaluated_data:
@@ -42,7 +44,7 @@ try:
             "ARN": [row[1] for row in unevaluated_data],
             "ACCOUNT": [row[2] for row in unevaluated_data],
             "BA": [row[3] for row in unevaluated_data],
-            "CREATE_DATE": [row[4] for row in unevaluated_data],
+            "CREATE_DATE": [row[4] for row in unevaluated_data],  # Keep as datetime
             "ROLE_TYPE": [row[5] for row in unevaluated_data],
             "NOTES": [None] * len(unevaluated_data)
         }
@@ -59,7 +61,7 @@ try:
     logger.info(f"Supporting evidence data: {evidence_data}")
     logger.info(f"Supporting evidence data types: {[type(x[0]) if x and len(x) > 0 else None for x in evidence_data.values()]}")
 
-    # Define explicit schema to avoid inference issues
+    # Define explicit schema
     evidence_schema = StructType([
         StructField("RESOURCE_ID", StringType(), True),
         StructField("ARN", StringType(), True),
@@ -72,6 +74,7 @@ try:
 
     # Convert to pandas DataFrame and then to PySpark DataFrame with explicit schema
     pd_evidence = pd.DataFrame(evidence_data)
+    logger.info(f"Pandas DataFrame CREATE_DATE type: {pd_evidence['CREATE_DATE'].dtype if not pd_evidence.empty else 'Empty'}")
     df_supporting_evidence = spark.createDataFrame(pd_evidence, schema=evidence_schema)
     logger.info("Supporting evidence DataFrame created with explicit schema")
     df_supporting_evidence.printSchema()
@@ -120,7 +123,7 @@ def test_tier1_supporting_evidence(spark):
             "ARN": [row[1] for row in unevaluated_data],
             "ACCOUNT": [row[2] for row in unevaluated_data],
             "BA": [row[3] for row in unevaluated_data],
-            "CREATE_DATE": [row[4] for row in unevaluated_data],
+            "CREATE_DATE": [row[4] for row in unevaluated_data],  # Keep as datetime
             "ROLE_TYPE": [row[5] for row in unevaluated_data],
             "NOTES": [None] * len(unevaluated_data)
         }
@@ -146,7 +149,7 @@ def test_tier1_supporting_evidence(spark):
         StructField("NOTES", StringType(), True)
     ])
 
-    # Convert to pandas DataFrame and then to PySpark DataFrame
+    # Convert to pandas DataFrame and then to PySpark DataFrame with explicit schema
     pd_evidence = pd.DataFrame(evidence_data)
     df_result = spark.createDataFrame(pd_evidence, schema=evidence_schema)
 
@@ -154,6 +157,7 @@ def test_tier1_supporting_evidence(spark):
     collected_result = df_result.collect()
     assert len(collected_result) == 1, f"Expected 1 unevaluated row, got {len(collected_result)}"
     assert collected_result[0]["ARN"] == "arn2", f"Expected ARN arn2, got {collected_result[0]['ARN']}"
+    assert collected_result[0]["CREATE_DATE"] == datetime(2023, 1, 2), f"Expected CREATE_DATE 2023-01-02, got {collected_result[0]['CREATE_DATE']}"
     assert collected_result[0]["NOTES"] is None, f"Expected NOTES to be None, got {collected_result[0]['NOTES']}"
     logger.info("Unit test for Tier 1 supporting evidence passed!")
 
