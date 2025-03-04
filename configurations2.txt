@@ -14,6 +14,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
+    # Verify date import
+    logger.info(f"Verifying date import: {date} is defined, type: {type(date)}")
+
     # Load Tier 1 thresholds from Snowflake using PySpark
     logger.info("Loading Tier 1 thresholds from Snowflake")
     thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
@@ -53,7 +56,7 @@ try:
 
     # Perform metric calculation in Python
     def calculate_metrics(alert_val, warning_val, evaluated_cnt, total_cnt):
-        """Pure Python function to calculate metrics."""
+        """Pure Python function to calculate metrics with corrected status logic."""
         alert = float(alert_val) if alert_val is not None else None
         warning = float(warning_val) if warning_val is not None else None
         evaluated = int(evaluated_cnt)
@@ -61,12 +64,14 @@ try:
         
         metric = evaluated / total * 100 if total > 0 else 0.0
         metric = round(metric, 2)  # Python's built-in round
+        
+        # Corrected status logic
         status = "GREEN"
-        if warning is not None and metric <= warning:
+        if alert is not None and metric <= alert:
             status = "RED"
-        elif alert is not None and metric <= alert:
+        elif warning is not None and metric <= warning and metric > alert:
             status = "YELLOW"
-        logger.info(f"Calculated metric: {metric}, status: {status}")
+        logger.info(f"Calculated metric: {metric}, status: {status} with alert={alert}, warning={warning}")
         return {
             "metric": metric,
             "status": status,
@@ -129,7 +134,7 @@ def test_tier1_metrics_calculation(spark):
         ["RESOURCE_NAME"]
     )
     mock_thresholds = spark.createDataFrame(
-        [(100.0, 80.0)],
+        [(100.0, 80.0)],  # Alert: 100.0, Warning: 80.0
         ["ALERT_THRESHOLD", "WARNING_THRESHOLD"]
     )
 
@@ -167,7 +172,7 @@ def test_tier1_metrics_calculation(spark):
     assert collected_result["NUMERATOR"] == 2, f"Expected numerator 2, got {collected_result['NUMERATOR']}"
     assert collected_result["DENOMINATOR"] == 3, f"Expected denominator 3, got {collected_result['DENOMINATOR']}"
     assert round(collected_result["MONITORING_METRIC"], 2) == 66.67, f"Expected metric ~66.67%, got {collected_result['MONITORING_METRIC']}"
-    assert collected_result["COMPLIANCE_STATUS"] == "YELLOW", f"Expected status YELLOW, got {collected_result['COMPLIANCE_STATUS']}"
+    assert collected_result["COMPLIANCE_STATUS"] == "RED", f"Expected status RED, got {collected_result['COMPLIANCE_STATUS']}"  # Updated expectation
     logger.info("Unit test for Tier 1 metrics calculation and DataFrame creation passed!")
 
 # Run unit test
