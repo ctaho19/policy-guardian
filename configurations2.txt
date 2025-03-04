@@ -1,179 +1,72 @@
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 13. Tier 2 Supporting Evidence
-# MAGIC Display details of non-compliant evaluated roles
+# MAGIC ## 14. Summary and Cleanup
+# MAGIC Summarize results and perform cleanup operations
 
 # COMMAND ----------
-from pyspark.sql.functions import col
 import logging
-from datetime import datetime, date
-import pandas as pd
-from pyspark.sql.types import StructType, StructField, StringType
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
-    # Load filtered and evaluated roles from PySpark DataFrames
-    logger.info("Loading filtered and evaluated roles for supporting evidence")
-    if not 'df_filtered' in locals() or df_filtered is None:
-        df_filtered = spark.table("filtered_machine_roles")
-    if not 'df_evaluated_roles' in locals() or df_evaluated_roles is None:
-        df_evaluated_roles = spark.table("evaluated_roles")
+    # Display summary of key metrics
+    logger.info("Generating pipeline execution summary")
+    print("\n========== PIPELINE EXECUTION SUMMARY ==========")
     
-    # Log schema and sample data to verify structure
-    logger.info("df_filtered schema: ")
-    df_filtered.printSchema()
-    logger.info("Sample df_filtered data: ")
-    df_filtered.show(5)
-    logger.info("df_evaluated_roles schema: ")
-    df_evaluated_roles.printSchema()
-    logger.info("Sample df_evaluated_roles data: ")
-    df_evaluated_roles.show(5)
+    total_iam_roles = spark.table("all_iam_roles").count()
+    machine_roles = spark.table("filtered_machine_roles").count()
+    print(f"Total IAM Roles (IDENTITY_REPORTS_IAM_RESOURCE_V3): {total_iam_roles}")
+    print(f"Machine Roles in Approved Accounts: {machine_roles}")
     
-    # Convert to Python lists
-    filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"], row["ACCOUNT"], 
-                     row["BA"], row["ROLE_TYPE"]) for row in df_filtered.collect()]
-    evaluated_data = [(row["RESOURCE_NAME"], row["COMPLIANCE_STATUS"]) for row in df_evaluated_roles.collect()]
-    logger.info(f"Filtered data count: {len(filtered_data)}, type: {type(filtered_data)}")
-    logger.info(f"Evaluated data count: {len(evaluated_data)}, type: {type(evaluated_data)}")
-    logger.info(f"Sample evaluated_data: {evaluated_data[:5]}")  # Debug sample
-
-    # Join filtered and evaluated data to identify non-compliant roles
-    filtered_map = {row[1]: (row[0], row[2], row[3], row[4]) for row in filtered_data}  # Map ARN to (RESOURCE_ID, ACCOUNT, BA, ROLE_TYPE)
-    evaluated_compliance = {arn: status for arn, status in evaluated_data}
-    non_compliant_roles = [
-        (resource_id, arn, acc, ba, role_type, status) 
-        for arn, status in evaluated_compliance.items() 
-        if arn in filtered_map and status == "NonCompliant"
-        for resource_id, acc, ba, role_type in [filtered_map[arn]]
-    ]
-    logger.info(f"Non-compliant roles count: {len(non_compliant_roles)}, type: {type(non_compliant_roles)}")
-    logger.info(f"Sample non-compliant roles: {non_compliant_roles[:5]}")  # Debug sample
-
-    # Prepare supporting evidence data as a Python dictionary for pandas
-    if non_compliant_roles:
-        evidence_data = {
-            "RESOURCE_ID": [row[0] for row in non_compliant_roles],
-            "ARN": [row[1] for row in non_compliant_roles],
-            "ACCOUNT": [row[2] for row in non_compliant_roles],
-            "BA": [row[3] for row in non_compliant_roles],
-            "ROLE_TYPE": [row[4] for row in non_compliant_roles],
-            "NOTES": [row[5] for row in non_compliant_roles]  # Use COMPLIANCE_STATUS as NOTES
-        }
-    else:
-        evidence_data = {
-            "RESOURCE_ID": [None],
-            "ARN": [None],
-            "ACCOUNT": [None],
-            "BA": [None],
-            "ROLE_TYPE": [None],
-            "NOTES": ["All Evaluated Roles are Compliant"]
-        }
-    logger.info(f"Supporting evidence data: {evidence_data}")
-    logger.info(f"Supporting evidence data types: {[type(x[0]) if x and len(x) > 0 else None for x in evidence_data.values()]}")
-
-    # Define explicit schema
-    evidence_schema = StructType([
-        StructField("RESOURCE_ID", StringType(), True),
-        StructField("ARN", StringType(), True),
-        StructField("ACCOUNT", StringType(), True),
-        StructField("BA", StringType(), True),
-        StructField("ROLE_TYPE", StringType(), True),
-        StructField("NOTES", StringType(), True)
-    ])
-
-    # Convert to pandas DataFrame and then to PySpark DataFrame with explicit schema
-    pd_evidence = pd.DataFrame(evidence_data)
-    df_supporting_evidence = spark.createDataFrame(pd_evidence, schema=evidence_schema)
-    logger.info("Supporting evidence DataFrame created with explicit schema")
-    df_supporting_evidence.printSchema()
-    logger.info("Supporting evidence DataFrame content:")
-    df_supporting_evidence.show(20, truncate=False)
-
-    # Register as temp view
-    df_supporting_evidence.createOrReplaceTempView("tier2_evidence")
+    # Tier 1 metrics with fallback and logging
+    tier1_numerator = int(spark.conf.get("spark.tier1_numerator", 0))
+    tier1_denominator = int(spark.conf.get("spark.tier1_denominator", 0))
+    tier1_metric = float(spark.conf.get("spark.tier1_metric_value", 0.0))
+    tier1_status = spark.conf.get("spark.tier1_compliance_status", "UNKNOWN")
+    logger.info(f"Tier 1 metrics retrieved: numerator={tier1_numerator}, denominator={tier1_denominator}, "
+                f"metric={tier1_metric}, status={tier1_status}")
+    print(f"\nTier 1 (Coverage) Metric: {tier1_metric}% ({tier1_status})")
+    print(f"Evaluated Roles: {tier1_numerator}")
+    print(f"Total Roles: {tier1_denominator}")
+    
+    # Tier 2 metrics with fallback and logging
+    tier2_numerator = int(spark.conf.get("spark.tier2_numerator", 0))
+    tier2_denominator = int(spark.conf.get("spark.tier2_denominator", 0))
+    tier2_metric = float(spark.conf.get("spark.tier2_metric_value", 0.0))
+    tier2_status = spark.conf.get("spark.tier2_compliance_status", "UNKNOWN")
+    logger.info(f"Tier 2 metrics retrieved: numerator={tier2_numerator}, denominator={tier2_denominator}, "
+                f"metric={tier2_metric}, status={tier2_status}")
+    print(f"\nTier 2 (Compliance) Metric: {tier2_metric}% ({tier2_status})")
+    print(f"Compliant Roles: {tier2_numerator}")
+    print(f"Evaluated Roles: {tier2_denominator}")
+    
+    # Cleanup cached DataFrames to free up memory
+    logger.info("Performing cleanup of cached DataFrames")
+    if 'df_all_iam_roles' in locals() and df_all_iam_roles is not None:
+        df_all_iam_roles.unpersist()
+        logger.info("Unpersisted df_all_iam_roles")
+    if 'df_all_roles' in locals() and df_all_roles is not None:
+        df_all_roles.unpersist()
+        logger.info("Unpersisted df_all_roles")
+    if 'df_filtered' in locals() and df_filtered is not None:
+        df_filtered.unpersist()
+        logger.info("Unpersisted df_filtered")
+    
+    # Log total execution time
+    start_time = datetime.strptime(spark.conf.get("spark.pipeline_start_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S")), "%Y-%m-%d %H:%M:%S")
+    execution_time = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Pipeline execution completed successfully, total time: {execution_time} seconds")
+    print(f"Total execution time: {execution_time} seconds")
 
 except Exception as e:
-    logger.error(f"ERROR in Tier 2 supporting evidence: {str(e)}")
+    logger.error(f"ERROR in summary and cleanup: {str(e)}")
     raise
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Unit Tests for Tier 2 Supporting Evidence
-
-# COMMAND ----------
-def test_tier2_supporting_evidence(spark):
-    """Unit test for Tier 2 supporting evidence logic and DataFrame creation."""
-    # Mock data
-    mock_filtered_data = spark.createDataFrame(
-        [("res1", "arn1", "acc1", "ba1", "MACHINE"),
-         ("res2", "arn2", "acc2", "ba2", "MACHINE"),
-         ("res3", "arn3", "acc3", "ba3", "MACHINE")],
-        ["RESOURCE_ID", "AMAZON_RESOURCE_NAME", "ACCOUNT", "BA", "ROLE_TYPE"]
-    )
-    mock_evaluated_data = spark.createDataFrame(
-        [("arn1", "Compliant"), ("arn2", "NonCompliant"), ("arn3", "CompliantControlAllowance")],
-        ["RESOURCE_NAME", "COMPLIANCE_STATUS"]
-    )
-
-    # Collect data
-    filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"], row["ACCOUNT"], 
-                     row["BA"], row["ROLE_TYPE"]) for row in mock_filtered_data.collect()]
-    evaluated_data = [(row["RESOURCE_NAME"], row["COMPLIANCE_STATUS"]) for row in mock_evaluated_data.collect()]
-
-    # Join filtered and evaluated data to identify non-compliant roles
-    filtered_map = {row[1]: (row[0], row[2], row[3], row[4]) for row in filtered_data}
-    evaluated_compliance = {arn: status for arn, status in evaluated_data}
-    non_compliant_roles = [
-        (resource_id, arn, acc, ba, role_type, status) 
-        for arn, status in evaluated_compliance.items() 
-        if arn in filtered_map and status == "NonCompliant"
-        for resource_id, acc, ba, role_type in [filtered_map[arn]]
-    ]
-
-    # Prepare supporting evidence data
-    if non_compliant_roles:
-        evidence_data = {
-            "RESOURCE_ID": [row[0] for row in non_compliant_roles],
-            "ARN": [row[1] for row in non_compliant_roles],
-            "ACCOUNT": [row[2] for row in non_compliant_roles],
-            "BA": [row[3] for row in non_compliant_roles],
-            "ROLE_TYPE": [row[4] for row in non_compliant_roles],
-            "NOTES": [row[5] for row in non_compliant_roles]
-        }
-    else:
-        evidence_data = {
-            "RESOURCE_ID": [None],
-            "ARN": [None],
-            "ACCOUNT": [None],
-            "BA": [None],
-            "ROLE_TYPE": [None],
-            "NOTES": ["All Evaluated Roles are Compliant"]
-        }
-
-    # Define explicit schema
-    evidence_schema = StructType([
-        StructField("RESOURCE_ID", StringType(), True),
-        StructField("ARN", StringType(), True),
-        StructField("ACCOUNT", StringType(), True),
-        StructField("BA", StringType(), True),
-        StructField("ROLE_TYPE", StringType(), True),
-        StructField("NOTES", StringType(), True)
-    ])
-
-    # Convert to pandas DataFrame and then to PySpark DataFrame with explicit schema
-    pd_evidence = pd.DataFrame(evidence_data)
-    df_result = spark.createDataFrame(pd_evidence, schema=evidence_schema)
-
-    # Assertions
-    collected_result = df_result.collect()
-    assert len(collected_result) == 1, f"Expected 1 non-compliant row, got {len(collected_result)}"
-    assert collected_result[0]["ARN"] == "arn2", f"Expected ARN arn2, got {collected_result[0]['ARN']}"
-    assert collected_result[0]["NOTES"] == "NonCompliant", f"Expected NOTES NonCompliant, got {collected_result[0]['NOTES']}"
-    logger.info("Unit test for Tier 2 supporting evidence passed!")
-
-# Run unit test
-test_tier2_supporting_evidence(spark)
+# MAGIC ## Pipeline Execution Complete
+# MAGIC All steps have been executed. Review the logs for any errors or warnings.
 ​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
