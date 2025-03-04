@@ -6,6 +6,7 @@
 # COMMAND ----------
 from pyspark.sql.functions import current_date
 from pyspark.sql.types import StructType, StructField, DateType, StringType, DoubleType, LongType
+from pyspark.sql.column import Column
 
 try:
     # Get thresholds from Snowflake
@@ -53,20 +54,48 @@ try:
     
     print(f"DEBUG - Raw evaluated count (from join): {evaluated_count_raw}, type: {type(evaluated_count_raw)}")
     print(f"DEBUG - Raw total count: {total_count_raw}, type: {type(total_count_raw)}")
+
+    # Check if any of the variables are Spark Column objects
+    print(f"Is alert_threshold_raw a Column? {isinstance(alert_threshold_raw, Column)}")
+    print(f"Is warning_threshold_raw a Column? {isinstance(warning_threshold_raw, Column)}")
+    print(f"Is evaluated_count_raw a Column? {isinstance(evaluated_count_raw, Column)}")
+    print(f"Is total_count_raw a Column? {isinstance(total_count_raw, Column)}")
+    
+    # Add debug info before calculation
+    print(f"DEBUG - Full calculation inputs:")
+    print(f"  - alert_threshold_raw: {alert_threshold_raw}, type: {type(alert_threshold_raw)}")
+    print(f"  - warning_threshold_raw: {warning_threshold_raw}, type: {type(warning_threshold_raw)}")
+    print(f"  - evaluated_count_raw: {evaluated_count_raw}, type: {type(evaluated_count_raw)}")
+    print(f"  - total_count_raw: {total_count_raw}, type: {type(total_count_raw)}")
     
     # Define a completely separate function for calculations
     def calculate_metrics(alert_val, warning_val, evaluated_cnt, total_cnt):
         """Pure Python function to calculate metrics outside of Spark context"""
+        print(f"DEBUG - Inside calculate_metrics function:")
+        print(f"  - alert_val: {alert_val}, type: {type(alert_val)}")
+        print(f"  - warning_val: {warning_val}, type: {type(warning_val)}")
+        print(f"  - evaluated_cnt: {evaluated_cnt}, type: {type(evaluated_cnt)}")
+        print(f"  - total_cnt: {total_cnt}, type: {type(total_cnt)}")
+        
         # Convert to primitive types explicitly
         alert = float(alert_val) if alert_val is not None else None
         warning = float(warning_val) if warning_val is not None else None
         evaluated = int(evaluated_cnt)
         total = int(total_cnt)
         
+        print(f"DEBUG - After conversion:")
+        print(f"  - alert: {alert}, type: {type(alert)}")
+        print(f"  - warning: {warning}, type: {type(warning)}")
+        print(f"  - evaluated: {evaluated}, type: {type(evaluated)}")
+        print(f"  - total: {total}, type: {type(total)}")
+        
         # Calculate metric
+        print(f"DEBUG - About to calculate metric with evaluated={evaluated} and total={total}")
         metric = 0.0
         if total > 0:
             metric = round((evaluated * 100.0) / total, 2)
+        
+        print(f"DEBUG - Calculated metric: {metric}, type: {type(metric)}")
         
         # Determine status
         status = "GREEN"
@@ -75,6 +104,8 @@ try:
         elif alert is not None and metric <= alert:
             status = "YELLOW"
         
+        print(f"DEBUG - Determined status: {status}")
+        
         return {
             "metric": metric,
             "status": status,
@@ -82,12 +113,24 @@ try:
             "denominator": total
         }
     
-    # Run calculations
+    # Try to force primitive types before passing to the function
+    alert_threshold_primitive = float(alert_threshold_raw) if alert_threshold_raw is not None else None
+    warning_threshold_primitive = float(warning_threshold_raw) if warning_threshold_raw is not None else None
+    evaluated_count_primitive = int(evaluated_count_raw)
+    total_count_primitive = int(total_count_raw)
+    
+    print("DEBUG - Primitive values before calculation:")
+    print(f"  - alert_threshold_primitive: {alert_threshold_primitive}, type: {type(alert_threshold_primitive)}")
+    print(f"  - warning_threshold_primitive: {warning_threshold_primitive}, type: {type(warning_threshold_primitive)}")
+    print(f"  - evaluated_count_primitive: {evaluated_count_primitive}, type: {type(evaluated_count_primitive)}")
+    print(f"  - total_count_primitive: {total_count_primitive}, type: {type(total_count_primitive)}")
+    
+    # Run calculations with primitive types
     results = calculate_metrics(
-        alert_threshold_raw,
-        warning_threshold_raw,
-        evaluated_count_raw,
-        total_count_raw
+        alert_threshold_primitive,
+        warning_threshold_primitive,
+        evaluated_count_primitive,
+        total_count_primitive
     )
     log_step("Calculation results", f"Results: {results}")
     
@@ -125,11 +168,36 @@ try:
     df_result.show()
     
     # Store key metrics as global variables
-    spark.sql(f"SET tier1_numerator = {results['numerator']}")
-    spark.sql(f"SET tier1_denominator = {results['denominator']}")
-    spark.sql(f"SET tier1_metric_value = {results['metric']}")
-    spark.sql(f"SET tier1_compliance_status = '{results['status']}'")
+    # Wrap everything in quotes to ensure they're treated as string literals
+    log_step("Setting SQL variables", "About to set Spark SQL variables")
+    try:
+        spark.sql(f"SET tier1_numerator = '{results['numerator']}'")
+        log_step("Set numerator", "Success")
+    except Exception as e:
+        log_step("Error setting numerator", str(e))
+    
+    try:
+        spark.sql(f"SET tier1_denominator = '{results['denominator']}'")
+        log_step("Set denominator", "Success")
+    except Exception as e:
+        log_step("Error setting denominator", str(e))
+    
+    try:
+        spark.sql(f"SET tier1_metric_value = '{results['metric']}'")
+        log_step("Set metric", "Success")
+    except Exception as e:
+        log_step("Error setting metric", str(e))
+    
+    try:
+        spark.sql(f"SET tier1_compliance_status = '{results['status']}'")
+        log_step("Set status", "Success")
+    except Exception as e:
+        log_step("Error setting status", str(e))
     
 except Exception as e:
     log_step("ERROR in Tier 1 metrics calculation", f"Calculation failed: {str(e)}")
+    print(f"Error type: {type(e)}, Error message: {str(e)}")
+    print(f"Error details: {e}")
+    import traceback
+    traceback.print_exc()
     raise
