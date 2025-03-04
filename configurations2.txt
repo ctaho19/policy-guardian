@@ -1,203 +1,191 @@
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## 10. Tier 1 Metrics Calculation
-# MAGIC Calculate and display compliance metrics based on thresholds from Snowflake
+# MAGIC Calculate compliance metrics using a robust Python-based approach with explicit DataFrame handling
 
 # COMMAND ----------
-from pyspark.sql.functions import current_date
-from pyspark.sql.types import StructType, StructField, DateType, StringType, DoubleType, LongType
-from pyspark.sql.column import Column
+from pyspark.sql.functions import col
+from pyspark.sql.types import DateType, LongType
+import logging
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 try:
-    # Get thresholds from Snowflake
-    log_step("Retrieving Tier 1 thresholds")
+    # Retrieve Tier 1 thresholds from Snowflake
+    logger.info("Retrieving Tier 1 thresholds")
     thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
         .options(**sfOptions) \
         .option("query", tier1_threshold_query) \
         .load()
     
-    print("Tier 1 thresholds:")
     thresholds_df.show()
+    threshold_data = thresholds_df.collect()
+    logger.info(f"Threshold data collected: {threshold_data}, type: {type(threshold_data)}")
     
-    # Get raw values first
-    threshold_row_list = thresholds_df.collect()
-    print(f"DEBUG - threshold_row_list type: {type(threshold_row_list)}")
-    
-    alert_threshold_raw = None
-    warning_threshold_raw = None
-    
-    if len(threshold_row_list) > 0:
-        threshold_row = threshold_row_list[0]
-        alert_threshold_raw = threshold_row['ALERT_THRESHOLD']
-        warning_threshold_raw = threshold_row['WARNING_THRESHOLD']
-        
-        print(f"DEBUG - Raw alert threshold: {alert_threshold_raw}, type: {type(alert_threshold_raw)}")
-        print(f"DEBUG - Raw warning threshold: {warning_threshold_raw}, type: {type(warning_threshold_raw)}")
-    
-    # Get filtered machine roles data
+    alert_threshold_raw = threshold_data[0]["ALERT_THRESHOLD"] if threshold_data else None
+    warning_threshold_raw = threshold_data[0]["WARNING_THRESHOLD"] if threshold_data else None
+    logger.info(f"Alert threshold: {alert_threshold_raw}, type: {type(alert_threshold_raw)}")
+    logger.info(f"Warning threshold: {warning_threshold_raw}, type: {type(warning_threshold_raw)}")
+
+    # Collect data from filtered and evaluated roles
+    logger.info("Collecting data from filtered and evaluated roles")
     if not 'df_filtered' in locals() or df_filtered is None:
         df_filtered = spark.table("filtered_machine_roles")
-    
-    # Get evaluated roles data
     if not 'df_evaluated_roles' in locals() or df_evaluated_roles is None:
         df_evaluated_roles = spark.table("evaluated_roles")
     
-    # Calculate numerator: count of machine roles evaluated against the control
-    evaluated_count_raw = df_filtered.join(
-        df_evaluated_roles,
-        df_filtered["AMAZON_RESOURCE_NAME"] == df_evaluated_roles["RESOURCE_NAME"],
-        "inner"
-    ).select("RESOURCE_ID").distinct().count()
-    
-    # Calculate denominator: total count of machine roles
-    total_count_raw = df_filtered.select("RESOURCE_ID").distinct().count()
-    
-    print(f"DEBUG - Raw evaluated count (from join): {evaluated_count_raw}, type: {type(evaluated_count_raw)}")
-    print(f"DEBUG - Raw total count: {total_count_raw}, type: {type(total_count_raw)}")
+    filtered_data = df_filtered.select("RESOURCE_ID", "AMAZON_RESOURCE_NAME").collect()
+    evaluated_data = df_evaluated_roles.select("RESOURCE_NAME").collect()
+    logger.info(f"Filtered data count: {len(filtered_data)}, type: {type(filtered_data)}")
+    logger.info(f"Evaluated data count: {len(evaluated_data)}, type: {type(evaluated_data)}")
 
-    # Check if any of the variables are Spark Column objects
-    print(f"Is alert_threshold_raw a Column? {isinstance(alert_threshold_raw, Column)}")
-    print(f"Is warning_threshold_raw a Column? {isinstance(warning_threshold_raw, Column)}")
-    print(f"Is evaluated_count_raw a Column? {isinstance(evaluated_count_raw, Column)}")
-    print(f"Is total_count_raw a Column? {isinstance(total_count_raw, Column)}")
-    
-    # Add debug info before calculation
-    print(f"DEBUG - Full calculation inputs:")
-    print(f"  - alert_threshold_raw: {alert_threshold_raw}, type: {type(alert_threshold_raw)}")
-    print(f"  - warning_threshold_raw: {warning_threshold_raw}, type: {type(warning_threshold_raw)}")
-    print(f"  - evaluated_count_raw: {evaluated_count_raw}, type: {type(evaluated_count_raw)}")
-    print(f"  - total_count_raw: {total_count_raw}, type: {type(total_count_raw)}")
-    
-    # Define a completely separate function for calculations
+    # Calculate numerator and denominator in Python
+    evaluated_resource_ids = {row["RESOURCE_NAME"] for row in evaluated_data}
+    total_resource_ids = {row["AMAZON_RESOURCE_NAME"] for row in filtered_data}
+    evaluated_count = len([rid for rid in total_resource_ids if rid in evaluated_resource_ids])
+    total_count = len(total_resource_ids)
+    logger.info(f"Evaluated count: {evaluated_count}, type: {type(evaluated_count)}")
+    logger.info(f"Total count: {total_count}, type: {type(total_count)}")
+
+    # Perform metric calculation in Python
     def calculate_metrics(alert_val, warning_val, evaluated_cnt, total_cnt):
-        """Pure Python function to calculate metrics outside of Spark context"""
-        print(f"DEBUG - Inside calculate_metrics function:")
-        print(f"  - alert_val: {alert_val}, type: {type(alert_val)}")
-        print(f"  - warning_val: {warning_val}, type: {type(warning_val)}")
-        print(f"  - evaluated_cnt: {evaluated_cnt}, type: {type(evaluated_cnt)}")
-        print(f"  - total_cnt: {total_cnt}, type: {type(total_cnt)}")
-        
-        # Convert to primitive types explicitly
+        """Pure Python function to calculate metrics."""
         alert = float(alert_val) if alert_val is not None else None
         warning = float(warning_val) if warning_val is not None else None
         evaluated = int(evaluated_cnt)
         total = int(total_cnt)
         
-        print(f"DEBUG - After conversion:")
-        print(f"  - alert: {alert}, type: {type(alert)}")
-        print(f"  - warning: {warning}, type: {type(warning)}")
-        print(f"  - evaluated: {evaluated}, type: {type(evaluated)}")
-        print(f"  - total: {total}, type: {type(total)}")
-        
-        # Calculate metric
-        print(f"DEBUG - About to calculate metric with evaluated={evaluated} and total={total}")
-        metric = 0.0
-        if total > 0:
-            metric = round((evaluated * 100.0) / total, 2)
-        
-        print(f"DEBUG - Calculated metric: {metric}, type: {type(metric)}")
-        
-        # Determine status
+        metric = (evaluated * 100.0) / total if total > 0 else 0.0  # Avoid round() for now
+        metric = round(metric, 2)  # Use Python's built-in round after calculation
         status = "GREEN"
         if warning is not None and metric <= warning:
             status = "RED"
         elif alert is not None and metric <= alert:
             status = "YELLOW"
-        
-        print(f"DEBUG - Determined status: {status}")
-        
+        logger.info(f"Calculated metric: {metric}, status: {status}")
         return {
             "metric": metric,
             "status": status,
             "numerator": evaluated,
             "denominator": total
         }
-    
-    # Try to force primitive types before passing to the function
-    alert_threshold_primitive = float(alert_threshold_raw) if alert_threshold_raw is not None else None
-    warning_threshold_primitive = float(warning_threshold_raw) if warning_threshold_raw is not None else None
-    evaluated_count_primitive = int(evaluated_count_raw)
-    total_count_primitive = int(total_count_raw)
-    
-    print("DEBUG - Primitive values before calculation:")
-    print(f"  - alert_threshold_primitive: {alert_threshold_primitive}, type: {type(alert_threshold_primitive)}")
-    print(f"  - warning_threshold_primitive: {warning_threshold_primitive}, type: {type(warning_threshold_primitive)}")
-    print(f"  - evaluated_count_primitive: {evaluated_count_primitive}, type: {type(evaluated_count_primitive)}")
-    print(f"  - total_count_primitive: {total_count_primitive}, type: {type(total_count_primitive)}")
-    
-    # Run calculations with primitive types
-    results = calculate_metrics(
-        alert_threshold_primitive,
-        warning_threshold_primitive,
-        evaluated_count_primitive,
-        total_count_primitive
+
+    # Run calculations
+    results = calculate_metrics(alert_threshold_raw, warning_threshold_raw, evaluated_count, total_count)
+    logger.info(f"Calculation results: {results}")
+
+    # Get current date using a temporary DataFrame and collect as Python object
+    logger.info("Retrieving current date")
+    temp_df = spark.sql("SELECT CURRENT_DATE AS date")
+    current_date_value = temp_df.collect()[0]["date"]
+    logger.info(f"Current date: {current_date_value}, type: {type(current_date_value)}")
+
+    # Prepare metrics data as a list of Python objects
+    metrics_data = [
+        (
+            current_date_value,
+            'MNTR-1105806-T1',
+            float(results["metric"]),  # Explicitly cast to float
+            str(results["status"]),
+            int(results["numerator"]),
+            int(results["denominator"])
+        )
+    ]
+    logger.info(f"Metrics data: {metrics_data}")
+    logger.info(f"Metrics data types: {[type(x) for x in metrics_data[0]]}")
+
+    # Create DataFrame with schema inference first, then cast columns
+    df_result = spark.createDataFrame(metrics_data)
+    df_result = df_result.select(
+        col("date").cast(DateType()).alias("DATE"),
+        col("1").cast(StringType()).alias("MONITORING_METRIC_NUMBER"),
+        col("2").cast(DoubleType()).alias("MONITORING_METRIC"),
+        col("3").cast(StringType()).alias("COMPLIANCE_STATUS"),
+        col("4").cast(LongType()).alias("NUMERATOR"),
+        col("5").cast(LongType()).alias("DENOMINATOR")
     )
-    log_step("Calculation results", f"Results: {results}")
-    
-    # Get current date as a Python object
-    current_date_value = spark.range(1).select(current_date()).first()[0]
-    log_step("Current date", f"Value: {current_date_value}, Type: {type(current_date_value)}")
-    
-    # Create metrics_data with Python objects
-    metrics_data = [(
-        current_date_value,  # Python datetime.date object
-        'MNTR-1105806-T1',
-        results["metric"],
-        results["status"],
-        results["numerator"],
-        results["denominator"]
-    )]
-    log_step("Metrics data types", f"Types: {[type(x) for x in metrics_data[0]]}")
-    
-    # Define schema
-    metrics_schema = StructType([
-        StructField("DATE", DateType(), False),
-        StructField("MONITORING_METRIC_NUMBER", StringType(), False),
-        StructField("MONITORING_METRIC", DoubleType(), False),
-        StructField("COMPLIANCE_STATUS", StringType(), False),
-        StructField("NUMERATOR", LongType(), False),
-        StructField("DENOMINATOR", LongType(), False)
-    ])
-    
-    # Create DataFrame
-    df_result = spark.createDataFrame(metrics_data, metrics_schema)
-    log_step("DataFrame created", "Tier 1 metrics DataFrame successfully created")
-    
-    # Display results
-    log_step("Final Tier 1 Compliance Metrics")
+    logger.info("DataFrame created with explicit casting")
+    df_result.printSchema()
+    logger.info("DataFrame content:")
     df_result.show()
-    
+
     # Store key metrics as global variables
-    # Wrap everything in quotes to ensure they're treated as string literals
-    log_step("Setting SQL variables", "About to set Spark SQL variables")
-    try:
-        spark.sql(f"SET tier1_numerator = '{results['numerator']}'")
-        log_step("Set numerator", "Success")
-    except Exception as e:
-        log_step("Error setting numerator", str(e))
-    
-    try:
-        spark.sql(f"SET tier1_denominator = '{results['denominator']}'")
-        log_step("Set denominator", "Success")
-    except Exception as e:
-        log_step("Error setting denominator", str(e))
-    
-    try:
-        spark.sql(f"SET tier1_metric_value = '{results['metric']}'")
-        log_step("Set metric", "Success")
-    except Exception as e:
-        log_step("Error setting metric", str(e))
-    
-    try:
-        spark.sql(f"SET tier1_compliance_status = '{results['status']}'")
-        log_step("Set status", "Success")
-    except Exception as e:
-        log_step("Error setting status", str(e))
-    
+    spark.sql(f"SET tier1_numerator = {results['numerator']}")
+    spark.sql(f"SET tier1_denominator = {results['denominator']}")
+    spark.sql(f"SET tier1_metric_value = {results['metric']}")
+    spark.sql(f"SET tier1_compliance_status = '{results['status']}'")
+
 except Exception as e:
-    log_step("ERROR in Tier 1 metrics calculation", f"Calculation failed: {str(e)}")
-    print(f"Error type: {type(e)}, Error message: {str(e)}")
-    print(f"Error details: {e}")
-    import traceback
-    traceback.print_exc()
+    logger.error(f"ERROR in Tier 1 metrics calculation: {str(e)}")
     raise
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Unit Tests for Tier 1 Metrics Calculation
+
+# COMMAND ----------
+def test_tier1_metrics_calculation(spark):
+    """Unit test for Tier 1 metrics calculation and DataFrame creation."""
+    # Mock data
+    mock_filtered_data = spark.createDataFrame(
+        [("res1", "arn1"), ("res2", "arn2"), ("res3", "arn3")],
+        ["RESOURCE_ID", "AMAZON_RESOURCE_NAME"]
+    )
+    mock_evaluated_data = spark.createDataFrame(
+        [("arn1",), ("arn3",)],
+        ["RESOURCE_NAME"]
+    )
+    mock_thresholds = spark.createDataFrame(
+        [(100.0, 80.0)],
+        ["ALERT_THRESHOLD", "WARNING_THRESHOLD"]
+    )
+
+    # Collect data
+    filtered_data = mock_filtered_data.collect()
+    evaluated_data = mock_evaluated_data.collect()
+    threshold_data = mock_thresholds.collect()
+
+    # Calculate metrics
+    evaluated_resource_ids = {row["RESOURCE_NAME"] for row in evaluated_data}
+    total_resource_ids = {row["AMAZON_RESOURCE_NAME"] for row in filtered_data}
+    evaluated_count = len([rid for rid in total_resource_ids if rid in evaluated_resource_ids])
+    total_count = len(total_resource_ids)
+    alert_threshold = threshold_data[0]["ALERT_THRESHOLD"]
+    warning_threshold = threshold_data[0]["WARNING_THRESHOLD"]
+
+    results = calculate_metrics(alert_threshold, warning_threshold, evaluated_count, total_count)
+    
+    # Mock current date
+    temp_df = spark.sql("SELECT CURRENT_DATE AS date")
+    current_date_value = temp_df.collect()[0]["date"]
+
+    # Prepare metrics data
+    metrics_data = [
+        (current_date_value, 'MNTR-1105806-T1', float(results["metric"]), str(results["status"]),
+         int(results["numerator"]), int(results["denominator"]))
+    ]
+
+    # Create DataFrame
+    df_result = spark.createDataFrame(metrics_data)
+    df_result = df_result.select(
+        col("_1").cast(DateType()).alias("DATE"),
+        col("_2").cast(StringType()).alias("MONITORING_METRIC_NUMBER"),
+        col("_3").cast(DoubleType()).alias("MONITORING_METRIC"),
+        col("_4").cast(StringType()).alias("COMPLIANCE_STATUS"),
+        col("_5").cast(LongType()).alias("NUMERATOR"),
+        col("_6").cast(LongType()).alias("DENOMINATOR")
+    )
+
+    # Assertions
+    collected_result = df_result.collect()[0]
+    assert collected_result["NUMERATOR"] == 2, f"Expected numerator 2, got {collected_result['NUMERATOR']}"
+    assert collected_result["DENOMINATOR"] == 3, f"Expected denominator 3, got {collected_result['DENOMINATOR']}"
+    assert round(collected_result["MONITORING_METRIC"], 2) == 66.67, f"Expected metric ~66.67%, got {collected_result['MONITORING_METRIC']}"
+    assert collected_result["COMPLIANCE_STATUS"] == "YELLOW", f"Expected status YELLOW, got {collected_result['COMPLIANCE_STATUS']}"
+    logger.info("Unit test for Tier 1 metrics calculation and DataFrame creation passed!")
+
+# Run unit test
+test_tier1_metrics_calculation(spark)
