@@ -1,0 +1,80 @@
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 14. Summary and Cleanup
+# MAGIC Summarize results and perform cleanup operations
+
+# COMMAND ----------
+import logging
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    # Display summary of key metrics
+    logger.info("Generating pipeline execution summary")
+    print("\n========== PIPELINE EXECUTION SUMMARY ==========")
+    
+    total_iam_roles = spark.table("all_iam_roles").count()
+    machine_roles = spark.table("filtered_machine_roles").count()
+    print(f"Total IAM Roles (IDENTITY_REPORTS_IAM_RESOURCE_V3): {total_iam_roles}")
+    print(f"Machine Roles in Approved Accounts: {machine_roles}")
+    
+    # Tier 1 metrics with string defaults and casting
+    tier1_numerator = int(spark.conf.get("spark.tier1_numerator", "0"))
+    tier1_denominator = int(spark.conf.get("spark.tier1_denominator", "0"))
+    tier1_metric = float(spark.conf.get("spark.tier1_metric_value", "0.0"))
+    tier1_status = spark.conf.get("spark.tier1_compliance_status", "UNKNOWN")
+    logger.info(f"Raw Tier 1 configs: numerator={spark.conf.get('spark.tier1_numerator', '0')}, "
+                f"denominator={spark.conf.get('spark.tier1_denominator', '0')}, "
+                f"metric={spark.conf.get('spark.tier1_metric_value', '0.0')}, "
+                f"status={spark.conf.get('spark.tier1_compliance_status', 'UNKNOWN')}")
+    logger.info(f"Tier 1 metrics retrieved: numerator={tier1_numerator}, denominator={tier1_denominator}, "
+                f"metric={tier1_metric}, status={tier1_status}")
+    print(f"\nTier 1 (Coverage) Metric: {tier1_metric}% ({tier1_status})")
+    print(f"Evaluated Roles: {tier1_numerator}")
+    print(f"Total Roles: {tier1_denominator}")
+    
+    # Tier 2 metrics with string defaults and casting
+    tier2_numerator = int(spark.conf.get("spark.tier2_numerator", "0"))
+    tier2_denominator = int(spark.conf.get("spark.tier2_denominator", "0"))
+    tier2_metric = float(spark.conf.get("spark.tier2_metric_value", "0.0"))
+    tier2_status = spark.conf.get("spark.tier2_compliance_status", "UNKNOWN")
+    logger.info(f"Raw Tier 2 configs: numerator={spark.conf.get('spark.tier2_numerator', '0')}, "
+                f"denominator={spark.conf.get('spark.tier2_denominator', '0')}, "
+                f"metric={spark.conf.get('spark.tier2_metric_value', '0.0')}, "
+                f"status={spark.conf.get('spark.tier2_compliance_status', 'UNKNOWN')}")
+    logger.info(f"Tier 2 metrics retrieved: numerator={tier2_numerator}, denominator={tier2_denominator}, "
+                f"metric={tier2_metric}, status={tier2_status}")
+    print(f"\nTier 2 (Compliance) Metric: {tier2_metric}% ({tier2_status})")
+    print(f"Compliant Roles: {tier2_numerator}")
+    print(f"Evaluated Roles: {tier2_denominator}")
+    
+    # Cleanup cached DataFrames to free up memory
+    logger.info("Performing cleanup of cached DataFrames")
+    if 'df_all_iam_roles' in locals() and df_all_iam_roles is not None:
+        df_all_iam_roles.unpersist()
+        logger.info("Unpersisted df_all_iam_roles")
+    if 'df_all_roles' in locals() and df_all_roles is not None:
+        df_all_roles.unpersist()
+        logger.info("Unpersisted df_all_roles")
+    if 'df_filtered' in locals() and df_filtered is not None:
+        df_filtered.unpersist()
+        logger.info("Unpersisted df_filtered")
+    
+    # Log total execution time
+    start_time = datetime.strptime(spark.conf.get("spark.pipeline_start_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S")), "%Y-%m-%d %H:%M:%S")
+    execution_time = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Pipeline execution completed successfully, total time: {execution_time} seconds")
+    print(f"Total execution time: {execution_time} seconds")
+
+except Exception as e:
+    logger.error(f"ERROR in summary and cleanup: {str(e)}")
+    raise
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Pipeline Execution Complete
+# MAGIC All steps have been executed. Review the logs for any errors or warnings.
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
