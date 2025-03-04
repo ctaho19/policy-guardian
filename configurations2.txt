@@ -1,7 +1,7 @@
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## 11. Tier 1 Supporting Evidence
-# MAGIC Display details of machine roles that were not evaluated against the control
+# MAGIC Display details of machine roles (from filtered data) not evaluated against the control
 
 # COMMAND ----------
 from pyspark.sql.functions import col
@@ -26,13 +26,14 @@ try:
     filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"], row["ACCOUNT"], 
                      row["BA"], row["CREATE_DATE"], row["ROLE_TYPE"]) for row in df_filtered.collect()]
     evaluated_data = [row["RESOURCE_NAME"] for row in df_evaluated_roles.collect()]
-    logger.info(f"Filtered data count: {len(filtered_data)}, type: {type(filtered_data)}")
-    logger.info(f"Evaluated data count: {len(evaluated_data)}, type: {type(evaluated_data)}")
+    logger.info(f"Filtered data count (denominator): {len(filtered_data)}, type: {type(filtered_data)}")
+    logger.info(f"Evaluated data count (numerator): {len(evaluated_data)}, type: {type(evaluated_data)}")
 
-    # Identify unevaluated roles in Python
+    # Identify unevaluated roles (from filtered data not in evaluated data)
     evaluated_set = set(evaluated_data)
-    unevaluated_data = [row for row in filtered_data if row[1] not in evaluated_set]  # Index 1 is AMAZON_RESOURCE_NAME
+    unevaluated_data = [row for row in filtered_data if row[1] not in evaluated_set]  # row[1] is AMAZON_RESOURCE_NAME
     logger.info(f"Unevaluated data count: {len(unevaluated_data)}, type: {type(unevaluated_data)}")
+    logger.info(f"Sample unevaluated ARNs: {unevaluated_data[:5]}")  # Debug sample
 
     # Prepare supporting evidence data as a Python dictionary for pandas
     if unevaluated_data:
@@ -56,12 +57,23 @@ try:
             "NOTES": ["All Roles Evaluated Against Control"]
         }
     logger.info(f"Supporting evidence data: {evidence_data}")
-    logger.info(f"Supporting evidence data types: {[type(x[0]) if x else None for x in evidence_data.values()]}")
+    logger.info(f"Supporting evidence data types: {[type(x[0]) if x and len(x) > 0 else None for x in evidence_data.values()]}")
 
-    # Convert to pandas DataFrame and then to PySpark DataFrame
+    # Define explicit schema to avoid inference issues
+    evidence_schema = StructType([
+        StructField("RESOURCE_ID", StringType(), True),
+        StructField("ARN", StringType(), True),
+        StructField("ACCOUNT", StringType(), True),
+        StructField("BA", StringType(), True),
+        StructField("CREATE_DATE", TimestampType(), True),
+        StructField("ROLE_TYPE", StringType(), True),
+        StructField("NOTES", StringType(), True)
+    ])
+
+    # Convert to pandas DataFrame and then to PySpark DataFrame with explicit schema
     pd_evidence = pd.DataFrame(evidence_data)
-    df_supporting_evidence = spark.createDataFrame(pd_evidence)
-    logger.info("Supporting evidence DataFrame created from pandas DataFrame")
+    df_supporting_evidence = spark.createDataFrame(pd_evidence, schema=evidence_schema)
+    logger.info("Supporting evidence DataFrame created with explicit schema")
     df_supporting_evidence.printSchema()
     logger.info("Supporting evidence DataFrame content:")
     df_supporting_evidence.show(20, truncate=False)
@@ -123,9 +135,20 @@ def test_tier1_supporting_evidence(spark):
             "NOTES": ["All Roles Evaluated Against Control"]
         }
 
+    # Define explicit schema
+    evidence_schema = StructType([
+        StructField("RESOURCE_ID", StringType(), True),
+        StructField("ARN", StringType(), True),
+        StructField("ACCOUNT", StringType(), True),
+        StructField("BA", StringType(), True),
+        StructField("CREATE_DATE", TimestampType(), True),
+        StructField("ROLE_TYPE", StringType(), True),
+        StructField("NOTES", StringType(), True)
+    ])
+
     # Convert to pandas DataFrame and then to PySpark DataFrame
     pd_evidence = pd.DataFrame(evidence_data)
-    df_result = spark.createDataFrame(pd_evidence)
+    df_result = spark.createDataFrame(pd_evidence, schema=evidence_schema)
 
     # Assertions
     collected_result = df_result.collect()
