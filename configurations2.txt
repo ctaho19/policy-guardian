@@ -1,3 +1,4 @@
+
 # DataBricks Notebook - Pipeline3_New
 """
 This notebook combines functionality to:
@@ -477,15 +478,25 @@ try:
         print(f"DEBUG - Raw alert threshold: {alert_threshold_raw}, type: {type(alert_threshold_raw)}")
         print(f"DEBUG - Raw warning threshold: {warning_threshold_raw}, type: {type(warning_threshold_raw)}")
     
-    # Get filtered data
+    # Get filtered machine roles data
     if not 'df_filtered' in locals() or df_filtered is None:
         df_filtered = spark.table("filtered_machine_roles")
     
-    # Get raw counts
-    evaluated_count_raw = df_filtered.filter(col("IS_EVALUATED") == 1).count()
-    total_count_raw = df_filtered.count()
+    # Get evaluated roles data
+    if not 'df_evaluated_roles' in locals() or df_evaluated_roles is None:
+        df_evaluated_roles = spark.table("evaluated_roles")
     
-    print(f"DEBUG - Raw evaluated count: {evaluated_count_raw}, type: {type(evaluated_count_raw)}")
+    # Calculate numerator: count of machine roles evaluated against the control
+    evaluated_count_raw = df_filtered.join(
+        df_evaluated_roles,
+        df_filtered["AMAZON_RESOURCE_NAME"] == df_evaluated_roles["RESOURCE_NAME"],
+        "inner"
+    ).select("RESOURCE_ID").distinct().count()
+    
+    # Calculate denominator: total count of machine roles
+    total_count_raw = df_filtered.select("RESOURCE_ID").distinct().count()
+    
+    print(f"DEBUG - Raw evaluated count (from join): {evaluated_count_raw}, type: {type(evaluated_count_raw)}")
     print(f"DEBUG - Raw total count: {total_count_raw}, type: {type(total_count_raw)}")
     
     # Define a completely separate function for calculations
@@ -516,7 +527,7 @@ try:
             "denominator": total
         }
     
-    # Run calculations in a completely separate context
+    # Run calculations
     results = calculate_metrics(
         alert_threshold_raw, 
         warning_threshold_raw,
@@ -592,17 +603,19 @@ try:
     
     if numerator < denominator:
         # Filter for unevaluated machine roles
-        df_supporting_evidence = df_filtered.filter(col("IS_EVALUATED") == 0) \
-            .select(
-                col("RESOURCE_ID"),
-                col("AMAZON_RESOURCE_NAME").alias("ARN"),
-                col("ACCOUNT"),
-                col("BA"),
-                col("CREATE_DATE"),
-                col("ROLE_TYPE"),
-                lit(None).cast(StringType()).alias("NOTES")
-            ) \
-            .orderBy(["ACCOUNT", "AMAZON_RESOURCE_NAME"])
+        df_supporting_evidence = df_filtered.join(
+            spark.table("evaluated_roles"),
+            df_filtered["AMAZON_RESOURCE_NAME"] == spark.table("evaluated_roles")["RESOURCE_NAME"],
+            "left_anti"
+        ).select(
+            col("RESOURCE_ID"),
+            col("AMAZON_RESOURCE_NAME").alias("ARN"),
+            col("ACCOUNT"),
+            col("BA"),
+            col("CREATE_DATE"),
+            col("ROLE_TYPE"),
+            lit(None).cast(StringType()).alias("NOTES")
+        ).orderBy(["ACCOUNT", "AMAZON_RESOURCE_NAME"])
     else:
         # Create single-row DataFrame with message when all roles are evaluated
         df_supporting_evidence = spark.createDataFrame([
@@ -812,7 +825,7 @@ try:
         df_all_iam_roles.unpersist()
     if 'df_all_roles' in locals() and df_all_roles is not None:
         df_all_roles.unpersist()
-    if 'df_filtered' in locals() and df_filtered is not None:
+    if 'df_filtered' in locals() and df_filtered is None:
         df_filtered.unpersist()
     
     log_step("Pipeline execution completed successfully", 
