@@ -1,21 +1,21 @@
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## 10. Tier 1 Metrics Calculation
-# MAGIC Calculate compliance metrics using a robust Python-based approach with explicit DataFrame handling
+# MAGIC Calculate compliance metrics using a Python-based pipeline after PySpark data loading
 
 # COMMAND ----------
 from pyspark.sql.functions import col
-from pyspark.sql.types import DateType, LongType
 import logging
-from datetime import datetime
+from datetime import datetime, date
+import pandas as pd
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
-    # Retrieve Tier 1 thresholds from Snowflake
-    logger.info("Retrieving Tier 1 thresholds")
+    # Load Tier 1 thresholds from Snowflake using PySpark
+    logger.info("Loading Tier 1 thresholds from Snowflake")
     thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
         .options(**sfOptions) \
         .option("query", tier1_threshold_query) \
@@ -30,23 +30,24 @@ try:
     logger.info(f"Alert threshold: {alert_threshold_raw}, type: {type(alert_threshold_raw)}")
     logger.info(f"Warning threshold: {warning_threshold_raw}, type: {type(warning_threshold_raw)}")
 
-    # Collect data from filtered and evaluated roles
-    logger.info("Collecting data from filtered and evaluated roles")
+    # Load filtered and evaluated roles from PySpark DataFrames
+    logger.info("Loading filtered and evaluated roles")
     if not 'df_filtered' in locals() or df_filtered is None:
         df_filtered = spark.table("filtered_machine_roles")
     if not 'df_evaluated_roles' in locals() or df_evaluated_roles is None:
         df_evaluated_roles = spark.table("evaluated_roles")
     
-    filtered_data = df_filtered.select("RESOURCE_ID", "AMAZON_RESOURCE_NAME").collect()
-    evaluated_data = df_evaluated_roles.select("RESOURCE_NAME").collect()
+    # Convert to Python lists
+    filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"]) for row in df_filtered.collect()]
+    evaluated_data = [row["RESOURCE_NAME"] for row in df_evaluated_roles.collect()]
     logger.info(f"Filtered data count: {len(filtered_data)}, type: {type(filtered_data)}")
     logger.info(f"Evaluated data count: {len(evaluated_data)}, type: {type(evaluated_data)}")
 
     # Calculate numerator and denominator in Python
-    evaluated_resource_ids = {row["RESOURCE_NAME"] for row in evaluated_data}
-    total_resource_ids = {row["AMAZON_RESOURCE_NAME"] for row in filtered_data}
-    evaluated_count = len([rid for rid in total_resource_ids if rid in evaluated_resource_ids])
-    total_count = len(total_resource_ids)
+    evaluated_set = set(evaluated_data)
+    total_set = set(row[1] for row in filtered_data)  # Using AMAZON_RESOURCE_NAME
+    evaluated_count = len([arn for arn in total_set if arn in evaluated_set])
+    total_count = len(total_set)
     logger.info(f"Evaluated count: {evaluated_count}, type: {type(evaluated_count)}")
     logger.info(f"Total count: {total_count}, type: {type(total_count)}")
 
@@ -58,8 +59,8 @@ try:
         evaluated = int(evaluated_cnt)
         total = int(total_cnt)
         
-        metric = (evaluated * 100.0) / total if total > 0 else 0.0  # Avoid round() for now
-        metric = round(metric, 2)  # Use Python's built-in round after calculation
+        metric = evaluated / total * 100 if total > 0 else 0.0
+        metric = round(metric, 2)  # Python's built-in round
         status = "GREEN"
         if warning is not None and metric <= warning:
             status = "RED"
@@ -77,37 +78,26 @@ try:
     results = calculate_metrics(alert_threshold_raw, warning_threshold_raw, evaluated_count, total_count)
     logger.info(f"Calculation results: {results}")
 
-    # Get current date using a temporary DataFrame and collect as Python object
-    logger.info("Retrieving current date")
-    temp_df = spark.sql("SELECT CURRENT_DATE AS date")
-    current_date_value = temp_df.collect()[0]["date"]
+    # Get current date as a Python object
+    current_date_value = date.today()
     logger.info(f"Current date: {current_date_value}, type: {type(current_date_value)}")
 
-    # Prepare metrics data as a list of Python objects
-    metrics_data = [
-        (
-            current_date_value,
-            'MNTR-1105806-T1',
-            float(results["metric"]),  # Explicitly cast to float
-            str(results["status"]),
-            int(results["numerator"]),
-            int(results["denominator"])
-        )
-    ]
+    # Prepare metrics data as a Python dictionary for pandas DataFrame
+    metrics_data = {
+        "DATE": [current_date_value],
+        "MONITORING_METRIC_NUMBER": ['MNTR-XXXXX-T1'],
+        "MONITORING_METRIC": [results["metric"]],
+        "COMPLIANCE_STATUS": [results["status"]],
+        "NUMERATOR": [results["numerator"]],
+        "DENOMINATOR": [results["denominator"]]
+    }
     logger.info(f"Metrics data: {metrics_data}")
-    logger.info(f"Metrics data types: {[type(x) for x in metrics_data[0]]}")
+    logger.info(f"Metrics data types: {[type(x[0]) for x in metrics_data.values()]}")
 
-    # Create DataFrame with schema inference first, then cast columns
-    df_result = spark.createDataFrame(metrics_data)
-    df_result = df_result.select(
-        col("date").cast(DateType()).alias("DATE"),
-        col("1").cast(StringType()).alias("MONITORING_METRIC_NUMBER"),
-        col("2").cast(DoubleType()).alias("MONITORING_METRIC"),
-        col("3").cast(StringType()).alias("COMPLIANCE_STATUS"),
-        col("4").cast(LongType()).alias("NUMERATOR"),
-        col("5").cast(LongType()).alias("DENOMINATOR")
-    )
-    logger.info("DataFrame created with explicit casting")
+    # Convert to pandas DataFrame and then to PySpark DataFrame
+    pd_df = pd.DataFrame(metrics_data)
+    df_result = spark.createDataFrame(pd_df)
+    logger.info("DataFrame created from pandas DataFrame")
     df_result.printSchema()
     logger.info("DataFrame content:")
     df_result.show()
@@ -144,40 +134,33 @@ def test_tier1_metrics_calculation(spark):
     )
 
     # Collect data
-    filtered_data = mock_filtered_data.collect()
-    evaluated_data = mock_evaluated_data.collect()
+    filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"]) for row in mock_filtered_data.collect()]
+    evaluated_data = [row["RESOURCE_NAME"] for row in mock_evaluated_data.collect()]
     threshold_data = mock_thresholds.collect()
 
     # Calculate metrics
-    evaluated_resource_ids = {row["RESOURCE_NAME"] for row in evaluated_data}
-    total_resource_ids = {row["AMAZON_RESOURCE_NAME"] for row in filtered_data}
-    evaluated_count = len([rid for rid in total_resource_ids if rid in evaluated_resource_ids])
-    total_count = len(total_resource_ids)
+    evaluated_set = set(evaluated_data)
+    total_set = set(row[1] for row in filtered_data)
+    evaluated_count = len([arn for arn in total_set if arn in evaluated_set])
+    total_count = len(total_set)
     alert_threshold = threshold_data[0]["ALERT_THRESHOLD"]
     warning_threshold = threshold_data[0]["WARNING_THRESHOLD"]
 
     results = calculate_metrics(alert_threshold, warning_threshold, evaluated_count, total_count)
     
-    # Mock current date
-    temp_df = spark.sql("SELECT CURRENT_DATE AS date")
-    current_date_value = temp_df.collect()[0]["date"]
-
     # Prepare metrics data
-    metrics_data = [
-        (current_date_value, 'MNTR-1105806-T1', float(results["metric"]), str(results["status"]),
-         int(results["numerator"]), int(results["denominator"]))
-    ]
+    metrics_data = {
+        "DATE": [date.today()],
+        "MONITORING_METRIC_NUMBER": ['MNTR-XXXXX-T1'],
+        "MONITORING_METRIC": [results["metric"]],
+        "COMPLIANCE_STATUS": [results["status"]],
+        "NUMERATOR": [results["numerator"]],
+        "DENOMINATOR": [results["denominator"]]
+    }
 
-    # Create DataFrame
-    df_result = spark.createDataFrame(metrics_data)
-    df_result = df_result.select(
-        col("_1").cast(DateType()).alias("DATE"),
-        col("_2").cast(StringType()).alias("MONITORING_METRIC_NUMBER"),
-        col("_3").cast(DoubleType()).alias("MONITORING_METRIC"),
-        col("_4").cast(StringType()).alias("COMPLIANCE_STATUS"),
-        col("_5").cast(LongType()).alias("NUMERATOR"),
-        col("_6").cast(LongType()).alias("DENOMINATOR")
-    )
+    # Convert to pandas DataFrame and then to PySpark DataFrame
+    pd_df = pd.DataFrame(metrics_data)
+    df_result = spark.createDataFrame(pd_df)
 
     # Assertions
     collected_result = df_result.collect()[0]
@@ -189,3 +172,4 @@ def test_tier1_metrics_calculation(spark):
 
 # Run unit test
 test_tier1_metrics_calculation(spark)
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
