@@ -1,46 +1,135 @@
-# Get current date as a Python object
-current_date_value = spark.range(1).select(current_date()).first()[0]
-log_step("Current date", f"Value: {current_date_value}, Type: {type(current_date_value)}")
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 10. Tier 1 Metrics Calculation
+# MAGIC Calculate and display compliance metrics based on thresholds from Snowflake
 
-# Create metrics_data with Python objects
-metrics_data = [(
-    current_date_value,  # Now a datetime.date object
-    'MNTR-XXXXX',
-    results["metric"],
-    results["status"],
-    results["numerator"],
-    results["denominator"]
-)]
+# COMMAND ----------
+from pyspark.sql.functions import current_date
+from pyspark.sql.types import StructType, StructField, DateType, StringType, DoubleType, LongType
 
-# Define schema (adjust if yours differs)
-metrics_schema = StructType([
-    StructField("DATE", DateType(), False),
-    StructField("MONITORING_METRIC_NUMBER", StringType(), False),
-    StructField("MONITORING_METRIC", DoubleType(), False),
-    StructField("COMPLIANCE_STATUS", StringType(), False),
-    StructField("NUMERATOR", LongType(), False),
-    StructField("DENOMINATOR", LongType(), False)
-])
-
-# Create DataFrame
-df_result = spark.createDataFrame(metrics_data, metrics_schema)
-log_step("DataFrame created", "Tier 1 metrics DataFrame successfully created")
-
------------------------------------------------------------------------------------
-# Get current date as a Python object
-current_date_value = spark.range(1).select(current_date()).first()[0]
-log_step("Current date", f"Value: {current_date_value}, Type: {type(current_date_value)}")
-
-# Create Tier 2 metrics_data with Python objects
-tier2_metrics_data = [(
-    current_date_value,  # Now a datetime.date object
-    'MNTR-XXXXX-T2',
-    results["metric"],
-    results["status"],
-    results["numerator"],
-    results["denominator"]
-)]
-
-# Create Tier 2 DataFrame (reuse schema from Tier 1 or redefine if different)
-df_tier2_result = spark.createDataFrame(tier2_metrics_data, metrics_schema)
-log_step("DataFrame created", "Tier 2 metrics DataFrame successfully created")
+try:
+    # Get thresholds from Snowflake
+    log_step("Retrieving Tier 1 thresholds")
+    thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", tier1_threshold_query) \
+        .load()
+    
+    print("Tier 1 thresholds:")
+    thresholds_df.show()
+    
+    # Get raw values first
+    threshold_row_list = thresholds_df.collect()
+    print(f"DEBUG - threshold_row_list type: {type(threshold_row_list)}")
+    
+    alert_threshold_raw = None
+    warning_threshold_raw = None
+    
+    if len(threshold_row_list) > 0:
+        threshold_row = threshold_row_list[0]
+        alert_threshold_raw = threshold_row['ALERT_THRESHOLD']
+        warning_threshold_raw = threshold_row['WARNING_THRESHOLD']
+        
+        print(f"DEBUG - Raw alert threshold: {alert_threshold_raw}, type: {type(alert_threshold_raw)}")
+        print(f"DEBUG - Raw warning threshold: {warning_threshold_raw}, type: {type(warning_threshold_raw)}")
+    
+    # Get filtered machine roles data
+    if not 'df_filtered' in locals() or df_filtered is None:
+        df_filtered = spark.table("filtered_machine_roles")
+    
+    # Get evaluated roles data
+    if not 'df_evaluated_roles' in locals() or df_evaluated_roles is None:
+        df_evaluated_roles = spark.table("evaluated_roles")
+    
+    # Calculate numerator: count of machine roles evaluated against the control
+    evaluated_count_raw = df_filtered.join(
+        df_evaluated_roles,
+        df_filtered["AMAZON_RESOURCE_NAME"] == df_evaluated_roles["RESOURCE_NAME"],
+        "inner"
+    ).select("RESOURCE_ID").distinct().count()
+    
+    # Calculate denominator: total count of machine roles
+    total_count_raw = df_filtered.select("RESOURCE_ID").distinct().count()
+    
+    print(f"DEBUG - Raw evaluated count (from join): {evaluated_count_raw}, type: {type(evaluated_count_raw)}")
+    print(f"DEBUG - Raw total count: {total_count_raw}, type: {type(total_count_raw)}")
+    
+    # Define a completely separate function for calculations
+    def calculate_metrics(alert_val, warning_val, evaluated_cnt, total_cnt):
+        """Pure Python function to calculate metrics outside of Spark context"""
+        # Convert to primitive types explicitly
+        alert = float(alert_val) if alert_val is not None else None
+        warning = float(warning_val) if warning_val is not None else None
+        evaluated = int(evaluated_cnt)
+        total = int(total_cnt)
+        
+        # Calculate metric
+        metric = 0.0
+        if total > 0:
+            metric = round((evaluated * 100.0) / total, 2)
+        
+        # Determine status
+        status = "GREEN"
+        if warning is not None and metric <= warning:
+            status = "RED"
+        elif alert is not None and metric <= alert:
+            status = "YELLOW"
+        
+        return {
+            "metric": metric,
+            "status": status,
+            "numerator": evaluated,
+            "denominator": total
+        }
+    
+    # Run calculations
+    results = calculate_metrics(
+        alert_threshold_raw,
+        warning_threshold_raw,
+        evaluated_count_raw,
+        total_count_raw
+    )
+    log_step("Calculation results", f"Results: {results}")
+    
+    # Get current date as a Python object
+    current_date_value = spark.range(1).select(current_date()).first()[0]
+    log_step("Current date", f"Value: {current_date_value}, Type: {type(current_date_value)}")
+    
+    # Create metrics_data with Python objects
+    metrics_data = [(
+        current_date_value,  # Python datetime.date object
+        'MNTR-1105806-T1',
+        results["metric"],
+        results["status"],
+        results["numerator"],
+        results["denominator"]
+    )]
+    log_step("Metrics data types", f"Types: {[type(x) for x in metrics_data[0]]}")
+    
+    # Define schema
+    metrics_schema = StructType([
+        StructField("DATE", DateType(), False),
+        StructField("MONITORING_METRIC_NUMBER", StringType(), False),
+        StructField("MONITORING_METRIC", DoubleType(), False),
+        StructField("COMPLIANCE_STATUS", StringType(), False),
+        StructField("NUMERATOR", LongType(), False),
+        StructField("DENOMINATOR", LongType(), False)
+    ])
+    
+    # Create DataFrame
+    df_result = spark.createDataFrame(metrics_data, metrics_schema)
+    log_step("DataFrame created", "Tier 1 metrics DataFrame successfully created")
+    
+    # Display results
+    log_step("Final Tier 1 Compliance Metrics")
+    df_result.show()
+    
+    # Store key metrics as global variables
+    spark.sql(f"SET tier1_numerator = {results['numerator']}")
+    spark.sql(f"SET tier1_denominator = {results['denominator']}")
+    spark.sql(f"SET tier1_metric_value = {results['metric']}")
+    spark.sql(f"SET tier1_compliance_status = '{results['status']}'")
+    
+except Exception as e:
+    log_step("ERROR in Tier 1 metrics calculation", f"Calculation failed: {str(e)}")
+    raise
