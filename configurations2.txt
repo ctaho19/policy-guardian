@@ -46,12 +46,16 @@ try:
     logger.info(f"Sample evaluated_data: {evaluated_data[:5]}")  # Debug sample
 
     # Join filtered and evaluated data to get compliance status
-    filtered_map = {row[1]: row for row in filtered_data}  # Map ARN to full row
+    filtered_map = {row[1]: row for row in filtered_data}  # Map ARN to (RESOURCE_ID, ARN, ACCOUNT, BA, ROLE_TYPE)
     evaluated_compliance = {arn: status for arn, status in evaluated_data}
-    evaluated_roles = [(rid, arn, filtered_map[arn][2], filtered_map[arn][3], filtered_map[arn][4], status) 
-                      for arn, status in evaluated_compliance.items() 
-                      if arn in filtered_map]
+    evaluated_roles = [
+        (resource_id, arn, acc, ba, role_type, status) 
+        for arn, status in evaluated_compliance.items() 
+        if arn in filtered_map 
+        for resource_id, _, acc, ba, role_type in [filtered_map[arn]]  # Unpack filtered_map[arn]
+    ]
     logger.info(f"Evaluated roles count: {len(evaluated_roles)}, type: {type(evaluated_roles)}")
+    logger.info(f"Sample evaluated_roles: {evaluated_roles[:5]}")  # Debug sample
 
     # Count compliant roles (all except "NonCompliant")
     compliant_count = len([status for _, _, _, _, _, status in evaluated_roles 
@@ -157,9 +161,12 @@ def test_tier2_metrics_calculation(spark):
     # Join filtered and evaluated data
     filtered_map = {row[1]: row for row in filtered_data}
     evaluated_compliance = {arn: status for arn, status in evaluated_data}
-    evaluated_roles = [(rid, arn, acc, ba, role, status) 
-                      for arn, status in evaluated_compliance.items() 
-                      if arn in filtered_map and filtered_map[arn][4] == "MACHINE"]
+    evaluated_roles = [
+        (resource_id, arn, acc, ba, role_type, status) 
+        for arn, status in evaluated_compliance.items() 
+        if arn in filtered_map 
+        for resource_id, _, acc, ba, role_type in [filtered_map[arn]]  # Unpack filtered_map[arn]
+    ]
     compliant_count = len([status for _, _, _, _, _, status in evaluated_roles 
                          if status not in ["NonCompliant"]])
     evaluated_count = len(evaluated_roles)
