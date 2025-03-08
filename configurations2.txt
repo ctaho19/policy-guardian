@@ -1,0 +1,225 @@
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 14. Tier 3 Metrics Calculation
+# MAGIC Calculate SLA compliance metrics for non-compliant resources
+
+# COMMAND ----------
+from pyspark.sql.functions import col
+import logging
+from datetime import datetime, date
+import pandas as pd
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def calculate_metrics(alert_val, warning_val, numerator, denominator):
+    """Pure Python function to calculate metrics with dynamic status logic."""
+    alert = float(alert_val) if alert_val is not None else None
+    warning = float(warning_val) if warning_val is not None else None
+    numerator = int(numerator)
+    denominator = int(denominator)
+    
+    metric = numerator / denominator * 100 if denominator > 0 else 100.0  # 100% if no non-compliant resources
+    metric = round(metric, 2)
+    
+    status = "GREEN"
+    if alert is not None and metric < alert:
+        status = "RED"
+    elif warning is not None and metric < warning and metric >= alert:
+        status = "YELLOW"
+    logger.info(f"Calculated metric: {metric}, status: {status} with alert={alert}, warning={warning}")
+    return {
+        "metric": metric,
+        "status": status,
+        "numerator": numerator,
+        "denominator": denominator
+    }
+
+try:
+    # Load Tier 3 thresholds from Snowflake
+    logger.info("Loading Tier 3 thresholds from Snowflake")
+    tier3_thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", tier3_threshold_query) \
+        .load()
+    
+    tier3_thresholds_df.show()
+    threshold_data = tier3_thresholds_df.collect()
+    logger.info(f"Threshold data collected: {threshold_data}, type: {type(threshold_data)}")
+    
+    tier3_alert_threshold_raw = threshold_data[0]["ALERT_THRESHOLD"] if threshold_data else None
+    tier3_warning_threshold_raw = threshold_data[0]["WARNING_THRESHOLD"] if threshold_data else None
+    logger.info(f"Tier 3 Alert threshold: {tier3_alert_threshold_raw}, type: {type(tier3_alert_threshold_raw)}")
+    logger.info(f"Tier 3 Warning threshold: {tier3_warning_threshold_raw}, type: {type(tier3_warning_threshold_raw)}")
+
+    # Get Tier 2 metrics to calculate total non-compliant resources
+    tier2_numerator = int(spark.conf.get("spark.tier2_numerator", "0"))
+    tier2_denominator = int(spark.conf.get("spark.tier2_denominator", "0"))
+    total_non_compliant = tier2_denominator - tier2_numerator
+    logger.info(f"Tier 2 metrics: numerator={tier2_numerator}, denominator={tier2_denominator}, "
+                f"total_non_compliant={total_non_compliant}")
+
+    # Load non-compliant resources with SLA data
+    logger.info("Loading non-compliant resources from Snowflake")
+    df_non_compliant = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", non_compliant_resources_query) \
+        .load()
+    
+    logger.info(f"df_non_compliant count: {df_non_compliant.count()}")
+    df_non_compliant.printSchema()
+    logger.info("Sample df_non_compliant data:")
+    df_non_compliant.show(5)
+    
+    # Convert to Python list
+    non_compliant_data = [(row["RESOURCE_ID"], row["CONTROL_RISK"], row["OPEN_DATE_UTC_TIMESTAMP"]) 
+                         for row in df_non_compliant.collect()]
+    logger.info(f"Non-compliant data count: {len(non_compliant_data)}, type: {type(non_compliant_data)}")
+    logger.info(f"Sample non_compliant_data: {non_compliant_data[:5]}")
+
+    # Calculate days open and determine past SLA status
+    sla_thresholds = {
+        "Critical": 0,
+        "High": 30,
+        "Medium": 60,
+        "Low": 90
+    }
+    current_date = datetime.now()
+    past_sla_count = 0
+    for _, control_risk, open_date in non_compliant_data:
+        if open_date is None or control_risk not in sla_thresholds:
+            continue  # Skip invalid data
+        days_open = (current_date - open_date).days
+        sla_limit = sla_thresholds.get(control_risk, 90)  # Default to 90 if risk level unknown
+        if days_open > sla_limit:
+            past_sla_count += 1
+    
+    logger.info(f"Past SLA count: {past_sla_count}, type: {type(past_sla_count)}")
+
+    # Calculate numerator (resources within SLA)
+    within_sla_count = total_non_compliant - past_sla_count if total_non_compliant >= past_sla_count else 0
+    logger.info(f"Within SLA count: {within_sla_count}, type: {type(within_sla_count)}")
+
+    # Perform metric calculation
+    results = calculate_metrics(tier3_alert_threshold_raw, tier3_warning_threshold_raw, 
+                              within_sla_count, total_non_compliant)
+    logger.info(f"Calculation results: {results}, type: {type(results)}")
+
+    # Get current date as a Python object
+    current_date_value = date.today()
+    logger.info(f"Current date: {current_date_value}, type: {type(current_date_value)}")
+
+    # Prepare metrics data as a Python dictionary for pandas DataFrame
+    metrics_data = {
+        "DATE": [current_date_value],
+        "MONITORING_METRIC_NUMBER": ['MNTR-XXXXX-T3'],
+        "MONITORING_METRIC": [results["metric"]],
+        "COMPLIANCE_STATUS": [results["status"]],
+        "NUMERATOR": [results["numerator"]],
+        "DENOMINATOR": [results["denominator"]]
+    }
+    logger.info(f"Metrics data: {metrics_data}")
+    logger.info(f"Metrics data types: {[type(x[0]) for x in metrics_data.values()]}")
+
+    # Convert to pandas DataFrame and then to PySpark DataFrame
+    pd_df = pd.DataFrame(metrics_data)
+    df_result = spark.createDataFrame(pd_df)
+    logger.info("DataFrame created from pandas DataFrame")
+    df_result.printSchema()
+    logger.info("DataFrame content:")
+    df_result.show()
+
+    # Register as temp view and store metrics
+    df_result.createOrReplaceTempView("tier3_metrics")
+    logger.info(f"Setting tier3_numerator to {results['numerator']}")
+    spark.sql(f"SET tier3_numerator = {results['numerator']}")
+    logger.info(f"Setting tier3_denominator to {results['denominator']}")
+    spark.sql(f"SET tier3_denominator = {results['denominator']}")
+    logger.info(f"Setting tier3_metric_value to {results['metric']}")
+    spark.sql(f"SET tier3_metric_value = {results['metric']}")
+    logger.info(f"Setting tier3_compliance_status to {results['status']}")
+    spark.sql(f"SET tier3_compliance_status = '{results['status']}'")
+
+except Exception as e:
+    logger.error(f"ERROR in Tier 3 metrics calculation: {str(e)}")
+    raise
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Unit Tests for Tier 3 Metrics Calculation
+
+# COMMAND ----------
+def test_tier3_metrics_calculation(spark):
+    """Unit test for Tier 3 metrics calculation and DataFrame creation."""
+    # Mock Tier 2 metrics
+    spark.conf.set("spark.tier2_numerator", "2")
+    spark.conf.set("spark.tier2_denominator", "5")  # 5 total, 2 compliant, 3 non-compliant
+    
+    # Mock non-compliant resources data
+    mock_non_compliant_data = spark.createDataFrame(
+        [("res1", "High", datetime(2025, 2, 1)),   # 36 days old, past SLA (High: 30 days)
+         ("res2", "Medium", datetime(2025, 2, 1)),  # 36 days old, within SLA (Medium: 60 days)
+         ("res3", "Low", datetime(2025, 2, 1))],   # 36 days old, within SLA (Low: 90 days)
+        ["RESOURCE_ID", "CONTROL_RISK", "OPEN_DATE_UTC_TIMESTAMP"]
+    )
+    mock_thresholds = spark.createDataFrame(
+        [(90.0, 95.0)],  # RED: <90%, YELLOW: 90-95%, GREEN: >=95%
+        ["ALERT_THRESHOLD", "WARNING_THRESHOLD"]
+    )
+
+    # Collect data
+    non_compliant_data = [(row["RESOURCE_ID"], row["CONTROL_RISK"], row["OPEN_DATE_UTC_TIMESTAMP"]) 
+                         for row in mock_non_compliant_data.collect()]
+    threshold_data = mock_thresholds.collect()
+
+    # Calculate total non-compliant from Tier 2
+    tier2_numerator = int(spark.conf.get("spark.tier2_numerator", "0"))
+    tier2_denominator = int(spark.conf.get("spark.tier2_denominator", "0"))
+    total_non_compliant = tier2_denominator - tier2_numerator
+
+    # Calculate past SLA count
+    sla_thresholds = {
+        "Critical": 0,
+        "High": 30,
+        "Medium": 60,
+        "Low": 90
+    }
+    current_date = datetime.now()
+    past_sla_count = 0
+    for _, control_risk, open_date in non_compliant_data:
+        if open_date is None or control_risk not in sla_thresholds:
+            continue
+        days_open = (current_date - open_date).days
+        sla_limit = sla_thresholds.get(control_risk, 90)
+        if days_open > sla_limit:
+            past_sla_count += 1
+
+    # Calculate numerator
+    within_sla_count = total_non_compliant - past_sla_count if total_non_compliant >= past_sla_count else 0
+    alert_threshold = threshold_data[0]["ALERT_THRESHOLD"]
+    warning_threshold = threshold_data[0]["WARNING_THRESHOLD"]
+
+    results = calculate_metrics(alert_threshold, warning_threshold, within_sla_count, total_non_compliant)
+    
+    metrics_data = {
+        "DATE": [date.today()],
+        "MONITORING_METRIC_NUMBER": ['MNTR-XXXXX-T3'],
+        "MONITORING_METRIC": [results["metric"]],
+        "COMPLIANCE_STATUS": [results["status"]],
+        "NUMERATOR": [results["numerator"]],
+        "DENOMINATOR": [results["denominator"]]
+    }
+
+    pd_df = pd.DataFrame(metrics_data)
+    df_result = spark.createDataFrame(pd_df)
+
+    collected_result = df_result.collect()[0]
+    assert collected_result["NUMERATOR"] == 2, f"Expected numerator 2, got {collected_result['NUMERATOR']}"  # 2 within SLA
+    assert collected_result["DENOMINATOR"] == 3, f"Expected denominator 3, got {collected_result['DENOMINATOR']}"  # 3 non-compliant
+    assert round(collected_result["MONITORING_METRIC"], 2) == 66.67, f"Expected metric ~66.67%, got {collected_result['MONITORING_METRIC']}"
+    assert collected_result["COMPLIANCE_STATUS"] == "RED", f"Expected status RED, got {collected_result['COMPLIANCE_STATUS']}"
+    logger.info("Unit test for Tier 3 metrics calculation and DataFrame creation passed!")
+
+# Run unit test
+test_tier3_metrics_calculation(spark)
