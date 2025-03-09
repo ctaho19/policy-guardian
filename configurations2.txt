@@ -1,6 +1,94 @@
-It is derived by first querying the EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE_V3 table to identify all IAM roles, filtering for machine roles (ROLE_TYPE = 'MACHINE') in approved accounts (a predefined list of AWS accounts), and deduplicating to keep the most recent record per role, resulting in a denominator of total machine roles in scope. The pipeline then queries the EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 table to identify roles evaluated against CM-2.AWS.12.v02, matching these against the filtered machine roles to determine the numerator—the number of roles actually assessed. The metric is computed as the percentage of evaluated roles out of the total ((numerator / denominator) * 100), rounded to two decimal places, and the compliance status is determined using thresholds from CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD
+EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE_V3
+RESOURCE_ID
+For Tier 1: The RESOURCE_ID field was used to uniquely identify each IAM role within the dataset, enabling deduplication to ensure only the most recent record (based on CREATE_DATE) was retained for each role. This contributed to the total count of machine roles in approved accounts, forming the denominator of the Tier 1 coverage metric.
 
-The Tier 2 metric (MNTR-XXXXX-T2) measures the compliance rate of IAM machine roles in approved AWS accounts that have been evaluated against the control CM-2.AWS.12.v02, providing the control owner with a clear view of how well these roles adhere to security requirements. It is derived by first identifying machine roles in approved accounts from the EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE_V3 table, filtering for ROLE_TYPE = 'MACHINE' and matching against a predefined list of approved accounts, then matching these roles with compliance data from EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2 for CM-2.AWS.12.v02. The denominator is the total number of evaluated machine roles, determined by the count of roles with matching ARNs, while the numerator is the count of those roles with a COMPLIANCE_STATUS other than NonCompliant, indicating they meet the control’s requirements. The metric is computed as the percentage of compliant roles ((numerator / denominator) * 100), rounded to two decimal places, and the compliance status is determined using thresholds from CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD, defaulting to GREEN if thresholds are unavailable. This metric ensures that the control owner is alerted to non-compliant machine roles that may pose security risks, enabling timely remediation to maintain compliance.
+For Tier 2: The RESOURCE_ID was used to link machine roles from the filtered dataset to their corresponding compliance status in the evaluation process, ensuring accurate matching of evaluated roles and contributing to the denominator of the Tier 2 compliance metric.
 
-The Tier 3 metric (MNTR-XXXXX-T3) measures the SLA compliance rate of non-compliant IAM machine roles identified in Tier 2, ensuring that violations of the control CM-2.AWS.12.v02 are remediated within designated timeframes based on their risk level, thus minimizing the window of exposure to security risks. It is derived by first calculating the total number of non-compliant roles from Tier 2 metrics (tier2_denominator - tier2_numerator), using the evaluated_roles_with_compliance dataset to extract the RESOURCE_IDs of roles with COMPLIANCE_STATUS = 'NonCompliant', which serves as the denominator (e.g., 53 roles). The pipeline then queries the CLCN_DB.PHDP_CLOUD.OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01 table for these specific resources, retrieving their CONTROL_RISK and OPEN_DATE_UTC_TIMESTAMP, and excluding remediated resources using OZONE_CLOSED_NON_COMPLIANT_RESOURCES_V04. For each resource, the pipeline calculates the days since the violation was opened and compares this against SLA thresholds (Critical: 0 days, High: 30 days, Medium: 60 days, Low: 90 days), counting resources as past SLA if the threshold is exceeded, resulting in a past_sla_count. The numerator is the number of non-compliant roles within SLA (total_non_compliant - past_sla_count), and the metric is computed as the percentage within SLA ((numerator / denominator) * 100), rounded to two decimal places. The compliance status is determined using thresholds from CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD, defaulting to GREEN if thresholds are unavailable, ensuring the control owner is alerted only when defined SLAs are breached, prompting timely remediation of non-compliant roles.
+AMAZON_RESOURCE_NAME
+For Tier 1: The AMAZON_RESOURCE_NAME field, representing the ARN of each IAM role, was used to filter roles that match the pattern arn:aws:iam::%role/%, ensuring only valid IAM roles were included. It also served as the key for matching against evaluated roles, contributing to the numerator by identifying roles that have been assessed.
+
+For Tier 2: The AMAZON_RESOURCE_NAME was used as the primary key to join the filtered machine roles with the evaluated roles dataset, enabling the identification of which roles were assessed for compliance and contributing to both the numerator (compliant roles) and denominator (evaluated roles) of the Tier 2 metric.
+
+ACCOUNT
+For Tier 1: The ACCOUNT field was used to filter the dataset to include only roles from approved AWS accounts (as defined by the approved_accounts list), ensuring the scope of the metric was limited to production environments, which directly influenced the denominator of the Tier 1 coverage metric.
+
+For Tier 2: The ACCOUNT field was leveraged to ensure that only machine roles from approved accounts were considered in the compliance evaluation, maintaining consistency with Tier 1 and contributing to the denominator of the Tier 2 compliance metric.
+
+CREATE_DATE
+For Tier 1: The CREATE_DATE field was used in the QUALIFY ROW_NUMBER() clause to deduplicate roles, retaining the most recent record for each RESOURCE_ID based on this timestamp. This ensured the accuracy of the total machine role count, forming the denominator of the Tier 1 metric.
+
+For Tier 2: The CREATE_DATE was indirectly used during the initial filtering to ensure the latest role data was considered, supporting the accurate identification of evaluated roles and contributing to the denominator of the Tier 2 metric.
+
+TYPE
+For Tier 1: The TYPE field was used to filter the dataset to include only roles where TYPE = 'role', narrowing the focus to IAM roles and contributing to the total count of roles in the denominator of the Tier 1 coverage metric.
+
+For Tier 2: The TYPE field was used to further filter for machine roles (ROLE_TYPE = 'MACHINE' derived from this context), ensuring only relevant roles were evaluated, contributing to the denominator of the Tier 2 compliance metric.
+
+FULL_RECORD
+For Tier 1: The FULL_RECORD field was used to exclude roles containing specific patterns (e.g., DENY-ALL or QUARANTINEPOLICY) via a REGEXP_LIKE condition, ensuring that only applicable roles were included in the total count, directly affecting the denominator of the Tier 1 metric.
+
+For Tier 2: The FULL_RECORD field was used similarly to exclude irrelevant roles during the initial filtering, ensuring the evaluated roles dataset was clean and contributing to the denominator of the Tier 2 metric.
+
+ROLE_TYPE
+For Tier 1: The ROLE_TYPE field was used to filter for roles where ROLE_TYPE = 'MACHINE', identifying the specific subset of roles relevant to the control, which formed the denominator of the Tier 1 coverage metric.
+
+For Tier 2: The ROLE_TYPE field was used to confirm that only machine roles were included in the compliance evaluation, contributing to the denominator of the Tier 2 compliance metric.
+
+SF_LOAD_TIMESTAMP
+For Tier 1: The SF_LOAD_TIMESTAMP field was used to filter for records loaded after '2025-02-19' or where the value is NULL, ensuring the dataset includes the most recent data available, which influenced the accuracy of the denominator in the Tier 1 metric.
+
+For Tier 2: The SF_LOAD_TIMESTAMP was used in the same manner to ensure the latest role data was considered, supporting the denominator of the Tier 2 metric.
+
+BA
+For Tier 1: The BA field (likely representing a business area or unit) was included in the filtered dataset to provide context but was not directly used in the metric calculation; it supported the numerator by aiding in data validation during matching.
+
+For Tier 2: The BA field was similarly included for context and validation during the matching process, contributing indirectly to the numerator and denominator by ensuring data integrity.
+
+EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+RESOURCE_NAME
+For Tier 1: The RESOURCE_NAME field (the ARN of the role) was used to identify roles that have been evaluated for compliance, matching with AMAZON_RESOURCE_NAME from IDENTITY_REPORTS_IAM_RESOURCE_V3 to determine the numerator of the Tier 1 coverage metric.
+
+For Tier 2: The RESOURCE_NAME was used as the key to match evaluated roles with the filtered machine roles, enabling the identification of roles with a COMPLIANCE_STATUS, which formed the denominator, while the matching process contributed to the numerator (compliant roles) of the Tier 2 compliance metric.
+
+COMPLIANCE_STATUS
+For Tier 1: The COMPLIANCE_STATUS field was not directly used in Tier 1; it was collected to prepare data for Tier 2, indirectly supporting the numerator by identifying evaluated roles.
+
+For Tier 2: The COMPLIANCE_STATUS field was critical, used to classify each evaluated role as compliant (any status except NonCompliant) or non-compliant (NonCompliant), directly determining the numerator (count of non-NonCompliant statuses) and denominator (total evaluated roles) of the Tier 2 metric.
+
+CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD
+MONITORING_METRIC_ID
+For Tier 1: The MONITORING_METRIC_ID field was used to filter the dataset for MNTR-XXXXX, ensuring the correct thresholds were retrieved to assess the Tier 1 coverage metric’s compliance status.
+
+For Tier 2: The MONITORING_METRIC_ID was used to filter for MNTR-XXXXX-T2, enabling the retrieval of appropriate thresholds to determine the compliance status of the Tier 2 compliance metric.
+
+For Tier 3: The MONITORING_METRIC_ID was used to filter for MNTR-XXXXX-T3, allowing the pipeline to fetch the relevant thresholds for assessing the Tier 3 SLA compliance metric’s status.
+
+ALERT_THRESHOLD
+For Tier 1: The ALERT_THRESHOLD field (e.g., 90%) was used to define the lower boundary for the RED status, determining if the Tier 1 coverage metric falls below this threshold, triggering an alert for the control owner.
+
+For Tier 2: The ALERT_THRESHOLD was used to set the lower limit for the RED status, indicating when the Tier 2 compliance metric is critically low and requires action.
+
+For Tier 3: The ALERT_THRESHOLD was used to establish the lower limit for the RED status, signaling when the Tier 3 SLA compliance metric indicates a significant delay in remediation.
+
+WARNING_THRESHOLD
+For Tier 1: The WARNING_THRESHOLD field (e.g., 95%) was used to define the boundary between GREEN and YELLOW statuses, alerting the control owner to potential issues if the Tier 1 coverage metric falls below this value but above the ALERT_THRESHOLD.
+
+For Tier 2: The WARNING_THRESHOLD was used to demarcate the transition from GREEN to YELLOW, providing an early warning to the control owner if the Tier 2 compliance metric is at risk.
+
+For Tier 3: The WARNING_THRESHOLD was used to set the boundary between GREEN and YELLOW, notifying the control owner of potential SLA breaches if the Tier 3 metric drops below this threshold but remains above the ALERT_THRESHOLD.
+
+CLCN_DB.PHDP_CLOUD.OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01
+RESOURCE_ID
+For Tier 3: The RESOURCE_ID field was used to match non-compliant resources identified in Tier 2 with their corresponding records in this dataset, ensuring the SLA status was evaluated only for the correct resources, contributing to the numerator (within SLA) and denominator (total non-compliant) of the Tier 3 metric.
+
+CONTROL_RISK
+For Tier 3: The CONTROL_RISK field was used to determine the appropriate SLA threshold for each non-compliant resource (e.g., Critical: 0 days, High: 30 days, Medium: 60 days, Low: 90 days), enabling the calculation of whether a resource is past its SLA based on its risk level, directly affecting the past_sla_count and thus the numerator of the Tier 3 metric.
+
+OPEN_DATE_UTC_TIMESTAMP
+For Tier 3: The OPEN_DATE_UTC_TIMESTAMP field was used to calculate the number of days since the non-compliance was identified (days_open = CURRENT_DATE - OPEN_DATE_UTC_TIMESTAMP), which was compared against the SLA threshold to determine if the resource is past SLA, contributing to the past_sla_count and subsequently the numerator (within SLA) of the Tier 3 metric.
+
+CLCN_DB.PHDP_CLOUD.OZONE_CLOSED_NON_COMPLIANT_RESOURCES_V04
+ID
+For Tier 3: The ID field was used to exclude remediated non-compliant resources from the SLA evaluation in OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01 by filtering out any IDs present in this dataset, ensuring the metric only considers active non-compliant resources, impacting the denominator and numerator of the Tier 3 metric.
+
 
