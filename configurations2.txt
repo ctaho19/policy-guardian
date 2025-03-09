@@ -1,2 +1,46 @@
+# Install toml for parsing Pipfile
+%pip install toml
 
+import toml
+import json
+
+# Paths to your uploaded files in the workspace
+pipfile_path = "/FileStore/Pipfile"
+lockfile_path = "/FileStore/Pipfile.lock"
+
+# Parse Pipfile to get the internal source and package names
+with open(pipfile_path, "r") as f:
+    pipfile = toml.load(f)
+
+# Extract the internal PyPI URL (assumes one source)
+internal_source = pipfile["source"][0]["url"]  # e.g., "https://pypi-internal.yourcompany.com/simple"
+packages_section = pipfile.get("packages", {})
+dev_packages_section = pipfile.get("dev-packages", {})
+all_packages = {**packages_section, **dev_packages_section}  # Combine runtime and dev packages
+
+# Parse Pipfile.lock for exact versions
+with open(lockfile_path, "r") as f:
+    lockfile = json.load(f)
+
+# Combine 'default' (runtime) and 'develop' (dev) packages from lockfile
+locked_packages = {**lockfile.get("default", {}), **lockfile.get("develop", {})}
+
+# Build the list of packages with pinned versions
+install_list = []
+for pkg in all_packages.keys():
+    if pkg in locked_packages:
+        version = locked_packages[pkg]["version"]  # e.g., "==1.2.3"
+        install_list.append(f"{pkg}{version}")
+    else:
+        install_list.append(pkg)  # Fallback to Pipfile’s specifier if not locked
+
+# Construct and run the pip install command with the internal source
+install_cmd = " ".join(install_list)
+full_cmd = f"install --index-url {internal_source} --no-deps {install_cmd}"
+
+# Execute the installation
+%pip $full_cmd
+
+# Optional: Verify installation
+print(f"Installed packages from {internal_source}: {install_cmd}")
 
