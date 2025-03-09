@@ -1,5 +1,134 @@
-logger.info("Inspecting evaluated_roles_with_compliance:")
-spark.sql("SELECT * FROM evaluated_roles_with_compliance").show(10)
-non_compliant_count = spark.sql("SELECT COUNT(*) as non_compliant FROM evaluated_roles_with_compliance WHERE COMPLIANCE_STATUS = 'NonCompliant'").collect()[0]["non_compliant"]
-logger.info(f"Non-compliant count in temp view: {non_compliant_count}")
+# COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## 12. Tier 2 Metrics Calculation
+# MAGIC Calculate compliance metrics for evaluated roles using real COMPLIANCE_STATUS data
+
+# COMMAND ----------
+def calculate_metrics(alert_val, warning_val, compliant_cnt, evaluated_cnt):
+    """Pure Python function to calculate metrics with corrected status logic."""
+    alert = float(alert_val) if alert_val is not None else None
+    warning = float(warning_val) if warning_val is not None else None
+    compliant = int(compliant_cnt)
+    evaluated = int(evaluated_cnt)
+    
+    metric = compliant / evaluated * 100 if evaluated > 0 else 0.0
+    metric = round(metric, 2)
+    
+    status = "GREEN"
+    if alert is not None and metric <= alert:
+        status = "RED"
+    elif warning is not None and metric <= warning and metric > alert:
+        status = "YELLOW"
+    logger.info(f"Calculated metric: {metric}, status: {status} with alert={alert}, warning={warning}")
+    return {
+        "metric": metric,
+        "status": status,
+        "numerator": compliant,
+        "denominator": evaluated
+    }
+
+try:
+    logger.info("Loading Tier 2 thresholds from Snowflake")
+    tier2_thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", tier2_threshold_query) \
+        .load()
+    
+    tier2_thresholds_df.show()
+    threshold_data = tier2_thresholds_df.collect()
+    logger.info(f"Threshold data collected: {threshold_data}, type: {type(threshold_data)}")
+    
+    tier2_alert_threshold_raw = threshold_data[0]["ALERT_THRESHOLD"] if threshold_data else None
+    tier2_warning_threshold_raw = threshold_data[0]["WARNING_THRESHOLD"] if threshold_data else None
+    logger.info(f"Tier 2 Alert threshold: {tier2_alert_threshold_raw}, type: {type(tier2_alert_threshold_raw)}")
+    logger.info(f"Tier 2 Warning threshold: {tier2_warning_threshold_raw}, type: {type(tier2_warning_threshold_raw)}")
+
+    logger.info("Loading filtered and evaluated roles")
+    if not 'df_filtered' in locals() or df_filtered is None:
+        df_filtered = spark.table("filtered_machine_roles")
+    if not 'df_evaluated_roles' in locals() or df_evaluated_roles is None:
+        df_evaluated_roles = spark.table("evaluated_roles")
+    
+    logger.info(f"df_filtered count: {df_filtered.count()}")
+    logger.info(f"df_evaluated_roles count: {df_evaluated_roles.count()}")
+    
+    filtered_data = [(row["RESOURCE_ID"], row["AMAZON_RESOURCE_NAME"], row["ACCOUNT"], 
+                     row["BA"], row["ROLE_TYPE"]) for row in df_filtered.collect()]
+    evaluated_data = [(row["RESOURCE_NAME"], row["COMPLIANCE_STATUS"]) for row in df_evaluated_roles.collect()]
+    logger.info(f"Filtered data count: {len(filtered_data)}, type: {type(filtered_data)}")
+    logger.info(f"Evaluated data count: {len(evaluated_data)}, type: {type(evaluated_data)}")
+    logger.info(f"Sample evaluated_data: {evaluated_data[:5]}")
+
+    filtered_map = {row[1]: (row[0], row[2], row[3], row[4]) for row in filtered_data}
+    evaluated_compliance = {arn: status for arn, status in evaluated_data}
+    evaluated_roles = [
+        (resource_id, arn, acc, ba, role_type, status) 
+        for arn, status in evaluated_compliance.items() 
+        if arn in filtered_map 
+        for resource_id, acc, ba, role_type in [filtered_map[arn]]
+    ]
+    logger.info(f"Evaluated roles count: {len(evaluated_roles)}, type: {type(evaluated_roles)}")
+
+    compliant_count = len([status for _, _, _, _, _, status in evaluated_roles 
+                         if status not in ["NonCompliant"]])
+    evaluated_count = len(evaluated_roles)
+    logger.info(f"Compliant count: {compliant_count}, type: {type(compliant_count)}")
+    logger.info(f"Evaluated count: {evaluated_count}, type: {type(evaluated_count)}")
+
+    results = calculate_metrics(tier2_alert_threshold_raw, tier2_warning_threshold_raw, compliant_count, evaluated_count)
+    logger.info(f"Calculation results: {results}, type: {type(results)}")
+
+    current_date_value = date.today()
+    logger.info(f"Current date: {current_date_value}, type: {type(current_date_value)}")
+
+    # Summary metrics DataFrame
+    metrics_data = {
+        "DATE": [current_date_value],
+        "MONITORING_METRIC_NUMBER": ['MNTR-XXXXX-T2'],
+        "MONITORING_METRIC": [results["metric"]],
+        "COMPLIANCE_STATUS": [results["status"]],
+        "NUMERATOR": [results["numerator"]],
+        "DENOMINATOR": [results["denominator"]]
+    }
+    logger.info(f"Metrics data: {metrics_data}")
+    logger.info(f"Metrics data types: {[type(x[0]) for x in metrics_data.values()]}")
+
+    pd_df = pd.DataFrame(metrics_data)
+    df_result = spark.createDataFrame(pd_df)
+    logger.info("DataFrame created from pandas DataFrame")
+    df_result.printSchema()
+    logger.info("DataFrame content:")
+    df_result.show()
+
+    # Store summary metrics in tier2_metrics temp view
+    df_result.createOrReplaceTempView("tier2_metrics")
+    logger.info("Created tier2_metrics temp view with summary data.")
+
+    # Store detailed evaluated roles in evaluated_roles_with_compliance temp view
+    evaluated_roles_df = spark.createDataFrame(
+        evaluated_roles,
+        ["RESOURCE_ID", "ARN", "ACCOUNT", "BA", "ROLE_TYPE", "COMPLIANCE_STATUS"]
+    )
+    evaluated_roles_df.createOrReplaceTempView("evaluated_roles_with_compliance")
+    logger.info("Created evaluated_roles_with_compliance temp view with detailed role data.")
+    
+    # Validate non-compliant count in the temp view
+    non_compliant_count = spark.sql(
+        "SELECT COUNT(*) as non_compliant FROM evaluated_roles_with_compliance WHERE COMPLIANCE_STATUS = 'NonCompliant'"
+    ).collect()[0]["non_compliant"]
+    logger.info(f"Non-compliant count in evaluated_roles_with_compliance: {non_compliant_count}")
+
+    # Set Spark configurations
+    logger.info(f"Setting tier2_numerator to {results['numerator']}")
+    spark.sql(f"SET tier2_numerator = {results['numerator']}")
+    logger.info(f"Setting tier2_denominator to {results['denominator']}")
+    spark.sql(f"SET tier2_denominator = {results['denominator']}")
+    logger.info(f"Setting tier2_metric_value to {results['metric']}")
+    spark.sql(f"SET tier2_metric_value = {results['metric']}")
+    logger.info(f"Setting tier2_compliance_status to {results['status']}")
+    spark.sql(f"SET tier2_compliance_status = '{results['status']}'")
+
+except Exception as e:
+    logger.error(f"ERROR in Tier 2 metrics calculation: {str(e)}")
+    raise
