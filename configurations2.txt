@@ -1,9 +1,2 @@
-Statement:
-An Amazon EC2 instance configured with configurationName: "configuration.metadataOptions.httpTokens" and configurationValue: "required" exclusively supports the Instance Metadata Service Version 2 (IMDSv2), disabling IMDSv1. According to the AWS EC2 API Reference, the HttpTokens parameter set to "required" mandates session-oriented requests with a token, a defining feature of IMDSv2, thereby preventing IMDSv1 access. This is further corroborated by the AWS User Guide, which states that httpTokens: required results in "IMDSv2 only (token required)," ensuring enhanced security by requiring token-based metadata access.  
-Sources:  
-AWS, "ModifyInstanceMetadataOptions," Amazon EC2 API Reference, https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceMetadataOptions.html  
-
-AWS, "Configure the Instance Metadata Service options," Amazon EC2 User Guide, https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html
-
 
 
