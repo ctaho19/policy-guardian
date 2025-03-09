@@ -31,9 +31,11 @@ try:
     
     # Get non-compliant resources from Tier 2
     non_compliant_df = df_evaluated_roles.filter(col("COMPLIANCE_STATUS") == "NonCompliant")
+    non_compliant_count = non_compliant_df.count()
+    logger.info(f"Found {non_compliant_count} non-compliant resources in evaluated_roles_with_compliance")
     
     # If no non-compliant resources, create a simple evidence DataFrame
-    if non_compliant_df.count() == 0:
+    if non_compliant_count == 0:
         logger.info("No non-compliant resources found for Tier 3 supporting evidence")
         evidence_data = {
             "RESOURCE_ID": [None],
@@ -49,31 +51,41 @@ try:
             "NOTES": ["All Evaluated Roles are Compliant"]
         }
     else:
-        # Get SLA data for non-compliant resources
+        # Extract non-compliant resources
         non_compliant_resources = [(row["RESOURCE_ID"], row["ARN"], row["ACCOUNT"], row["BA"], row["ROLE_TYPE"]) 
                                   for row in non_compliant_df.collect()]
+        logger.info(f"Non-compliant resources extracted: {len(non_compliant_resources)}, sample: {non_compliant_resources[:5]}")
         
-        resource_ids = [res[0] for res in non_compliant_resources]
-        resource_ids_str = ", ".join([f"'{id}'" for id in resource_ids])
+        # Prepare list of RESOURCE_IDs for querying
+        resource_ids = [resource_id for resource_id, _, _, _, _ in non_compliant_resources]
+        resource_id_list = ",".join([f"'{rid}'" for rid in resource_ids])
         
-        # Query to get SLA data for non-compliant resources
+        # Query to get SLA data for non-compliant resources (aligned with Tier 3 Metrics)
         sla_query = f"""
         SELECT 
             RESOURCE_ID,
             CONTROL_RISK,
             OPEN_DATE_UTC_TIMESTAMP
-        FROM EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_SLA
-        WHERE RESOURCE_ID IN ({resource_ids_str})
-        AND CONTROL_ID = 'CM-2.AWS.12.v02'
+        FROM CLCN_DB.PHDP_CLOUD.OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01
+        WHERE CONTROL_ID = 'AC-3.AWS.39.v02'
+          AND RESOURCE_ID IN ({resource_id_list})
+          AND ID NOT IN (
+              SELECT ID 
+              FROM CLCN_DB.PHDP_CLOUD.OZONE_CLOSED_NON_COMPLIANT_RESOURCES_V04
+          )
         """
         
-        logger.info(f"Executing SLA query for non-compliant resources")
+        logger.info("Loading SLA data for non-compliant resources from Snowflake")
         df_sla_data = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
             .options(**sfOptions) \
             .option("query", sla_query) \
             .load()
         
-        # Define SLA thresholds
+        logger.info(f"SLA data count: {df_sla_data.count()}")
+        logger.info("SLA data sample:")
+        df_sla_data.show(5, truncate=False)
+        
+        # Define SLA thresholds (consistent with Tier 3 Metrics)
         sla_thresholds = {
             "Critical": 0,
             "High": 30,
@@ -94,14 +106,19 @@ try:
                 days_open = (current_date - open_date).days
                 sla_limit = sla_thresholds.get(control_risk, 90)
                 sla_status = "Past SLA" if days_open > sla_limit else "Within SLA"
-                
-                sla_data_map[resource_id] = {
-                    "CONTROL_RISK": control_risk,
-                    "OPEN_DATE": open_date,
-                    "DAYS_OPEN": days_open,
-                    "SLA_LIMIT": sla_limit,
-                    "SLA_STATUS": sla_status
-                }
+            else:
+                days_open = None
+                sla_limit = None
+                sla_status = "Unknown"
+                logger.warning(f"Invalid SLA data for resource_id={resource_id}, control_risk={control_risk}, open_date={open_date}")
+            
+            sla_data_map[resource_id] = {
+                "CONTROL_RISK": control_risk,
+                "OPEN_DATE": open_date,
+                "DAYS_OPEN": days_open,
+                "SLA_LIMIT": sla_limit,
+                "SLA_STATUS": sla_status
+            }
         
         # Combine non-compliant resources with SLA data
         evidence_rows = []
@@ -154,8 +171,8 @@ try:
         StructField("ROLE_TYPE", StringType(), True),
         StructField("CONTROL_RISK", StringType(), True),
         StructField("OPEN_DATE", TimestampType(), True),
-        StructField("DAYS_OPEN", StringType(), True),
-        StructField("SLA_LIMIT", StringType(), True),
+        StructField("DAYS_OPEN", StringType(), True),  # Kept as StringType to match potential None values
+        StructField("SLA_LIMIT", StringType(), True),  # Kept as StringType to match potential None values
         StructField("SLA_STATUS", StringType(), True),
         StructField("NOTES", StringType(), True)
     ])
