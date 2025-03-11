@@ -1,46 +1,295 @@
-# Install toml for parsing Pipfile
-%pip install toml
-
-import toml
+import logging
+import requests
+from requests.auth import HTTPBasicAuth
+from requests_oauthlib import OAuth2Session
+from collections import defaultdict
+import pandas as pd
+from datetime import datetime
 import json
 
-# Paths to your uploaded files in the workspace
-pipfile_path = "/FileStore/Pipfile"
-lockfile_path = "/FileStore/Pipfile.lock"
+# Configure logging to capture DEBUG level and above
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger('requests').setLevel(logging.DEBUG)  # Log requests library details
+logging.getLogger('urllib3').setLevel(logging.DEBUG)   # Log urllib3 (used by requests) details
+logging.getLogger('oauthlib').setLevel(logging.DEBUG)  # Log OAuth2Session details
 
-# Parse Pipfile to get the internal source and package names
-with open(pipfile_path, "r") as f:
-    pipfile = toml.load(f)
+def get_devex_requestor(dx_gateway, client_id, client_secret):
+    logging.info("Starting token retrieval process")
+    token_url = f"{dx_gateway}/oauth2/token"
+    auth = HTTPBasicAuth(client_id, client_secret)
+    token_data = {'grant_type': 'client_credentials'}
+    token_headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    
+    # Log request details
+    logging.debug(f"Token URL: {token_url}")
+    logging.debug(f"Token Headers: {token_headers}")
+    logging.debug(f"Token Data: {token_data}")
+    logging.debug(f"Client ID: {client_id}")
+    logging.debug(f"Client Secret: {'[REDACTED]' if client_secret else 'MISSING'}")
+    
+    try:
+        response = requests.post(token_url, data=token_data, headers=token_headers, auth=auth, verify=False)
+        logging.debug(f"Token Request Status Code: {response.status_code}")
+        logging.debug(f"Token Request Response Headers: {response.headers}")
+        logging.debug(f"Token Request Response Content: {response.content}")
+        response.raise_for_status()  # Raise exception for 4xx/5xx errors
+        token_info = response.json()
+        token = token_info['access_token']
+        logging.debug(f"Retrieved Token: {token}")
+        logging.debug(f"Full Token Response: {token_info}")
+        return OAuth2Session(client_id, token={'access_token': token, 'token_type': 'Bearer'})
+    except requests.RequestException as e:
+        logging.error(f"Token retrieval failed: {str(e)}")
+        raise
 
-# Extract the internal PyPI URL (assumes one source)
-internal_source = pipfile["source"][0]["url"]  # e.g., "https://pypi-internal.yourcompany.com/simple"
-packages_section = pipfile.get("packages", {})
-dev_packages_section = pipfile.get("dev-packages", {})
-all_packages = {**packages_section, **dev_packages_section}  # Combine runtime and dev packages
+def create_search_parameters(type, conditions):
+    logging.info("Creating search parameters")
+    search_params = {}
+    for condition in conditions:
+        sections = condition[0].split('.')
+        if len(sections) == 2:
+            items_name = f'{sections[0]}Items'
+            if items_name not in search_params:
+                search_params[items_name] = []
+            item = {
+                f'{sections[0]}Name': sections[1],
+                f'{sections[0]}Value': condition[1],
+            }
+            search_params[items_name].append(item)
+        else:
+            search_params[condition[0]] = condition[1]
+    search_params["resourceType"] = type
+    logging.debug(f"Search Parameters: {search_params}")
+    return search_params
 
-# Parse Pipfile.lock for exact versions
-with open(lockfile_path, "r") as f:
-    lockfile = json.load(f)
+def get_resource(requestor, type, conditions, next_record_key=None):
+    logging.info(f"Fetching resources for type: {type}")
+    search_params = create_search_parameters(type, conditions)
+    body = {
+        "searchParameters": [search_params],
+        "responseFields": [
+            "accountName", "accountResourceId", "amazonResourceName", "asvName", "awsAccountId", "awsRegion",
+            "businessApplicationName", "businessExecutiveFullName", "configurationItemCaptureTimestamp",
+            "engineeringLeadFullName", "environment", "resourceCreationTimestamp", "resourceId", "resourceType",
+            "technologyDivision", "technologyExecutiveFullName", "configuration.origin"
+        ]
+    }
+    request = f"{DX_GATEWAY}/internal-operations/cloud-service/aws-tooling/search-resource-configurations?limit=10000"
+    if next_record_key:
+        request += f'&nextRecordKey={next_record_key}'
+    
+    logging.debug(f"Request URL: {request}")
+    logging.debug(f"Request Body: {json.dumps(body, indent=2)}")
+    print(f"Request URL: {request}")
+    print(f"Request Body: {json.dumps(body, indent=2)}")
+    
+    try:
+        # Log the Authorization header being used by OAuth2Session
+        logging.debug(f"Request Headers (before sending): {requestor.headers}")
+        response = requestor.post(request, json=body, timeout=60)
+        logging.debug(f"Response Status Code: {response.status_code}")
+        logging.debug(f"Response Headers: {response.headers}")
+        logging.debug(f"Response Content: {response.content}")
+        print(f"Response Status Code: {response.status_code}")
+        print(f"Response Content: {response.content}")
+        
+        if response.status_code != 200:
+            logging.error(f"API returned non-200 status: {response.status_code}")
+            raise Exception(f'Bad response from API: {response.status_code}')
+        return response.json()
+    except requests.RequestException as e:
+        logging.error(f"Resource request failed: {str(e)}", exc_info=True)
+        raise
 
-# Combine 'default' (runtime) and 'develop' (dev) packages from lockfile
-locked_packages = {**lockfile.get("default", {}), **lockfile.get("develop", {})}
+# Alternative function using direct bearer token (for comparison)
+def get_resource_with_bearer_token(url, token, type, conditions, next_record_key=None):
+    logging.info(f"Fetching resources with bearer token for type: {type}")
+    search_params = create_search_parameters(type, conditions)
+    body = {
+        "searchParameters": [search_params],
+        "responseFields": [
+            "accountName", "accountResourceId", "amazonResourceName", "asvName", "awsAccountId", "awsRegion",
+            "businessApplicationName", "businessExecutiveFullName", "configurationItemCaptureTimestamp",
+            "engineeringLeadFullName", "environment", "resourceCreationTimestamp", "resourceId", "resourceType",
+            "technologyDivision", "technologyExecutiveFullName", "configuration.origin"
+        ]
+    }
+    request = f"{url}?limit=10000"
+    if next_record_key:
+        request += f'&nextRecordKey={next_record_key}'
+    
+    headers = {
+        'Accept': 'application/json;v=1.0',
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    
+    logging.debug(f"Request URL: {request}")
+    logging.debug(f"Request Headers: {headers}")
+    logging.debug(f"Request Body: {json.dumps(body, indent=2)}")
+    print(f"Request URL: {request}")
+    print(f"Request Headers: {headers}")
+    print(f"Request Body: {json.dumps(body, indent=2)}")
+    
+    try:
+        response = requests.post(request, headers=headers, data=json.dumps(body), verify=False, timeout=60)
+        logging.debug(f"Response Status Code: {response.status_code}")
+        logging.debug(f"Response Headers: {response.headers}")
+        logging.debug(f"Response Content: {response.content}")
+        print(f"Response Status Code: {response.status_code}")
+        print(f"Response Content: {response.content}")
+        
+        if response.status_code != 200:
+            logging.error(f"API returned non-200 status: {response.status_code}")
+            raise Exception(f'Bad response from API: {response.status_code}')
+        return response.json()
+    except requests.RequestException as e:
+        logging.error(f"Resource request failed: {str(e)}", exc_info=True)
+        raise
 
-# Build the list of packages with pinned versions
-install_list = []
-for pkg in all_packages.keys():
-    if pkg in locked_packages:
-        version = locked_packages[pkg]["version"]  # e.g., "==1.2.3"
-        install_list.append(f"{pkg}{version}")
-    else:
-        install_list.append(pkg)  # Fallback to Pipfile’s specifier if not locked
+def main():
+    dx_gateway = DX_GATEWAY  # Ensure this is defined (e.g., "https://api.cloud.capitalone.com")
+    kms_client_id = CLIENT_ID  # Ensure this is defined
+    kms_client_secret = CLIENT_SECRET  # Ensure this is defined
+    bearer_token = ""  # Add your working bearer token here for testing the alternative approach
 
-# Construct and run the pip install command with the internal source
-install_cmd = " ".join(install_list)
-full_cmd = f"install --index-url {internal_source} --no-deps {install_cmd}"
+    logging.info("Starting main execution")
+    logging.debug(f"DX Gateway: {dx_gateway}")
+    logging.debug(f"Client ID: {kms_client_id}")
+    logging.debug(f"Client Secret: {'[REDACTED]' if kms_client_secret else 'MISSING'}")
+    logging.debug(f"Bearer Token: {'[REDACTED]' if bearer_token else 'MISSING'}")
 
-# Execute the installation
-%pip $full_cmd
+    # Option 1: Use OAuth2Session with client credentials
+    requestor = get_devex_requestor(dx_gateway, kms_client_id, kms_client_secret)
 
-# Optional: Verify installation
-print(f"Installed packages from {internal_source}: {install_cmd}")
+    # Option 2: Use direct bearer token (uncomment to test)
+    # url = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
+    # resource_info = get_resource_with_bearer_token(url, bearer_token, 'AWS::KMS::Key', [['resourceType', 'AWS::KMS::Key']])
+    
+    total_count = 0
+    origin_counts = defaultdict(int)
+    unknown_origins = []
 
+    # Use this line for Option 1 (OAuth2Session)
+    resource_info = get_resource(requestor, 'AWS::KMS::Key', [['resourceType', 'AWS::KMS::Key']])
+    
+    records = resource_info.get('resourceConfigurations', [])
+    next_record_key = resource_info.get('nextRecordKey', '')
+
+    if not records:
+        logging.info('No records found')
+        print('No records found')
+        return
+
+    while records:
+        total_count += len(records)
+        logging.debug(f"Processing {len(records)} records")
+
+        for record in records:
+            logging.debug(f"Processing record: {record}")
+            print(f"Processing record: {record}")
+            origin = 'Unknown'
+            if 'configurationList' in record:
+                for config in record['configurationList']:
+                    if config['configurationName'] == 'configuration.origin':
+                        origin = config['configurationValue']
+                        break
+            logging.debug(f"Extracted origin: {origin}")
+            print(f"Extracted origin: {origin}")
+
+            origin_counts[origin] += 1
+
+            if origin == 'Unknown':
+                unknown_origins.append({
+                    'environment': record.get('environment', ''),
+                    'accountResourceId': record.get('accountResourceId', ''),
+                    'resourceType': record.get('resourceType', ''),
+                    'CreationDate': record.get('resourceCreationTimestamp', ''),
+                    'configurationName': 'configuration.origin',
+                    'configurationValue': origin
+                })
+
+        if next_record_key:
+            logging.debug(f"Fetching next page with nextRecordKey: {next_record_key}")
+            # Use appropriate call based on Option 1 or 2
+            resource_info = get_resource(requestor, 'AWS::KMS::Key', [['resourceType', 'AWS::KMS::Key']], next_record_key)
+            # resource_info = get_resource_with_bearer_token(url, bearer_token, 'AWS::KMS::Key', [['resourceType', 'AWS::KMS::Key']], next_record_key)
+            records = resource_info.get('resourceConfigurations', [])
+            next_record_key = resource_info.get('nextRecordKey', '')
+        else:
+            break
+
+    # Convert unknown origins to DataFrame
+    df_unknown_origins = pd.DataFrame(unknown_origins)
+    logging.debug(f"Unknown origins DataFrame: {df_unknown_origins.to_dict()}")
+
+    # Store total count and origin counts as variables
+    total_resource_count = total_count
+    origin_value_counts = dict(origin_counts)
+
+    # Calculate the metric
+    numerator = origin_value_counts.get('AWS_KMS', 0)
+    denominator = total_resource_count
+    monitoring_metric = numerator / denominator if denominator != 0 else 0
+    logging.debug(f"Metric calculation - Numerator: {numerator}, Denominator: {denominator}, Result: {monitoring_metric}")
+
+    # Fetch the threshold value from the dataset (ensure sfOptions and SNOWFLAKE_SOURCE_NAME are defined)
+    threshold_query = """
+        SELECT 
+            MONITORING_METRIC_ID,
+            ALERT_THRESHOLD
+        FROM CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD
+        WHERE MONITORING_METRIC_ID = 'MNTR-1077125-T2'
+    """
+    logging.debug(f"Executing threshold query: {threshold_query}")
+
+    threshold_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", threshold_query) \
+        .load()
+    threshold_value = threshold_df.collect()[0]['ALERT_THRESHOLD']
+    logging.debug(f"Threshold value: {threshold_value}")
+
+    # Determine compliance status
+    compliance_status = 'GREEN' if monitoring_metric > threshold_value else 'RED'
+    logging.debug(f"Compliance status: {compliance_status}")
+
+    # Create the metric DataFrame
+    metric_df = pd.DataFrame([{
+        'DATE': datetime.now().strftime('%Y-%m-%d'),
+        'MONITORING_METRIC_NUMBER': 'MNTR-1077125-T2',
+        'MONITORING_METRIC': monitoring_metric,
+        'COMPLIANCE_STATUS': compliance_status,
+        'NUMERATOR': numerator,
+        'DENOMINATOR': denominator
+    }])
+    logging.debug(f"Metric DataFrame: {metric_df.to_dict()}")
+
+    # Print the results
+    print(f'Total count of resources: {total_resource_count}')
+    print('Breakdown of origin values:')
+    for origin, count in origin_value_counts.items():
+        print(f'{origin}: {count}')
+    print("\nResources with unknown origin:")
+    print(df_unknown_origins)
+    print("\nMetric DataFrame:")
+    print(metric_df)
+
+    logging.info("Main execution completed")
+    return metric_df, df_unknown_origins
+
+# Run the main function
+if __name__ == "__main__":
+    try:
+        # Ensure these are set (e.g., via environment variables or Databricks secrets)
+        DX_GATEWAY = "https://api.cloud.capitalone.com"  # Adjust if different
+        CLIENT_ID = ""  # Your client ID
+        CLIENT_SECRET = ""  # Your client secret
+        metric_df, df_unknown_origins = main()
+    except Exception as e:
+        logging.error(f"Script execution failed: {str(e)}", exc_info=True)
+        raise
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
