@@ -3,15 +3,25 @@ def get_summary_count(payload: Dict) -> Optional[int]:
     try:
         response = requests.post(SUMMARY_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
         logger.info(f"Summary View API response status: {response.status_code}")
+        logger.debug(f"Raw response text: {response.text}")
         if response.status_code == 200:
             data = response.json()
+            if data is None:
+                logger.error("Response JSON is None")
+                return None
             logger.debug(f"Summary View API response data: {json.dumps(data, indent=2)}")
+            # Adjust based on actual structure (guessing from snippets, might need tweak)
             count = data.get("level1List", [{}])[0].get("level1ResourceCount", 0)
+            if "level1List" not in data:
+                logger.warning("Expected 'level1List' not found in response; count may be inaccurate")
             logger.info(f"Extracted summary count: {count}")
             return count
         else:
             logger.error(f"Summary View API failed with status {response.status_code}: {response.text}")
             return None
+    except ValueError as e:
+        logger.error(f"JSON decode error: {str(e)}")
+        return None
     except Exception as e:
         logger.error(f"Exception in Summary View call: {str(e)}", exc_info=True)
         return None
@@ -30,10 +40,14 @@ def fetch_all_resources(payload: Dict) -> Tuple[List[Dict], int]:
 
             response = requests.post(CONFIG_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
             logger.info(f"Config API response status: {response.status_code}")
+            logger.debug(f"Raw response text: {response.text}")
             if response.status_code == 200:
                 data = response.json()
+                if data is None:
+                    logger.error("Response JSON is None")
+                    break
                 logger.debug(f"Config API response data: {json.dumps(data, indent=2)}")
-                resources = data.get("resources", [])
+                resources = data.get("resourceConfigurations", [])  # Updated from "resources"
                 logger.info(f"Fetched {len(resources)} resources in this call")
                 all_resources.extend(resources)
                 total_count += len(resources)
@@ -46,6 +60,9 @@ def fetch_all_resources(payload: Dict) -> Tuple[List[Dict], int]:
             else:
                 logger.error(f"Config API failed with status {response.status_code}: {response.text}")
                 break
+        except ValueError as e:
+            logger.error(f"JSON decode error: {str(e)}")
+            break
         except Exception as e:
             logger.error(f"Exception fetching resources: {str(e)}", exc_info=True)
             break
@@ -55,8 +72,6 @@ def fetch_all_resources(payload: Dict) -> Tuple[List[Dict], int]:
 ​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
 
 
-
-
 def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
     logger.info(f"Filtering Tier 1 with config_key: {config_key}, fields: {fields}")
     logger.debug(f"Total resources to filter: {len(resources)}")
@@ -64,13 +79,21 @@ def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[
     non_matching_resources = []
 
     for i, resource in enumerate(resources):
-        config = resource.get("configuration", {})
-        logger.debug(f"Resource {i}: configuration = {config}")
-        if config_key in config and config[config_key] is not None:
+        logger.debug(f"Resource {i}: {json.dumps(resource, indent=2)}")
+        config_list = resource.get("configurationList", [])
+        has_config = any(config["configurationName"] == f"configuration.{config_key}" and config["configurationValue"] is not None for config in config_list)
+        if has_config:
             matching_count += 1
             logger.debug(f"Resource {i} matches Tier 1: {config_key} present")
         else:
-            filtered_resource = {field: resource.get(field, config.get(field, "N/A")) for field in fields}
+            filtered_resource = {}
+            for field in fields:
+                if field.startswith("configuration."):
+                    subfield = field.replace("configuration.", "")
+                    value = next((c["configurationValue"] for c in config_list if c["configurationName"] == f"configuration.{subfield}"), "N/A")
+                else:
+                    value = resource.get(field, "N/A")
+                filtered_resource[field] = value
             non_matching_resources.append(filtered_resource)
             logger.debug(f"Resource {i} non-compliant for Tier 1: {filtered_resource}")
 
@@ -86,17 +109,28 @@ def filter_tier2_resources(resources: List[Dict], config_key: str, config_value:
     logger.info(f"Filtering Tier 2 with config_key: {config_key}, config_value: {config_value}, fields: {fields}")
     matching_count = 0
     non_matching_resources = []
-    tier1_compliant = [r for r in resources if config_key in r.get("configuration", {}) and r["configuration"][config_key] is not None]
+    tier1_compliant = [
+        r for r in resources 
+        if any(c["configurationName"] == f"configuration.{config_key}" and c["configurationValue"] is not None for c in r.get("configurationList", []))
+    ]
     logger.info(f"Tier 2: {len(tier1_compliant)} Tier 1 compliant resources to filter")
 
     for i, resource in enumerate(tier1_compliant):
-        config = resource.get("configuration", {})
-        logger.debug(f"Tier 2 Resource {i}: configuration = {config}")
-        if config.get(config_key) == config_value:
+        config_list = resource.get("configurationList", [])
+        logger.debug(f"Tier 2 Resource {i}: {json.dumps(resource, indent=2)}")
+        value = next((c["configurationValue"] for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
+        if value == config_value:
             matching_count += 1
             logger.debug(f"Tier 2 Resource {i} matches: {config_key} = {config_value}")
         else:
-            filtered_resource = {field: resource.get(field, config.get(field, "N/A")) for field in fields}
+            filtered_resource = {}
+            for field in fields:
+                if field.startswith("configuration."):
+                    subfield = field.replace("configuration.", "")
+                    value = next((c["configurationValue"] for c in config_list if c["configurationName"] == f"configuration.{subfield}"), "N/A")
+                else:
+                    value = resource.get(field, "N/A")
+                filtered_resource[field] = value
             non_matching_resources.append(filtered_resource)
             logger.debug(f"Tier 2 Resource {i} non-compliant: {filtered_resource}")
 
@@ -107,6 +141,47 @@ def filter_tier2_resources(resources: List[Dict], config_key: str, config_value:
         df = pd.DataFrame([{"accountResourceId": "No non-compliant resources found"}], columns=fields)
     logger.info(f"Tier 2 DataFrame created with {len(df)} rows")
     return matching_count, df
+
+def load_thresholds(spark: SparkSession) -> pd.DataFrame:
+    threshold_query = """
+    SELECT 
+        MONITORING_METRIC_ID,
+        ALERT_THRESHOLD,
+        WARNING_THRESHOLD
+    FROM CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD
+    WHERE MONITORING_METRIC_ID IN ('MNTR-KMS-STORAGE-T1', 'MNTR-KMS-STORAGE-T2')
+    """
+    logger.info("Loading Tier 1 and Tier 2 thresholds from Snowflake")
+    thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", threshold_query) \
+        .load()
+    
+    threshold_data = thresholds_df.collect()
+    logger.info(f"Threshold data collected: {threshold_data}, type: {type(threshold_data)}")
+    
+    if threshold_data:
+        data = [
+            {
+                "MONITORING_METRIC_ID": row["MONITORING_METRIC_ID"],
+                "ALERT_THRESHOLD": row["ALERT_THRESHOLD"],
+                "WARNING_THRESHOLD": row["WARNING_THRESHOLD"]
+            } for row in threshold_data
+        ]
+        return pd.DataFrame(data)
+    else:
+        logger.warning("No threshold data found; using fallback values")
+        return pd.DataFrame([
+            {"MONITORING_METRIC_ID": "MNTR-KMS-STORAGE-T1", "ALERT_THRESHOLD": 0.1, "WARNING_THRESHOLD": 0.3},
+            {"MONITORING_METRIC_ID": "MNTR-KMS-STORAGE-T2", "ALERT_THRESHOLD": 0.1, "WARNING_THRESHOLD": 0.3}
+        ])
+
+def get_compliance_status(metric: float, alert_threshold: float, warning_threshold: Optional[float]) -> str:
+    if metric > alert_threshold:
+        return "RED"
+    elif warning_threshold is not None and metric > warning_threshold:
+        return "YELLOW"
+    return "GREEN"
 ​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
 
 
@@ -114,28 +189,28 @@ def filter_tier2_resources(resources: List[Dict], config_key: str, config_value:
 
 def main():
     # Initialize Spark session
-    spark = SparkSession.builder.appName("CyberControlsMonitoring").getOrCreate()
+    spark = SparkSession.builder.appName("KMSStorageMonitoring").getOrCreate()
     logger.info("Spark session initialized")
 
-    # Define payloads (example from your output, adjust as needed)
+    # Define payloads
     summary_payload = {
         "searchParameters": {
-            "resourceType": "AWS::ACM::Certificate",
-            "configurationItems": [{"configurationName": "issuer", "configurationValue": "Amazon"}],
+            "resourceType": "AWS::KMS::Key",
+            "configurationItems": [{"configurationName": "origin", "configurationValue": "AWS_KMS"}],
             "aggregations": ["resourceType"]
         }
     }
 
     config_payload = {
-        "searchParameters": [{"resourceType": "AWS::ACM::Certificate"}]
+        "searchParameters": [{"resourceType": "AWS::KMS::Key"}]
     }
 
     # Configuration to evaluate
-    CONFIG_KEY = "issuer"
-    CONFIG_VALUE = "Amazon"
-    DESIRED_FIELDS = ["accountResourceId", "configuration.issuer", "resourceType"]
-    TIER1_METRIC_ID = "MNTR-1077125-T1"
-    TIER2_METRIC_ID = "MNTR-1077125-T2"
+    CONFIG_KEY = "origin"
+    CONFIG_VALUE = "AWS_KMS"
+    DESIRED_FIELDS = ["accountResourceId", "configuration.origin"]
+    TIER1_METRIC_ID = "MNTR-KMS-STORAGE-T1"
+    TIER2_METRIC_ID = "MNTR-KMS-STORAGE-T2"
 
     # Step 1: Get summary count
     summary_count = get_summary_count(summary_payload)
@@ -198,7 +273,7 @@ def main():
     ]
     monitoring_df = pd.DataFrame(monitoring_data)
     logger.info(f"Monitoring DataFrame created: {monitoring_df.to_dict(orient='records')}")
-    print("CTRL-1077125 Monitoring Metric DataFrames:")
+    print("KMS Storage Monitoring Metric DataFrames:")
     print(monitoring_df)
 
     # Step 7: Log results
