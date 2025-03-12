@@ -1,0 +1,161 @@
+def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    matching_count = 0  # Resources with the config field present
+    non_matching_resources = []
+
+    for resource in resources:
+        config = resource.get("configuration", {})
+        if config_key in config and config[config_key] is not None:
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, config.get(field, "N/A")) for field in fields}
+            non_matching_resources.append(filtered_resource)
+
+    logger.info(f"Tier 1: Found {matching_count} resources with {config_key} present")
+    if non_matching_resources:
+        df = pd.DataFrame(non_matching_resources)
+    else:
+        df = pd.DataFrame([{"accountResourceId": "No non-compliant resources found"}], columns=fields)
+    return matching_count, df
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+
+def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    matching_count = 0  # Resources with the correct config value
+    non_matching_resources = []
+    tier1_compliant = [r for r in resources if config_key in r.get("configuration", {}) and r["configuration"][config_key] is not None]
+
+    for resource in tier1_compliant:
+        config = resource.get("configuration", {})
+        if config.get(config_key) == config_value:
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, config.get(field, "N/A")) for field in fields}
+            non_matching_resources.append(filtered_resource)
+
+    logger.info(f"Tier 2: Found {matching_count} resources with {config_key} = {config_value}")
+    if non_matching_resources:
+        df = pd.DataFrame(non_matching_resources)
+    else:
+        df = pd.DataFrame([{"accountResourceId": "No non-compliant resources found"}], columns=fields)
+    return matching_count, df
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+
+def load_thresholds(spark: SparkSession) -> pd.DataFrame:
+    tier1_threshold_query = """
+    SELECT 
+        MONITORING_METRIC_ID,
+        ALERT_THRESHOLD,
+        WARNING_THRESHOLD
+    FROM CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD
+    WHERE MONITORING_METRIC_ID = 'MNTR-XXXXXX-T1'
+    """
+    logger.info("Loading Tier 1 thresholds from Snowflake")
+    thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", tier1_threshold_query) \
+        .load()
+    
+    threshold_data = thresholds_df.collect()
+    logger.info(f"Threshold data collected: {threshold_data}, type: {type(threshold_data)}")
+    
+    if threshold_data:
+        data = [{
+            "MONITORING_METRIC_ID": threshold_data[0]["MONITORING_METRIC_ID"],
+            "ALERT_THRESHOLD": threshold_data[0]["ALERT_THRESHOLD"],
+            "WARNING_THRESHOLD": threshold_data[0]["WARNING_THRESHOLD"]
+        }]
+        return pd.DataFrame(data)
+    else:
+        logger.warning("No threshold data found for MNTR-XXXXXX-T1")
+        return pd.DataFrame([{"MONITORING_METRIC_ID": "MNTR-XXXXXX-T1", "ALERT_THRESHOLD": 0.1, "WARNING_THRESHOLD": 0.3}])  # Fallback
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+
+
+def main():
+    # Initialize Spark session
+    spark = SparkSession.builder.appName("CyberControlsMonitoring").getOrCreate()
+
+    # Define payloads
+    summary_payload = {
+        "searchParameters": {
+            "resourceType": "AWS::ACM::Certificate",
+            "configurationItems": [{"configurationName": "issuer", "configurationValue": "Amazon"}],
+            "aggregations": ["resourceType"]
+        }
+    }
+
+    config_payload = {
+        "searchParameters": [{"resourceType": "AWS::ACM::Certificate"}]
+    }
+
+    # Configuration to evaluate
+    CONFIG_KEY = "issuer"
+    CONFIG_VALUE = "Amazon"
+    DESIRED_FIELDS = ["accountResourceId", "configuration.issuer", "resourceType"]
+
+    # Step 1: Get summary count
+    summary_count = get_summary_count(summary_payload)
+    if summary_count is None:
+        logger.error("Failed to get summary count. Exiting.")
+        return
+
+    # Step 2: Fetch all resources
+    all_resources, config_total_count = fetch_all_resources(config_payload)
+
+    # Step 3: Tier 1 - Check if field exists
+    tier1_numerator, tier1_non_compliant_df = filter_tier1_resources(all_resources, CONFIG_KEY, DESIRED_FIELDS)
+    logger.info(f"Tier 1 Non-compliant DataFrame: {len(tier1_non_compliant_df)} rows")
+    if not tier1_non_compliant_df.empty:
+        print(tier1_non_compliant_df.head())
+
+    # Step 4: Tier 2 - Check if value matches
+    tier2_numerator, tier2_non_compliant_df = filter_tier2_resources(all_resources, CONFIG_KEY, CONFIG_VALUE, DESIRED_FIELDS)
+    logger.info(f"Tier 2 Non-compliant DataFrame: {len(tier2_non_compliant_df)} rows")
+    if not tier2_non_compliant_df.empty:
+        print(tier2_non_compliant_df.head())
+
+    # Step 5: Load thresholds and calculate metrics
+    thresholds_df = load_thresholds(spark)
+    threshold_row = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == "MNTR-XXXXXX-T1"].iloc[0]
+    
+    # Tier 1 Metric (all resources should have the field)
+    tier1_metric = tier1_numerator / config_total_count if config_total_count > 0 else 0
+    tier1_status = get_compliance_status(1 - tier1_metric, threshold_row["ALERT_THRESHOLD"], threshold_row["WARNING_THRESHOLD"])  # 1 - metric because we want compliance
+
+    # Tier 2 Metric (among those with field, value should match)
+    tier2_denominator = tier1_numerator  # Tier 2 denominator is Tier 1 numerator
+    tier2_metric = tier2_numerator / tier2_denominator if tier2_denominator > 0 else 0
+    tier2_status = get_compliance_status(1 - tier2_metric, threshold_row["ALERT_THRESHOLD"], threshold_row["WARNING_THRESHOLD"])
+
+    # Step 6: Create monitoring DataFrame
+    monitoring_data = [
+        {
+            "DATE": datetime.now().strftime("%Y-%m-%d"),
+            "MONITORING_METRIC_NUMBER": "MNTR-XXXXXX-T1",
+            "MONITORING_METRIC": f"{tier1_numerator}/{config_total_count}",
+            "COMPLIANCE_STATUS": tier1_status,
+            "NUMERATOR": tier1_numerator,
+            "DENOMINATOR": config_total_count
+        },
+        {
+            "DATE": datetime.now().strftime("%Y-%m-%d"),
+            "MONITORING_METRIC_NUMBER": "MNTR-XXXXXX-T2",
+            "MONITORING_METRIC": f"{tier2_numerator}/{tier2_denominator}",
+            "COMPLIANCE_STATUS": tier2_status,
+            "NUMERATOR": tier2_numerator,
+            "DENOMINATOR": tier2_denominator
+        }
+    ]
+    monitoring_df = pd.DataFrame(monitoring_data)
+    logger.info(f"Monitoring DataFrame: {monitoring_df.to_dict(orient='records')}")
+
+    # Step 7: Log results and save outputs
+    logger.info(f"Summary View Total Count: {summary_count}")
+    logger.info(f"Tier 1 Numerator (Field Present): {tier1_numerator}")
+    logger.info(f"Tier 2 Numerator (Value Matches): {tier2_numerator}")
+    logger.info(f"Config Total Count: {config_total_count}")
+
+    monitoring_df.to_csv("monitoring_report.csv", index=False)
+    tier1_non_compliant_df.to_csv("tier1_non_compliant_resources.csv", index=False)
+    tier2_non_compliant_df.to_csv("tier2_non_compliant_resources.csv", index=False)
+    logger.info("Saved monitoring report and non-compliant DataFrames")
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
