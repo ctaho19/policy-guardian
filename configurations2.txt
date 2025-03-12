@@ -1,0 +1,188 @@
+import requests
+import json
+import pandas as pd
+import logging
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from pyspark.sql import SparkSession
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("api_search.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+# API Endpoints and Auth (replace with your actual token)
+AUTH_TOKEN = ""  # Replace with your actual token
+BASE_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling"
+SUMMARY_URL = f"{BASE_URL}/summary-view"
+CONFIG_URL = f"{BASE_URL}/search-resource-configurations"
+
+HEADERS = {
+    'Accept': 'application/json;v=1.0',
+    'Authorization': f'Bearer {AUTH_TOKEN}',
+    'Content-Type': 'application/json'
+}
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+def get_summary_count(payload: Dict) -> Optional[int]:
+    try:
+        response = requests.post(SUMMARY_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
+        if response.status_code == 200:
+            data = response.json()
+            count = data.get("level1List", [{}])[0].get("level1ResourceCount", 0)
+            logger.info(f"Summary View count retrieved: {count}")
+            return count
+        else:
+            logger.error(f"Summary View API call failed with status {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Error in Summary View call: {str(e)}")
+        return None
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+def fetch_all_resources(payload: Dict) -> Tuple[List[Dict], int]:
+    all_resources = []
+    total_count = 0
+    next_record_key = ""
+
+    while True:
+        try:
+            if next_record_key:
+                payload["nextRecordKey"] = next_record_key
+
+            response = requests.post(CONFIG_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
+            if response.status_code == 200:
+                data = response.json()
+                resources = data.get("resources", [])
+                all_resources.extend(resources)
+                total_count += len(resources)
+                next_record_key = data.get("nextRecordKey", "")
+
+                logger.info(f"Fetched {len(resources)} resources, total so far: {total_count}")
+                if not next_record_key or len(resources) == 0:
+                    logger.info("No more resources to fetch")
+                    break
+            else:
+                logger.error(f"Config API call failed with status {response.status_code}: {response.text}")
+                break
+        except Exception as e:
+            logger.error(f"Error fetching resources: {str(e)}")
+            break
+
+    return all_resources, total_count
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+def filter_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    matching_count = 0
+    non_matching_resources = []
+
+    for resource in resources:
+        config = resource.get("configuration", {})
+        if config.get(config_key) == config_value:
+            matching_count += 1
+        else:
+            # Extract only specified fields for non-matching resources
+            filtered_resource = {field: resource.get(field, config.get(field, "N/A")) for field in fields}
+            non_matching_resources.append(filtered_resource)
+
+    logger.info(f"Found {matching_count} resources with {config_key} = {config_value}")
+    df = pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+    return matching_count, df
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+def load_thresholds() -> pd.DataFrame:
+    # Replace with your actual PySpark SQL query
+    spark = SparkSession.builder.appName("Thresholds").getOrCreate()
+    # Example: spark.sql("SELECT MONITORING_METRIC_ID, ALERT_THRESHOLD, WARNING_THRESHOLD FROM thresholds_table")
+    # For now, mock data:
+    data = [
+        {"MONITORING_METRIC_ID": "MNTR-XXXXXX-T1", "ALERT_THRESHOLD": 0.1, "WARNING_THRESHOLD": 0.3}
+    ]
+    return pd.DataFrame(data)
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+def get_compliance_status(metric: float, alert_threshold: float, warning_threshold: Optional[float]) -> str:
+    if metric > alert_threshold:
+        return "RED"
+    elif warning_threshold is not None and metric > warning_threshold:
+        return "YELLOW"
+    return "GREEN"
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+
+def main():
+    # Define payloads
+    summary_payload = {
+        "searchParameters": {
+            "resourceType": "AWS::ACM::Certificate",
+            "configurationItems": [{"configurationName": "issuer", "configurationValue": "Amazon"}],
+            "aggregations": ["resourceType"]
+        }
+    }
+
+    config_payload = {
+        "searchParameters": [{"resourceType": "AWS::ACM::Certificate"}]
+    }
+
+    # Configuration to filter
+    CONFIG_KEY = "issuer"
+    CONFIG_VALUE = "Amazon"
+
+    # Fields to include in the non-compliant DataFrame
+    DESIRED_FIELDS = ["accountResourceId", "configuration.issuer", "resourceType"]
+
+    # Step 1: Get summary count
+    summary_count = get_summary_count(summary_payload)
+    if summary_count is None:
+        logger.error("Failed to get summary count. Exiting.")
+        return
+
+    # Step 2: Fetch all resources from config endpoint
+    all_resources, config_total_count = fetch_all_resources(config_payload)
+
+    # Step 3: Filter resources and get non-compliant DataFrame
+    matching_count, non_compliant_df = filter_resources(all_resources, CONFIG_KEY, CONFIG_VALUE, DESIRED_FIELDS)
+    if not non_compliant_df.empty:
+        logger.info(f"Non-compliant DataFrame created with {len(non_compliant_df)} rows")
+        print(non_compliant_df.head())
+    else:
+        logger.info("No non-compliant resources found")
+
+    # Step 4: Load thresholds and calculate monitoring metric
+    thresholds_df = load_thresholds()
+    threshold_row = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == "MNTR-XXXXXX-T1"].iloc[0]
+    numerator = matching_count
+    denominator = config_total_count
+    monitoring_metric = numerator / denominator if denominator > 0 else 0
+    compliance_status = get_compliance_status(
+        monitoring_metric,
+        threshold_row["ALERT_THRESHOLD"],
+        threshold_row["WARNING_THRESHOLD"]
+    )
+
+    # Step 5: Create monitoring DataFrame
+    monitoring_data = {
+        "DATE": [datetime.now().strftime("%Y-%m-%d")],
+        "MONITORING_METRIC_NUMBER": ["MNTR-XXXXXX-T1"],
+        "MONITORING_METRIC": [f"{numerator}/{denominator}"],
+        "COMPLIANCE_STATUS": [compliance_status],
+        "NUMERATOR": [numerator],
+        "DENOMINATOR": [denominator]
+    }
+    monitoring_df = pd.DataFrame(monitoring_data)
+    logger.info(f"Monitoring DataFrame created: {monitoring_df.to_dict(orient='records')}")
+
+    # Step 6: Log results
+    logger.info(f"Summary View Total Count: {summary_count}")
+    logger.info(f"Config Matching Count ({CONFIG_KEY} = {CONFIG_VALUE}): {matching_count}")
+    logger.info(f"Config Total Count: {config_total_count}")
+
+    # Save DataFrames
+    monitoring_df.to_csv("monitoring_report.csv", index=False)
+    if not non_compliant_df.empty:
+        non_compliant_df.to_csv("non_compliant_resources.csv", index=False)
+        logger.info("Saved non-compliant resources to non_compliant_resources.csv")
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+if __name__ == "__main__":
+    main()
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
