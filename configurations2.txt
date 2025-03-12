@@ -1,295 +1,153 @@
-import logging
 import requests
-from requests.auth import HTTPBasicAuth
-from requests_oauthlib import OAuth2Session
-from collections import defaultdict
-import pandas as pd
-from datetime import datetime
 import json
+import pandas as pd
+import logging
+from typing import Dict, List, Optional, Tuple
 
-# Configure logging to capture DEBUG level and above
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logging.getLogger('requests').setLevel(logging.DEBUG)  # Log requests library details
-logging.getLogger('urllib3').setLevel(logging.DEBUG)   # Log urllib3 (used by requests) details
-logging.getLogger('oauthlib').setLevel(logging.DEBUG)  # Log OAuth2Session details
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("api_search.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-def get_devex_requestor(dx_gateway, client_id, client_secret):
-    logging.info("Starting token retrieval process")
-    token_url = f"{dx_gateway}/oauth2/token"
-    auth = HTTPBasicAuth(client_id, client_secret)
-    token_data = {'grant_type': 'client_credentials'}
-    token_headers = {
-        'Accept': 'application/json',
-        'Content-Type': 'application/x-www-form-urlencoded'
-    }
-    
-    # Log request details
-    logging.debug(f"Token URL: {token_url}")
-    logging.debug(f"Token Headers: {token_headers}")
-    logging.debug(f"Token Data: {token_data}")
-    logging.debug(f"Client ID: {client_id}")
-    logging.debug(f"Client Secret: {'[REDACTED]' if client_secret else 'MISSING'}")
-    
+# API Endpoints and Auth (replace with your actual token)
+AUTH_TOKEN = ""  # Replace with your actual token
+BASE_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling"
+SUMMARY_URL = f"{BASE_URL}/summary-view"
+CONFIG_URL = f"{BASE_URL}/search-resource-configurations"
+
+HEADERS = {
+    'Accept': 'application/json;v=1.0',
+    'Authorization': f'Bearer {AUTH_TOKEN}',
+    'Content-Type': 'application/json'
+}
+
+# Function to call Summary View Endpoint
+def get_summary_count(payload: Dict) -> Optional[int]:
     try:
-        response = requests.post(token_url, data=token_data, headers=token_headers, auth=auth, verify=False)
-        logging.debug(f"Token Request Status Code: {response.status_code}")
-        logging.debug(f"Token Request Response Headers: {response.headers}")
-        logging.debug(f"Token Request Response Content: {response.content}")
-        response.raise_for_status()  # Raise exception for 4xx/5xx errors
-        token_info = response.json()
-        token = token_info['access_token']
-        logging.debug(f"Retrieved Token: {token}")
-        logging.debug(f"Full Token Response: {token_info}")
-        return OAuth2Session(client_id, token={'access_token': token, 'token_type': 'Bearer'})
-    except requests.RequestException as e:
-        logging.error(f"Token retrieval failed: {str(e)}")
-        raise
-
-def create_search_parameters(type, conditions):
-    logging.info("Creating search parameters")
-    search_params = {}
-    for condition in conditions:
-        sections = condition[0].split('.')
-        if len(sections) == 2:
-            items_name = f'{sections[0]}Items'
-            if items_name not in search_params:
-                search_params[items_name] = []
-            item = {
-                f'{sections[0]}Name': sections[1],
-                f'{sections[0]}Value': condition[1],
-            }
-            search_params[items_name].append(item)
+        response = requests.post(SUMMARY_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
+        if response.status_code == 200:
+            data = response.json()
+            count = data.get("level1List", [{}])[0].get("level1ResourceCount", 0)
+            logger.info(f"Summary View count retrieved: {count}")
+            return count
         else:
-            search_params[condition[0]] = condition[1]
-    search_params["resourceType"] = type
-    logging.debug(f"Search Parameters: {search_params}")
-    return search_params
+            logger.error(f"Summary View API call failed with status {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Error in Summary View call: {str(e)}")
+        return None
 
-def get_resource(requestor, type, conditions, next_record_key=None):
-    logging.info(f"Fetching resources for type: {type}")
-    search_params = create_search_parameters(type, conditions)
-    body = {
-        "searchParameters": [search_params],
-        "responseFields": [
-            "accountName", "accountResourceId", "amazonResourceName", "asvName", "awsAccountId", "awsRegion",
-            "businessApplicationName", "businessExecutiveFullName", "configurationItemCaptureTimestamp",
-            "engineeringLeadFullName", "environment", "resourceCreationTimestamp", "resourceId", "resourceType",
-            "technologyDivision", "technologyExecutiveFullName", "configuration.origin"
-        ]
-    }
-    request = f"{DX_GATEWAY}/internal-operations/cloud-service/aws-tooling/search-resource-configurations?limit=10000"
-    if next_record_key:
-        request += f'&nextRecordKey={next_record_key}'
-    
-    logging.debug(f"Request URL: {request}")
-    logging.debug(f"Request Body: {json.dumps(body, indent=2)}")
-    print(f"Request URL: {request}")
-    print(f"Request Body: {json.dumps(body, indent=2)}")
-    
-    try:
-        # Log the Authorization header being used by OAuth2Session
-        logging.debug(f"Request Headers (before sending): {requestor.headers}")
-        response = requestor.post(request, json=body, timeout=60)
-        logging.debug(f"Response Status Code: {response.status_code}")
-        logging.debug(f"Response Headers: {response.headers}")
-        logging.debug(f"Response Content: {response.content}")
-        print(f"Response Status Code: {response.status_code}")
-        print(f"Response Content: {response.content}")
-        
-        if response.status_code != 200:
-            logging.error(f"API returned non-200 status: {response.status_code}")
-            raise Exception(f'Bad response from API: {response.status_code}')
-        return response.json()
-    except requests.RequestException as e:
-        logging.error(f"Resource request failed: {str(e)}", exc_info=True)
-        raise
-
-# Alternative function using direct bearer token (for comparison)
-def get_resource_with_bearer_token(url, token, type, conditions, next_record_key=None):
-    logging.info(f"Fetching resources with bearer token for type: {type}")
-    search_params = create_search_parameters(type, conditions)
-    body = {
-        "searchParameters": [search_params],
-        "responseFields": [
-            "accountName", "accountResourceId", "amazonResourceName", "asvName", "awsAccountId", "awsRegion",
-            "businessApplicationName", "businessExecutiveFullName", "configurationItemCaptureTimestamp",
-            "engineeringLeadFullName", "environment", "resourceCreationTimestamp", "resourceId", "resourceType",
-            "technologyDivision", "technologyExecutiveFullName", "configuration.origin"
-        ]
-    }
-    request = f"{url}?limit=10000"
-    if next_record_key:
-        request += f'&nextRecordKey={next_record_key}'
-    
-    headers = {
-        'Accept': 'application/json;v=1.0',
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json'
-    }
-    
-    logging.debug(f"Request URL: {request}")
-    logging.debug(f"Request Headers: {headers}")
-    logging.debug(f"Request Body: {json.dumps(body, indent=2)}")
-    print(f"Request URL: {request}")
-    print(f"Request Headers: {headers}")
-    print(f"Request Body: {json.dumps(body, indent=2)}")
-    
-    try:
-        response = requests.post(request, headers=headers, data=json.dumps(body), verify=False, timeout=60)
-        logging.debug(f"Response Status Code: {response.status_code}")
-        logging.debug(f"Response Headers: {response.headers}")
-        logging.debug(f"Response Content: {response.content}")
-        print(f"Response Status Code: {response.status_code}")
-        print(f"Response Content: {response.content}")
-        
-        if response.status_code != 200:
-            logging.error(f"API returned non-200 status: {response.status_code}")
-            raise Exception(f'Bad response from API: {response.status_code}')
-        return response.json()
-    except requests.RequestException as e:
-        logging.error(f"Resource request failed: {str(e)}", exc_info=True)
-        raise
-
-def main():
-    dx_gateway = DX_GATEWAY  # Ensure this is defined (e.g., "https://api.cloud.capitalone.com")
-    kms_client_id = CLIENT_ID  # Ensure this is defined
-    kms_client_secret = CLIENT_SECRET  # Ensure this is defined
-    bearer_token = ""  # Add your working bearer token here for testing the alternative approach
-
-    logging.info("Starting main execution")
-    logging.debug(f"DX Gateway: {dx_gateway}")
-    logging.debug(f"Client ID: {kms_client_id}")
-    logging.debug(f"Client Secret: {'[REDACTED]' if kms_client_secret else 'MISSING'}")
-    logging.debug(f"Bearer Token: {'[REDACTED]' if bearer_token else 'MISSING'}")
-
-    # Option 1: Use OAuth2Session with client credentials
-    requestor = get_devex_requestor(dx_gateway, kms_client_id, kms_client_secret)
-
-    # Option 2: Use direct bearer token (uncomment to test)
-    # url = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
-    # resource_info = get_resource_with_bearer_token(url, bearer_token, 'AWS::KMS::Key', [['resourceType', 'AWS::KMS::Key']])
-    
+# Function to fetch all resources with pagination
+def fetch_all_resources(payload: Dict) -> Tuple[List[Dict], int]:
+    all_resources = []
     total_count = 0
-    origin_counts = defaultdict(int)
-    unknown_origins = []
+    next_record_key = ""
 
-    # Use this line for Option 1 (OAuth2Session)
-    resource_info = get_resource(requestor, 'AWS::KMS::Key', [['resourceType', 'AWS::KMS::Key']])
-    
-    records = resource_info.get('resourceConfigurations', [])
-    next_record_key = resource_info.get('nextRecordKey', '')
+    while True:
+        try:
+            # Add nextRecordKey to payload if it exists
+            if next_record_key:
+                payload["nextRecordKey"] = next_record_key
 
-    if not records:
-        logging.info('No records found')
-        print('No records found')
-        return
+            response = requests.post(CONFIG_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
+            if response.status_code == 200:
+                data = response.json()
+                resources = data.get("resources", [])
+                all_resources.extend(resources)
+                total_count += len(resources)
+                next_record_key = data.get("nextRecordKey", "")
 
-    while records:
-        total_count += len(records)
-        logging.debug(f"Processing {len(records)} records")
+                logger.info(f"Fetched {len(resources)} resources, total so far: {total_count}")
 
-        for record in records:
-            logging.debug(f"Processing record: {record}")
-            print(f"Processing record: {record}")
-            origin = 'Unknown'
-            if 'configurationList' in record:
-                for config in record['configurationList']:
-                    if config['configurationName'] == 'configuration.origin':
-                        origin = config['configurationValue']
-                        break
-            logging.debug(f"Extracted origin: {origin}")
-            print(f"Extracted origin: {origin}")
-
-            origin_counts[origin] += 1
-
-            if origin == 'Unknown':
-                unknown_origins.append({
-                    'environment': record.get('environment', ''),
-                    'accountResourceId': record.get('accountResourceId', ''),
-                    'resourceType': record.get('resourceType', ''),
-                    'CreationDate': record.get('resourceCreationTimestamp', ''),
-                    'configurationName': 'configuration.origin',
-                    'configurationValue': origin
-                })
-
-        if next_record_key:
-            logging.debug(f"Fetching next page with nextRecordKey: {next_record_key}")
-            # Use appropriate call based on Option 1 or 2
-            resource_info = get_resource(requestor, 'AWS::KMS::Key', [['resourceType', 'AWS::KMS::Key']], next_record_key)
-            # resource_info = get_resource_with_bearer_token(url, bearer_token, 'AWS::KMS::Key', [['resourceType', 'AWS::KMS::Key']], next_record_key)
-            records = resource_info.get('resourceConfigurations', [])
-            next_record_key = resource_info.get('nextRecordKey', '')
-        else:
+                # Break if no more records
+                if not next_record_key or len(resources) == 0:
+                    logger.info("No more resources to fetch")
+                    break
+            else:
+                logger.error(f"Config API call failed with status {response.status_code}: {response.text}")
+                break
+        except Exception as e:
+            logger.error(f"Error fetching resources: {str(e)}")
             break
 
-    # Convert unknown origins to DataFrame
-    df_unknown_origins = pd.DataFrame(unknown_origins)
-    logging.debug(f"Unknown origins DataFrame: {df_unknown_origins.to_dict()}")
+    return all_resources, total_count
 
-    # Store total count and origin counts as variables
-    total_resource_count = total_count
-    origin_value_counts = dict(origin_counts)
+# Function to count resources with a specific configuration value
+def count_config_value(resources: List[Dict], config_key: str, config_value: str) -> Tuple[int, List[Dict]]:
+    matching_resources = []
+    count = 0
 
-    # Calculate the metric
-    numerator = origin_value_counts.get('AWS_KMS', 0)
-    denominator = total_resource_count
-    monitoring_metric = numerator / denominator if denominator != 0 else 0
-    logging.debug(f"Metric calculation - Numerator: {numerator}, Denominator: {denominator}, Result: {monitoring_metric}")
+    for resource in resources:
+        config = resource.get("configuration", {})
+        if config.get(config_key) == config_value:
+            count += 1
+            matching_resources.append(resource)
 
-    # Fetch the threshold value from the dataset (ensure sfOptions and SNOWFLAKE_SOURCE_NAME are defined)
-    threshold_query = """
-        SELECT 
-            MONITORING_METRIC_ID,
-            ALERT_THRESHOLD
-        FROM CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD
-        WHERE MONITORING_METRIC_ID = 'MNTR-1077125-T2'
-    """
-    logging.debug(f"Executing threshold query: {threshold_query}")
+    logger.info(f"Found {count} resources with {config_key} = {config_value}")
+    return count, matching_resources
 
-    threshold_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
-        .options(**sfOptions) \
-        .option("query", threshold_query) \
-        .load()
-    threshold_value = threshold_df.collect()[0]['ALERT_THRESHOLD']
-    logging.debug(f"Threshold value: {threshold_value}")
+# Main script
+def main():
+    # Define payloads (adjust as needed)
+    summary_payload = {
+        "searchParameters": {
+            "aggregations": ["resourceType"],
+            "configurationList": [{"configurationName": "configuration.issuer", "configurationValue": "Amazon"}],
+            "resourceType": "AWS::ACM::Certificate"
+        }
+    }
 
-    # Determine compliance status
-    compliance_status = 'GREEN' if monitoring_metric > threshold_value else 'RED'
-    logging.debug(f"Compliance status: {compliance_status}")
+    config_payload = {
+        "searchParameters": [
+            {"resourceType": "AWS::ACM::Certificate"},
+            {"configurationList": [{"configurationName": "configuration.issuer", "configurationValue": "Amazon"}]}
+        ]
+    }
 
-    # Create the metric DataFrame
-    metric_df = pd.DataFrame([{
-        'DATE': datetime.now().strftime('%Y-%m-%d'),
-        'MONITORING_METRIC_NUMBER': 'MNTR-1077125-T2',
-        'MONITORING_METRIC': monitoring_metric,
-        'COMPLIANCE_STATUS': compliance_status,
-        'NUMERATOR': numerator,
-        'DENOMINATOR': denominator
-    }])
-    logging.debug(f"Metric DataFrame: {metric_df.to_dict()}")
+    # Configuration to search for
+    CONFIG_KEY = "configuration.Origin"
+    CONFIG_VALUE = "AWS_KMS"
 
-    # Print the results
-    print(f'Total count of resources: {total_resource_count}')
-    print('Breakdown of origin values:')
-    for origin, count in origin_value_counts.items():
-        print(f'{origin}: {count}')
-    print("\nResources with unknown origin:")
-    print(df_unknown_origins)
-    print("\nMetric DataFrame:")
-    print(metric_df)
+    # Step 1: Get summary count
+    summary_count = get_summary_count(summary_payload)
+    if summary_count is None:
+        logger.error("Failed to get summary count. Exiting.")
+        return
 
-    logging.info("Main execution completed")
-    return metric_df, df_unknown_origins
+    # Step 2: Fetch all resources from config endpoint
+    all_resources, config_total_count = fetch_all_resources(config_payload)
 
-# Run the main function
+    # Step 3: Count specific configuration value
+    config_value_count, matching_resources = count_config_value(all_resources, CONFIG_KEY, CONFIG_VALUE)
+
+    # Step 4: Create DataFrame for matching resources
+    df = pd.DataFrame(matching_resources)
+    if not df.empty:
+        logger.info(f"DataFrame created with {len(df)} rows")
+        print(df.head())  # Preview the DataFrame
+    else:
+        logger.warning("No matching resources found for DataFrame")
+
+    # Step 5: Compare counts
+    logger.info(f"Summary View Total Count: {summary_count}")
+    logger.info(f"Config Endpoint Total Count: {config_total_count}")
+    logger.info(f"Count of resources with {CONFIG_KEY} = {CONFIG_VALUE}: {config_value_count}")
+
+    if summary_count == config_total_count:
+        logger.info("Counts match between Summary View and Config Endpoint")
+    else:
+        logger.warning(f"Counts mismatch: Summary View ({summary_count}) vs Config Endpoint ({config_total_count})")
+
+    # Optional: Save DataFrame to CSV for inspection
+    if not df.empty:
+        df.to_csv("matching_resources.csv", index=False)
+        logger.info("Saved matching resources to matching_resources.csv")
+
 if __name__ == "__main__":
-    try:
-        # Ensure these are set (e.g., via environment variables or Databricks secrets)
-        DX_GATEWAY = "https://api.cloud.capitalone.com"  # Adjust if different
-        CLIENT_ID = ""  # Your client ID
-        CLIENT_SECRET = ""  # Your client secret
-        metric_df, df_unknown_origins = main()
-    except Exception as e:
-        logging.error(f"Script execution failed: {str(e)}", exc_info=True)
-        raise
-​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+    main()
