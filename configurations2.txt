@@ -1,0 +1,192 @@
+import requests
+import json
+import pandas as pd
+import logging
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+SUMMARY_URL = "your_summary_view_url"
+CONFIG_URL = "your_search_resource_configurations_url"
+HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer your_auth_token"
+}
+
+def get_summary_count(payload: Dict) -> Optional[int]:
+    logger.info(f"Calling Summary View API with payload: {json.dumps(payload, indent=2)}")
+    try:
+        response = requests.post(SUMMARY_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
+        if response.status_code == 200:
+            data = response.json()
+            count = data.get("level1List", [{}])[0].get("level1ResourceCount", 0)
+            logger.info(f"Summary count: {count}")
+            return count
+        else:
+            logger.error(f"Summary API failed: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Exception in Summary API: {str(e)}")
+        return None
+
+def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_only: bool = False) -> Tuple[List[Dict], int]:
+    all_resources = []
+    total_count = 0
+    next_record_key = ""
+    fetch_payload = payload.copy()
+    if limit:
+        fetch_payload["limit"] = limit
+    max_pages = 200  # Prevent infinite loop
+    page_count = 0
+
+    logger.info(f"Fetching resources with payload: {json.dumps(fetch_payload, indent=2)}")
+    while page_count < max_pages:
+        if next_record_key:
+            fetch_payload["nextRecordKey"] = next_record_key
+        try:
+            response = requests.post(CONFIG_URL, headers=HEADERS, data=json.dumps(fetch_payload), verify=False)
+            if response.status_code == 200:
+                data = response.json()
+                resources = data.get("resourceConfigurations", [])
+                all_resources.extend(resources)
+                total_count += len(resources)
+                next_record_key = data.get("nextRecordKey", "")
+                logger.info(f"Page {page_count + 1}: Fetched {len(resources)} resources, total: {total_count}, nextRecordKey: {next_record_key}")
+                page_count += 1
+                if validate_only or not next_record_key or (limit and total_count >= limit):
+                    break
+            else:
+                logger.error(f"Config API failed: {response.status_code} - {response.text}")
+                break
+        except Exception as e:
+            logger.error(f"Exception fetching resources: {str(e)}")
+            break
+    if page_count >= max_pages:
+        logger.error("Max pages reached. Possible pagination loop.")
+    logger.info(f"Final count: {total_count}")
+    return all_resources, total_count
+
+def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    matching_count = 0
+    non_matching_resources = []
+    for resource in resources:
+        config_list = resource.get("configurationList", [])
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
+        if origin_config and origin_config.get("configurationValue") not in [None, ""]:
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource["configuration.origin"] = origin_config.get("configurationValue", "N/A") if origin_config else "N/A"
+            non_matching_resources.append(filtered_resource)
+    logger.info(f"Tier 1: {matching_count} keys with non-empty {config_key}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+
+def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    matching_count = 0
+    non_matching_resources = []
+    for resource in resources:
+        config_list = resource.get("configurationList", [])
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
+        if origin_config and origin_config.get("configurationValue") == config_value:
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource["configuration.origin"] = origin_config.get("configurationValue", "N/A") if origin_config else "N/A"
+            non_matching_resources.append(filtered_resource)
+    logger.info(f"Tier 2: {matching_count} keys with {config_key} = {config_value}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+
+def main():
+    summary_payload_all = {
+        "searchParameters": {
+            "resourceType": "AWS::KMS::Key",
+            "aggregations": ["resourceType"]
+        }
+    }
+    summary_payload_aws_kms = {
+        "searchParameters": {
+            "resourceType": "AWS::KMS::Key",
+            "configurationItems": [{"configurationName": "origin", "configurationValue": "AWS_KMS"}],
+            "aggregations": ["resourceType"]
+        }
+    }
+    config_payload = {
+        "searchParameters": [{"resourceType": "AWS::KMS::Key"}]
+    }
+
+    CONFIG_KEY = "origin"
+    CONFIG_VALUE = "AWS_KMS"
+    DESIRED_FIELDS = ["accountResourceId", "configuration.origin"]
+
+    total_summary_count = get_summary_count(summary_payload_all)
+    aws_kms_summary_count = get_summary_count(summary_payload_aws_kms)
+    if total_summary_count is None or aws_kms_summary_count is None:
+        logger.error("Failed to get summary counts. Exiting.")
+        return
+    logger.info(f"Total KMS keys: {total_summary_count}, AWS_KMS keys: {aws_kms_summary_count}")
+
+    logger.info("Validating origin extraction and filtering on first 1000 resources...")
+    validation_resources, validation_count = fetch_all_resources(config_payload, limit=1000, validate_only=True)
+    if validation_count == 0:
+        logger.error("No resources fetched in validation. Check API or payload.")
+        return
+
+    origin_values = []
+    for i, resource in enumerate(validation_resources[:5]):
+        config_list = resource.get("configurationList", [])
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{CONFIG_KEY}"), None)
+        origin_value = origin_config.get("configurationValue") if origin_config else "N/A"
+        origin_values.append(origin_value)
+        logger.debug(f"Sample resource {i}: origin = {origin_value}")
+
+    tier1_count, tier1_non_compliant_df = filter_tier1_resources(validation_resources, CONFIG_KEY, DESIRED_FIELDS)
+    tier2_count, tier2_non_compliant_df = filter_tier2_resources(validation_resources, CONFIG_KEY, CONFIG_VALUE, DESIRED_FIELDS)
+
+    logger.info(f"Validation: Total={validation_count}, Tier 1={tier1_count}, Tier 2={tier2_count}")
+    origins_found = sum(1 for v in origin_values if v != "N/A")
+    if origins_found == 0:
+        logger.error("No origin fields extracted from sample. Check configurationList structure or key name.")
+        print("Validation Error: No configuration.origin found in first 1000 resources.")
+        print(f"Sample origin values: {origin_values}")
+        return
+    if tier1_count == 0:
+        logger.error("No resources have a non-empty origin. Filtering logic or data issue.")
+        print("Validation Error: Tier 1 count is 0. Expected most keys to have an origin.")
+        print(f"Sample origin values: {origin_values}")
+        return
+    if tier1_count == validation_count and tier2_count == validation_count:
+        logger.warning("All resources match both tiers. Filtering may not be distinguishing values.")
+        print("Validation Warning: No variation in origin values detected.")
+        print(f"Sample origin values: {origin_values}")
+        proceed = input("Continue full execution anyway? (yes/no): ")
+        if proceed.lower() != "yes":
+            logger.info("Exiting due to validation concern.")
+            return
+
+    logger.info("Validation passed or overridden. Fetching all resources...")
+    all_resources, config_total_count = fetch_all_resources(config_payload)
+    if total_summary_count != config_total_count:
+        logger.warning(f"Mismatch: Summary count ({total_summary_count}) != Config count ({config_total_count})")
+
+    tier1_count, tier1_non_compliant_df = filter_tier1_resources(all_resources, CONFIG_KEY, DESIRED_FIELDS)
+    tier2_count, tier2_non_compliant_df = filter_tier2_resources(all_resources, CONFIG_KEY, CONFIG_VALUE, DESIRED_FIELDS)
+
+    print("\nTier 1 Non-compliant Resources (origin missing or empty):")
+    print(tier1_non_compliant_df if not tier1_non_compliant_df.empty else "None found")
+    print("\nTier 2 Non-compliant Resources (origin != AWS_KMS):")
+    print(tier2_non_compliant_df if not tier2_non_compliant_df.empty else "None found")
+    print("\nSummary Report:")
+    print(f"Total KMS Keys: {config_total_count}")
+    print(f"Tier 1 (Non-empty origin): {tier1_count}")
+    print(f"Tier 2 (origin = AWS_KMS): {tier2_count}")
+    print(f"Non-compliant keys (Tier 2): {config_total_count - tier2_count}")
+
+if __name__ == "__main__":
+    main()
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
