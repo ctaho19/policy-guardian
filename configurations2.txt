@@ -1,117 +1,112 @@
+import requests
+import json
+import pandas as pd
+import logging
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+
+# Set up logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# API URLs and Headers (replace with your actual values)
+SUMMARY_URL = "your_summary_view_url"
+CONFIG_URL = "your_search_resource_configurations_url"
+HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer your_auth_token"
+}
+
 def get_summary_count(payload: Dict) -> Optional[int]:
-    logger.info(f"Summary View payload: {json.dumps(payload, indent=2)}")
+    logger.info(f"Calling Summary View API with payload: {json.dumps(payload, indent=2)}")
     try:
         response = requests.post(SUMMARY_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
-        logger.info(f"Status: {response.status_code}")
-        logger.debug(f"Response: {response.text}")
         if response.status_code == 200:
             data = response.json()
             count = data.get("level1List", [{}])[0].get("level1ResourceCount", 0)
             logger.info(f"Summary count: {count}")
             return count
-        logger.error(f"Failed: {response.status_code} - {response.text}")
-        return None
+        else:
+            logger.error(f"Summary API failed: {response.status_code} - {response.text}")
+            return None
     except Exception as e:
-        logger.error(f"Exception: {str(e)}", exc_info=True)
+        logger.error(f"Exception in Summary API: {str(e)}")
         return None
 
-def fetch_all_resources(payload: Dict, summary_count: Optional[int] = None) -> Tuple[List[Dict], int]:
+def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_only: bool = False) -> Tuple[List[Dict], int]:
     all_resources = []
     total_count = 0
     next_record_key = ""
+    fetch_payload = payload.copy()
+    if limit:
+        fetch_payload["limit"] = limit
 
-    logger.info(f"Fetching resources with payload: {json.dumps(payload, indent=2)}")
+    logger.info(f"Fetching resources with payload: {json.dumps(fetch_payload, indent=2)}")
     while True:
+        if next_record_key:
+            fetch_payload["nextRecordKey"] = next_record_key
         try:
-            if next_record_key:
-                payload["nextRecordKey"] = next_record_key
-                logger.debug(f"Next key: {next_record_key}")
-
-            response = requests.post(CONFIG_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
-            logger.info(f"Status: {response.status_code}")
-            logger.debug(f"Response: {response.text}")
+            response = requests.post(CONFIG_URL, headers=HEADERS, data=json.dumps(fetch_payload), verify=False)
             if response.status_code == 200:
                 data = response.json()
                 resources = data.get("resourceConfigurations", [])
-                # Filter to keys with non-empty origin
-                filtered_resources = [
-                    r for r in resources 
-                    if any(c["configurationName"] == "configuration.origin" and c.get("configurationValue") not in [None, ""] for c in r.get("configurationList", []))
-                ]
-                all_resources.extend(filtered_resources)
-                total_count += len(filtered_resources)
+                all_resources.extend(resources)
+                total_count += len(resources)
                 next_record_key = data.get("nextRecordKey", "")
-                
-                logger.info(f"Fetched {len(resources)}, kept {len(filtered_resources)}, Total: {total_count}")
-                if total_count > 0 and summary_count and total_count > summary_count * 1.1:
-                    logger.warning(f"Overcount: {total_count} vs. {summary_count}")
-                    break
-                
-                if not next_record_key or len(resources) == 0:
-                    logger.info("Fetch complete")
+                logger.info(f"Fetched {len(resources)} resources, total: {total_count}")
+                if validate_only or not next_record_key or (limit and total_count >= limit):
                     break
             else:
-                logger.error(f"Failed: {response.status_code} - {response.text}")
+                logger.error(f"Config API failed: {response.status_code} - {response.text}")
                 break
         except Exception as e:
-            logger.error(f"Exception: {str(e)}", exc_info=True)
+            logger.error(f"Exception fetching resources: {str(e)}")
             break
-
     logger.info(f"Final count: {total_count}")
     return all_resources, total_count
-​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
-
 
 def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
-    logger.info(f"Tier 1 filtering for {config_key}")
     matching_count = 0
     non_matching_resources = []
-
-    for i, resource in enumerate(resources):
+    for resource in resources:
         config_list = resource.get("configurationList", [])
-        has_config = any(c["configurationName"] == f"configuration.{config_key}" and c.get("configurationValue") not in [None, ""] for c in config_list)
-        if has_config:
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
+        if origin_config and origin_config.get("configurationValue") not in [None, ""]:
             matching_count += 1
         else:
-            filtered_resource = {field: next((c["configurationValue"] for c in config_list if c["configurationName"] == field), resource.get(field, "N/A")) for field in fields}
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource["configuration.origin"] = origin_config.get("configurationValue", "N/A") if origin_config else "N/A"
             non_matching_resources.append(filtered_resource)
-            logger.debug(f"Non-compliant {i}: {filtered_resource}")
-
-    logger.info(f"Tier 1: {matching_count}/{len(resources)}")
-    df = pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame([{"accountResourceId": "No non-compliant resources found"}], columns=fields)
-    return matching_count, df
+    logger.info(f"Tier 1: {matching_count} keys with non-empty {config_key}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
 
 def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
-    logger.info(f"Tier 2 filtering for {config_key} = {config_value}")
     matching_count = 0
     non_matching_resources = []
-
-    for i, resource in enumerate(resources):
+    for resource in resources:
         config_list = resource.get("configurationList", [])
-        value = next((c["configurationValue"] for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
-        if value == config_value:
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
+        if origin_config and origin_config.get("configurationValue") == config_value:
             matching_count += 1
         else:
-            filtered_resource = {field: next((c["configurationValue"] for c in config_list if c["configurationName"] == field), resource.get(field, "N/A")) for field in fields}
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource["configuration.origin"] = origin_config.get("configurationValue", "N/A") if origin_config else "N/A"
             non_matching_resources.append(filtered_resource)
-            logger.debug(f"Non-compliant {i}: {filtered_resource}")
-
-    logger.info(f"Tier 2: {matching_count}/{len(resources)}")
-    df = pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame([{"accountResourceId": "No non-compliant resources found"}], columns=fields)
-    return matching_count, df
-
-# load_thresholds and get_compliance_status unchanged
-​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
-
-
-
-
+    logger.info(f"Tier 2: {matching_count} keys with {config_key} = {config_value}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
 
 def main():
-    spark = SparkSession.builder.appName("KMSStorageMonitoring").getOrCreate()
-    logger.info("Spark session initialized")
-
-    summary_payload = {
+    summary_payload_all = {
+        "searchParameters": {
+            "resourceType": "AWS::KMS::Key",
+            "aggregations": ["resourceType"]
+        }
+    }
+    summary_payload_aws_kms = {
         "searchParameters": {
             "resourceType": "AWS::KMS::Key",
             "configurationItems": [{"configurationName": "origin", "configurationValue": "AWS_KMS"}],
@@ -125,46 +120,70 @@ def main():
     CONFIG_KEY = "origin"
     CONFIG_VALUE = "AWS_KMS"
     DESIRED_FIELDS = ["accountResourceId", "configuration.origin"]
-    TIER1_METRIC_ID = "MNTR-KMS-STORAGE-T1"
-    TIER2_METRIC_ID = "MNTR-KMS-STORAGE-T2"
 
-    # Step 1: Summary count
-    summary_count = get_summary_count(summary_payload)
-    if summary_count is None:
-        logger.error("Failed summary count. Exiting.")
+    total_summary_count = get_summary_count(summary_payload_all)
+    aws_kms_summary_count = get_summary_count(summary_payload_aws_kms)
+    if total_summary_count is None or aws_kms_summary_count is None:
+        logger.error("Failed to get summary counts. Exiting.")
         return
-    logger.info(f"Summary count: {summary_count}")
+    logger.info(f"Total KMS keys: {total_summary_count}, AWS_KMS keys: {aws_kms_summary_count}")
 
-    # Step 2: Fetch resources
-    all_resources, config_total_count = fetch_all_resources(config_payload, summary_count)
-    logger.info(f"Total resources: {config_total_count}")
-    if config_total_count < summary_count * 0.9 or config_total_count > summary_count * 1.1:
-        logger.warning(f"Mismatch: {config_total_count} vs. {summary_count}")
+    logger.info("Validating origin extraction and filtering on first 1000 resources...")
+    validation_resources, validation_count = fetch_all_resources(config_payload, limit=1000, validate_only=True)
+    if validation_count == 0:
+        logger.error("No resources fetched in validation. Check API or payload.")
+        return
 
-    # Step 3 & 4: Filter
-    tier1_numerator, tier1_df = filter_tier1_resources(all_resources, CONFIG_KEY, DESIRED_FIELDS)
-    tier2_numerator, tier2_df = filter_tier2_resources(all_resources, CONFIG_KEY, CONFIG_VALUE, DESIRED_FIELDS)
-    print("Tier 1 Non-compliant:", tier1_df)
-    print("Tier 2 Non-compliant:", tier2_df)
+    origin_values = []
+    for i, resource in enumerate(validation_resources[:5]):
+        config_list = resource.get("configurationList", [])
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{CONFIG_KEY}"), None)
+        origin_value = origin_config.get("configurationValue") if origin_config else "N/A"
+        origin_values.append(origin_value)
+        logger.debug(f"Sample resource {i}: origin = {origin_value}")
 
-    # Step 5: Metrics
-    thresholds_df = load_thresholds(spark)
-    tier1_threshold = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == TIER1_METRIC_ID].iloc[0]
-    tier2_threshold = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == TIER2_METRIC_ID].iloc[0]
-    
-    tier1_metric = tier1_numerator / config_total_count if config_total_count > 0 else 0
-    tier1_status = get_compliance_status(1 - tier1_metric, tier1_threshold["ALERT_THRESHOLD"], tier1_threshold["WARNING_THRESHOLD"])
-    tier2_denominator = tier1_numerator
-    tier2_metric = tier2_numerator / tier2_denominator if tier2_denominator > 0 else 0
-    tier2_status = get_compliance_status(1 - tier2_metric, tier2_threshold["ALERT_THRESHOLD"], tier2_threshold["WARNING_THRESHOLD"])
+    tier1_count, tier1_non_compliant_df = filter_tier1_resources(validation_resources, CONFIG_KEY, DESIRED_FIELDS)
+    tier2_count, tier2_non_compliant_df = filter_tier2_resources(validation_resources, CONFIG_KEY, CONFIG_VALUE, DESIRED_FIELDS)
 
-    # Step 6: Monitoring DataFrame
-    monitoring_df = pd.DataFrame([
-        {"DATE": datetime.now().strftime("%Y-%m-%d"), "MONITORING_METRIC_NUMBER": TIER1_METRIC_ID, "MONITORING_METRIC": f"{round(tier1_metric * 100, 2)}%", "COMPLIANCE_STATUS": tier1_status, "NUMERATOR": tier1_numerator, "DENOMINATOR": config_total_count},
-        {"DATE": datetime.now().strftime("%Y-%m-%d"), "MONITORING_METRIC_NUMBER": TIER2_METRIC_ID, "MONITORING_METRIC": f"{round(tier2_metric * 100, 2)}%", "COMPLIANCE_STATUS": tier2_status, "NUMERATOR": tier2_numerator, "DENOMINATOR": tier2_denominator}
-    ])
-    print("Monitoring Metrics:", monitoring_df)
+    logger.info(f"Validation: Total={validation_count}, Tier 1={tier1_count}, Tier 2={tier2_count}")
+    origins_found = sum(1 for v in origin_values if v != "N/A")
+    if origins_found == 0:
+        logger.error("No origin fields extracted from sample. Check configurationList structure or key name.")
+        print("Validation Error: No configuration.origin found in first 1000 resources.")
+        print(f"Sample origin values: {origin_values}")
+        return
+    if tier1_count == 0:
+        logger.error("No resources have a non-empty origin. Filtering logic or data issue.")
+        print("Validation Error: Tier 1 count is 0. Expected most keys to have an origin.")
+        print(f"Sample origin values: {origin_values}")
+        return
+    if tier1_count == validation_count and tier2_count == validation_count:
+        logger.warning("All resources match both tiers. Filtering may not be distinguishing values.")
+        print("Validation Warning: No variation in origin values detected.")
+        print(f"Sample origin values: {origin_values}")
+        proceed = input("Continue full execution anyway? (yes/no): ")
+        if proceed.lower() != "yes":
+            logger.info("Exiting due to validation concern.")
+            return
 
-    # Step 7: Log results
-    logger.info(f"Results: Summary={summary_count}, Total={config_total_count}, T1={tier1_numerator}, T2={tier2_numerator}")
+    logger.info("Validation passed or overridden. Fetching all resources...")
+    all_resources, config_total_count = fetch_all_resources(config_payload)
+    if total_summary_count != config_total_count:
+        logger.warning(f"Mismatch: Summary count ({total_summary_count}) != Config count ({config_total_count})")
+
+    tier1_count, tier1_non_compliant_df = filter_tier1_resources(all_resources, CONFIG_KEY, DESIRED_FIELDS)
+    tier2_count, tier2_non_compliant_df = filter_tier2_resources(all_resources, CONFIG_KEY, CONFIG_VALUE, DESIRED_FIELDS)
+
+    print("\nTier 1 Non-compliant Resources (origin missing or empty):")
+    print(tier1_non_compliant_df if not tier1_non_compliant_df.empty else "None found")
+    print("\nTier 2 Non-compliant Resources (origin != AWS_KMS):")
+    print(tier2_non_compliant_df if not tier2_non_compliant_df.empty else "None found")
+    print("\nSummary Report:")
+    print(f"Total KMS Keys: {config_total_count}")
+    print(f"Tier 1 (Non-empty origin): {tier1_count}")
+    print(f"Tier 2 (origin = AWS_KMS): {tier2_count}")
+    print(f"Non-compliant keys (Tier 2): {config_total_count - tier2_count}")
+
+if __name__ == "__main__":
+    main()
 ​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
