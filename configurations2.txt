@@ -41,6 +41,25 @@ def get_summary_count(payload: Dict, timeout: int = 30, max_retries: int = 2) ->
 
 def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 1000) -> Tuple[List[Dict], Dict[str, int]]:
     """
+    Fetch all KMS resources using the pagination API.
+
+    Args:
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
+        page_size: Number of resources to fetch per page
+
+    Returns:
+        Tuple containing list of resources and dictionary of origin value counts
+    """
+    all_resources = []
+    origin_counts = {}
+    # Configure debug logging
+    debug_logger = logging.getLogger('pagination_debug')
+    debug_logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler('pagination_debug.log')
+    fh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    debug_logger.addHandler(fh)
+    """
     Fetch all KMS resources and analyze their origin values.
     
     Args:
@@ -57,6 +76,9 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
     page_count = 0
     unique_resource_ids = set()
     
+    debug_logger.info("=== Starting new fetch_resources call ===")
+    debug_logger.info(f"Parameters: timeout={timeout}, max_retries={max_retries}, page_size={page_size}")
+
     # Get expected total count
     payload = {
         "searchParameters": [{
@@ -65,9 +87,9 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
     }
     expected_count = get_summary_count(payload)
     if expected_count is not None:
-        logger.info(f"Expected total resources from summary: {expected_count}")
+        debug_logger.info(f"Expected total resources from summary: {expected_count}")
     else:
-        logger.warning("Could not get expected count from summary API")
+        debug_logger.warning("Could not get expected count from summary API - pagination validation will be limited")
     
     # Base payload with essential fields
     payload = {
@@ -103,6 +125,7 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
                     payload["nextRecordKey"] = next_record_key
                     logger.debug(f"Using nextRecordKey: {next_record_key}")
                 
+                debug_logger.debug(f"Making API request with payload: {json.dumps(payload, indent=2)}")
                 response = requests.post(
                     CONFIG_URL,
                     headers=HEADERS,
@@ -110,21 +133,39 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
                     verify=False,
                     timeout=timeout
                 )
+                debug_logger.debug(f"Response status code: {response.status_code}")
+                if response.status_code != 200:
+                    debug_logger.debug(f"Response headers: {dict(response.headers)}")
+                    debug_logger.debug(f"Response body: {response.text[:1000]}...")
                 
                 if response.status_code == 200:
                     data = response.json()
                     resources = data.get("resourceConfigurations", [])
                     
-                    # Debug response data
-                    logger.debug(f"Response nextRecordKey: {data.get('nextRecordKey')}")
-                    logger.debug(f"Resources in this page: {len(resources)}")
+                    # Enhanced pagination debugging
+                    debug_logger.info(f"=== Page {page_count + 1} Response Analysis ===")
+                    debug_logger.info(f"Current nextRecordKey: {current_page_key}")
+                    debug_logger.info(f"New nextRecordKey: {data.get('nextRecordKey')}")
+                    debug_logger.info(f"Resources in response: {len(resources)}")
+                    debug_logger.info(f"Total resources so far: {len(all_resources)}")
+                    
+                    if len(resources) == 0:
+                        debug_logger.warning("Received empty resource list in response")
+                        debug_logger.debug(f"Full response structure: {json.dumps(data, indent=2)}")
+                    
+                    # Analyze response structure
+                    debug_logger.debug("Response keys: " + ", ".join(data.keys()))
+                    if resources and len(resources) > 0:
+                        debug_logger.debug(f"Sample resource structure: {json.dumps(resources[0], indent=2)}")
+
                     
                     # Process resources
                     new_resources_count = 0
                     for resource in resources:
                         resource_id = resource.get('resourceId')
                         if resource_id in unique_resource_ids:
-                            logger.warning(f"Duplicate resource ID found: {resource_id} on page {page_count + 1}")
+                            debug_logger.warning(f"Duplicate resource detected - ID: {resource_id}, Page: {page_count + 1}")
+                            debug_logger.debug(f"Duplicate resource data: {json.dumps(resource, indent=2)}")
                             continue
                             
                         unique_resource_ids.add(resource_id)
@@ -150,9 +191,13 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
                     logger.info(f"Page {page_count + 1}: Added {new_resources_count} new resources (total: {len(all_resources)})")
                     logger.info(f"Next record key: {next_record_key}")
                     
-                    # Check if we're stuck on the same page
+                    # Enhanced pagination loop validation
                     if next_record_key == current_page_key:
-                        logger.error(f"Detected same nextRecordKey as current page. Breaking loop to avoid infinite pagination.")
+                        debug_logger.error("=== Pagination Loop Detection ===")
+                        debug_logger.error(f"Detected same nextRecordKey: {next_record_key}")
+                        debug_logger.error(f"Current page: {page_count + 1}, Total resources: {len(all_resources)}")
+                        debug_logger.error(f"Expected total: {expected_count if expected_count is not None else 'Unknown'}")
+                        debug_logger.error("Breaking pagination loop to avoid infinite iteration")
                         next_record_key = ""
                         break
                     
@@ -197,6 +242,14 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
             break
     
     total_time = (datetime.now() - start_time).total_seconds()
+    debug_logger.info("=== Fetch Resources Summary ===")
+    debug_logger.info(f"Total execution time: {total_time:.1f} seconds")
+    debug_logger.info(f"Pages processed: {page_count}")
+    debug_logger.info(f"Total resources: {len(all_resources)}")
+    debug_logger.info(f"Unique resource IDs: {len(unique_resource_ids)}")
+    debug_logger.info(f"Expected resources: {expected_count if expected_count is not None else 'Unknown'}")
+    debug_logger.info(f"Origin distribution: {json.dumps(origin_counts, indent=2)}")
+    
     logger.info(f"Fetch complete: {len(all_resources)} resources in {page_count} pages, {total_time:.1f} seconds")
     
     return all_resources, origin_counts
