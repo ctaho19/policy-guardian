@@ -1,14 +1,137 @@
-def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_only: bool = False, 
-                        timeout: int = 30, max_retries: int = 3) -> Tuple[List[Dict], int]:
-    """
-    Fetch resources with pagination, timeout, and retry logic.
+# API Pipeline for AWS KMS Key Resource Monitoring
+# This script analyzes AWS KMS Key resources and generates compliance metrics based on key origin configurations.
+
+import requests
+import json
+import pandas as pd
+import logging
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from IPython.display import display, HTML
+import sys
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+
+def setup_logging():
+    """Configure logging for both file and console output in Databricks environment."""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        force=True
+    )
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    
+    root_logger = logging.getLogger()
+    root_logger.addHandler(console_handler)
+    
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
+
+# ============================================================================
+# API Configuration
+# ============================================================================
+
+# API endpoints and authentication
+AUTH_TOKEN = "your_auth_token"
+BASE_URL = "your_base_url"
+SUMMARY_URL = f"{BASE_URL}/summary_view"
+CONFIG_URL = f"{BASE_URL}/search_resource_configurations"
+HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer your_auth_token"
+}
+
+# ============================================================================
+# API Interaction Functions
+# ============================================================================
+
+def get_summary_count(payload: Dict, timeout: int = 30, max_retries: int = 2) -> Optional[int]:
+    """Fetch the total count of resources from the summary-view API.
     
     Args:
-        payload: API request payload
-        limit: Optional limit on number of resources to fetch
-        validate_only: If True, only fetch first page for validation
-        timeout: Timeout in seconds for each API request
-        max_retries: Maximum number of retry attempts for failed requests
+        payload: API request payload containing search parameters
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Total resource count or None if request fails
+    """
+    logger.info(f"Calling Summary View API with payload: {json.dumps(payload, indent=2)}")
+    
+    for retry in range(max_retries + 1):
+        try:
+            response = requests.post(
+                SUMMARY_URL, 
+                headers=HEADERS, 
+                data=json.dumps(payload), 
+                verify=False,
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                level1_list = data.get("level1List", [])
+                if not level1_list:
+                    logger.warning("Empty level1List in response")
+                    return 0
+                    
+                count = level1_list[0].get("level1ResourceCount", 0)
+                logger.info(f"Summary count: {count}")
+                return count
+                
+            elif response.status_code == 429:
+                wait_time = min(2 ** retry, 30)
+                logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry {retry+1}/{max_retries}.")
+                time.sleep(wait_time)
+                if retry == max_retries:
+                    logger.error("Max retries reached for rate limiting.")
+                    return None
+            else:
+                logger.error(f"Summary API failed: {response.status_code} - {response.text}")
+                if retry < max_retries:
+                    wait_time = min(2 ** retry, 15)
+                    logger.info(f"Retrying in {wait_time}s... (Attempt {retry+1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    return None
+                    
+        except requests.exceptions.Timeout:
+            logger.warning(f"Request timeout after {timeout}s")
+            if retry < max_retries:
+                wait_time = min(2 ** retry, 15)
+                logger.info(f"Retrying in {wait_time}s... (Attempt {retry+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                logger.error("Max retries reached after timeouts.")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Exception in Summary API: {str(e)}")
+            if retry < max_retries:
+                wait_time = min(2 ** retry, 15)
+                logger.info(f"Retrying in {wait_time}s... (Attempt {retry+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                return None
+    
+    return None
+
+def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_only: bool = False, 
+                        timeout: int = 60, max_retries: int = 3) -> Tuple[List[Dict], int]:
+    """Fetch all resources with pagination support.
+    
+    Args:
+        payload: Search parameters for the API request
+        limit: Maximum number of resources to fetch (None for all)
+        validate_only: If True, only fetch initial resources for validation
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
         
     Returns:
         Tuple of (list of resources, total count)
@@ -16,130 +139,422 @@ def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_onl
     all_resources = []
     total_count = 0
     next_record_key = ""
-    fetch_payload = payload.copy()
-    if limit:
-        fetch_payload["limit"] = min(limit, 1000)  # API typically limits to 1000 per page
-    
-    # Get total count from summary-view API
-    summary_payload = {
-        "searchParameters": payload.get("searchParameters", {}),
-        "aggregations": ["resourceType"]
+    fetch_payload = {
+        "searchParameters": [payload.get("searchParameters", {})],
+        "responseFields": [
+            "accountName", "accountResourceId", "amazonResourceName", "asvName", 
+            "awsAccountId", "awsRegion", "businessApplicationName", 
+            "environment", "resourceCreationTimestamp", "resourceId", 
+            "resourceType", "configurationList",
+            "configuration.origin"
+        ],
+        "limit": min(limit, 10000) if limit else 10000
     }
-    expected_total = get_summary_count(summary_payload, timeout=timeout)
-    if expected_total is None:
-        expected_total = limit if limit else 150000  # Fallback to estimate
     
-    page_size = fetch_payload.get("limit", 1000)
-    if not page_size:  # Ensure page_size is set
-        page_size = 1000
-        fetch_payload["limit"] = page_size
-    
-    max_pages = (expected_total // page_size) + 2  # Add buffer for any new resources
-    
-    logger.info(f"Fetching resources with payload: {json.dumps(fetch_payload, indent=2)}")
-    logger.info(f"Max pages set to {max_pages}, timeout {timeout}s, max retries {max_retries}")
+    display_log(f"Fetching resources with payload: {json.dumps(fetch_payload, indent=2)}")
     
     page_count = 0
     start_time = datetime.now()
     
-    while page_count < max_pages:
-        if next_record_key:
-            fetch_payload["nextRecordKey"] = next_record_key
-        
-        # Retry logic for resilience
+    while True:
+        request_url = f"{CONFIG_URL}?nextRecordKey={next_record_key}" if next_record_key else CONFIG_URL
+            
         for retry in range(max_retries + 1):
             try:
                 logger.info(f"Requesting page {page_count + 1}" + (f" (retry {retry})" if retry > 0 else ""))
                 response = requests.post(
-                    CONFIG_URL, 
-                    headers=HEADERS, 
-                    data=json.dumps(fetch_payload), 
+                    request_url,
+                    headers=HEADERS,
+                    json=fetch_payload,
                     verify=False,
                     timeout=timeout
                 )
                 
                 if response.status_code == 200:
                     data = response.json()
-                    # Log a sample of the response structure
-                    sample_data = json.dumps({k: v[:1] if isinstance(v, list) and len(v) > 0 else v 
-                                             for k, v in data.items()}, indent=2)
-                    logger.debug(f"Sample response structure: {sample_data}")
-                    
                     resources = data.get("resourceConfigurations", [])
-                    # Log structure of first resource and available configuration paths
-                    if resources:
-                        logger.debug(f"Resource structure: {json.dumps(resources[0], indent=2)}")
-                        logger.debug(f"Configuration paths available: {[c['configurationName'] for c in resources[0].get('configurationList', [])]}")
+                    
+                    if page_count == 0:
+                        logger.debug(f"First page response structure: {json.dumps(data, indent=2)}")
+                        if resources:
+                            logger.debug(f"Sample resource structure: {json.dumps(resources[0], indent=2)}")
                     
                     all_resources.extend(resources)
                     total_count += len(resources)
                     next_record_key = data.get("nextRecordKey", "")
                     
-                    # Calculate and log progress metrics
-                    elapsed = (datetime.now() - start_time).total_seconds()
-                    rate = total_count / elapsed if elapsed > 0 else 0
-                    eta_seconds = (expected_total - total_count) / rate if rate > 0 else 0
-                    eta = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m {int(eta_seconds % 60)}s"
-                    
-                    logger.info(
-                        f"Page {page_count + 1}: Fetched {len(resources)} resources, "
-                        f"total: {total_count}, rate: {rate:.1f}/sec, ETA: {eta if rate > 0 else 'N/A'}"
-                    )
+                    logger.info(f"Page {page_count + 1}: Fetched {len(resources)} resources, total: {total_count}")
                     
                     page_count += 1
-                    # Exit conditions
-                    if validate_only or not next_record_key or (limit and total_count >= limit):
-                        logger.info("Reached exit condition for pagination")
-                        break
-                    
-                    # Successfully processed this page, break retry loop
                     break
                     
-                elif response.status_code == 429:  # Rate limiting
-                    wait_time = min(2 ** retry, 60)  # Exponential backoff
-                    logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry.")
-                    time.sleep(wait_time)
+                elif response.status_code != 200:
+                    logger.error(f"API error: {response.status_code} - {response.text}")
                     if retry == max_retries:
-                        logger.error("Max retries reached for rate limiting.")
-                        break
-                else:
-                    logger.error(f"Config API failed: {response.status_code} - {response.text}")
-                    if retry == max_retries:
-                        break
-                    wait_time = min(2 ** retry, 30)
-                    logger.info(f"Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
+                        raise Exception(f"Failed after {max_retries} retries")
+                    time.sleep(min(2 ** retry, 30))
                     
-            except requests.exceptions.Timeout:
-                logger.warning(f"Request timeout after {timeout}s")
-                if retry == max_retries:
-                    logger.error("Max retries reached after timeouts.")
-                    break
-                wait_time = min(2 ** retry, 30)
-                logger.info(f"Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                
             except Exception as e:
-                logger.error(f"Exception fetching resources: {str(e)}")
+                logger.error(f"Request failed: {str(e)}")
                 if retry == max_retries:
-                    break
-                wait_time = min(2 ** retry, 30)
-                logger.info(f"Retrying in {wait_time}s...")
-                time.sleep(wait_time)
+                    raise Exception(f"Failed after {max_retries} retries")
+                time.sleep(min(2 ** retry, 30))
         
-        # If we didn't get a successful response after all retries
-        if retry == max_retries:
-            logger.error("Failed to fetch page after maximum retries. Stopping pagination.")
-            break
-            
-        # If we've exited the retry loop due to validation or reaching the limit
         if validate_only or not next_record_key or (limit and total_count >= limit):
             break
-    
-    if page_count >= max_pages and next_record_key:
-        logger.warning(f"Max pages ({max_pages}) reached but more data available. Continuing pagination.")
-        max_pages = page_count + 1  # Extend max_pages to allow continued fetching
     
     total_time = (datetime.now() - start_time).total_seconds()
     logger.info(f"Fetch complete: {total_count} resources in {page_count} pages, {total_time:.1f} seconds")
     return all_resources, total_count
+
+# ============================================================================
+# Resource Filtering Functions
+# ============================================================================
+
+def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources based on Tier 1 criteria (non-empty configuration value).
+    
+    Args:
+        resources: List of resource configurations to filter
+        config_key: Configuration key to check
+        fields: Fields to include in the non-compliant resources DataFrame
+        
+    Returns:
+        Tuple of (compliant count, DataFrame of non-compliant resources)
+    """
+    matching_count = 0
+    non_matching_resources = []
+    for resource in resources:
+        config_list = resource.get("configurationList", [])
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
+        config_value = origin_config.get("configurationValue") if origin_config else None
+        
+        if config_value and config_value.strip():
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource["configuration.origin"] = config_value if config_value else "N/A"
+            non_matching_resources.append(filtered_resource)
+    
+    logger.info(f"Tier 1: {matching_count} keys with non-empty {config_key}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+
+def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources based on Tier 2 criteria (specific configuration value).
+    
+    Args:
+        resources: List of resource configurations to filter
+        config_key: Configuration key to check
+        config_value: Expected configuration value
+        fields: Fields to include in the non-compliant resources DataFrame
+        
+    Returns:
+        Tuple of (compliant count, DataFrame of non-compliant resources)
+    """
+    matching_count = 0
+    non_matching_resources = []
+    for resource in resources:
+        config_list = resource.get("configurationList", [])
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
+        config_value_actual = origin_config.get("configurationValue", "N/A") if origin_config else "N/A"
+        
+        if origin_config and config_value_actual == config_value:
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource["configuration.origin"] = config_value_actual
+            non_matching_resources.append(filtered_resource)
+    
+    logger.info(f"Tier 2: {matching_count} keys with {config_key} = {config_value}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+
+# ============================================================================
+# Metric Calculation Functions
+# ============================================================================
+
+def load_thresholds(spark: SparkSession) -> pd.DataFrame:
+    """Load compliance thresholds from Snowflake database.
+    
+    Args:
+        spark: Active Spark session
+        
+    Returns:
+        DataFrame containing threshold values for each metric
+    """
+    query = "SELECT MONITORING_METRIC_ID, ALERT_THRESHOLD, WARNING_THRESHOLD FROM CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD WHERE MONITORING_METRIC_ID IN ('MNTR-1077125-T1', 'MNTR-1077125-T2')"
+    logger.info("Loading Tier 1 and Tier 2 thresholds from Snowflake")
+    thresholds_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+       .option("query", query) \
+       .load()
+    threshold_data = thresholds_df.collect()
+    logger.info(f"Threshold data collected: {threshold_data}")
+
+    if threshold_data:
+        data = [
+            {
+                "MONITORING_METRIC_ID": row["MONITORING_METRIC_ID"],
+                "ALERT_THRESHOLD": row["ALERT_THRESHOLD"],
+                "WARNING_THRESHOLD": row["WARNING_THRESHOLD"]
+            } for row in threshold_data
+        ]
+        return pd.DataFrame(data)
+    else:
+        logger.warning("No threshold data found; using fallback values")
+        return pd.DataFrame([
+            {"MONITORING_METRIC_ID": "MNTR-1077125-T1", "ALERT_THRESHOLD": 100, "WARNING_THRESHOLD": "NULL"},
+            {"MONITORING_METRIC_ID": "MNTR-1077125-T2", "ALERT_THRESHOLD": 99, "WARNING_THRESHOLD": "NULL"}
+        ])
+
+def get_compliance_status(metric: float, alert_threshold: float, warning_threshold: float) -> str:
+    """Determine compliance status based on metric value and thresholds.
+    
+    Args:
+        metric: Calculated metric value
+        alert_threshold: Threshold for alert status
+        warning_threshold: Threshold for warning status
+        
+    Returns:
+        Compliance status (RED, YELLOW, or GREEN)
+    """
+    if metric <= alert_threshold:
+        return "RED"
+    elif warning_threshold is not None and metric <= warning_threshold:
+        return "YELLOW"
+    else:
+        return "GREEN"
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def display_log(message: str, level: str = "INFO"):
+    """Display formatted log messages in Databricks notebook.
+    
+    Args:
+        message: Log message to display
+        level: Log level (INFO, WARNING, or ERROR)
+    """
+    if level.upper() == "ERROR":
+        logger.error(message)
+        display(HTML(f'<div style="color: red">{message}</div>'))
+    elif level.upper() == "WARNING":
+        logger.warning(message)
+        display(HTML(f'<div style="color: orange">{message}</div>'))
+    else:
+        logger.info(message)
+        display(HTML(f'<div>{message}</div>'))
+
+# ============================================================================
+# Main Execution Flow
+# ============================================================================
+
+def main():
+    """Main execution flow for AWS KMS Key resource monitoring.
+    
+    This function performs the following steps:
+    1. Initialize configuration and API payloads
+    2. Fetch and validate resource counts
+    3. Sample and validate resource configurations
+    4. Process all resources and calculate metrics
+    5. Generate compliance report
+    """
+    # Initialize Spark session
+    spark = SparkSession.builder.appName("MNTR-1077125").getOrCreate()
+    logger.info("Spark session initialized")
+
+    # Resource monitoring configuration
+    resource_config = {
+        "resource_type": "AWS::KMS::Key",
+        "config_key": "origin",
+        "config_value": "AWS_KMS",
+        "desired_fields": ["accountResourceId", "resourceType", "configuration.origin"],
+        "tier1_metric_id": "MNTR-1077125-T1",
+        "tier2_metric_id": "MNTR-1077125-T2",
+        "validation_limit": 1000,
+        "full_limit": None,
+        "timeout": 60,
+        "max_retries": 3
+    }
+
+    # API request payloads
+    summary_payload_all = {
+        "searchParameters": [{
+            "resourceType": resource_config["resource_type"],
+            "aggregations": ["resourceType"]
+        }]
+    }
+    
+    summary_payload_filtered = {
+        "searchParameters": [{
+            "resourceType": resource_config["resource_type"],
+            "configurationItems": [
+                {"configurationName": resource_config["config_key"], 
+                 "configurationValue": resource_config["config_value"]}
+            ],
+            "aggregations": ["resourceType"]
+        }]
+    }
+    
+    config_payload = {
+        "searchParameters": [{"resourceType": resource_config["resource_type"]}]
+    }
+
+    # Step 1: Get summary counts
+    logger.info("Step 1: Getting summary counts...")
+    total_summary_count = get_summary_count(summary_payload_all)
+    filtered_summary_count = get_summary_count(summary_payload_filtered)
+    
+    if total_summary_count is None or filtered_summary_count is None:
+        logger.error("Failed to get summary counts. Exiting.")
+        return
+        
+    logger.info(f"Total {resource_config['resource_type']} resources: {total_summary_count}, "
+                f"Filtered by {resource_config['config_key']}={resource_config['config_value']}: {filtered_summary_count}")
+
+    # Step 2: Validate with sample resources
+    logger.info(f"Step 2: Validating with first {resource_config['validation_limit']} resources...")
+    validation_resources, validation_count = fetch_all_resources(
+        config_payload, 
+        limit=resource_config['validation_limit'], 
+        validate_only=True,
+        timeout=resource_config['timeout'],
+        max_retries=resource_config['max_retries']
+    )
+    
+    if validation_count == 0:
+        logger.error("No resources fetched in validation. Check API or payload.")
+        return
+
+    # Validate configuration extraction
+    config_values = []
+    for i, resource in enumerate(validation_resources[:5]):
+        config_list = resource.get("configurationList", [])
+        config_item = next(
+            (c for c in config_list if c["configurationName"] == f"configuration.{resource_config['config_key']}"), 
+            None
+        )
+        config_value = config_item.get("configurationValue") if config_item else "N/A"
+        config_values.append(config_value)
+        logger.debug(f"Sample resource {i}: {resource_config['config_key']} = {config_value}")
+
+    # Perform validation filtering
+    tier1_count, tier1_non_compliant_df = filter_tier1_resources(
+        validation_resources, 
+        resource_config["config_key"], 
+        resource_config["desired_fields"]
+    )
+    
+    tier2_count, tier2_non_compliant_df = filter_tier2_resources(
+        validation_resources, 
+        resource_config["config_key"], 
+        resource_config["config_value"], 
+        resource_config["desired_fields"]
+    )
+
+    logger.info(f"Validation: Total={validation_count}, Tier 1={tier1_count}, Tier 2={tier2_count}")
+    
+    # Validation checks
+    configs_found = sum(1 for v in config_values if v != "N/A")
+    if configs_found == 0:
+        logger.error(f"No {resource_config['config_key']} fields found in sample. Check configuration structure.")
+        return
+        
+    if tier1_count == 0:
+        logger.error(f"No resources have a non-empty {resource_config['config_key']}. Check data or filtering logic.")
+        return
+        
+    if tier1_count == validation_count and tier2_count == validation_count:
+        logger.warning("All resources match both tiers. Filtering may not be distinguishing values.")
+        proceed = input("Continue full execution anyway? (yes/no): ")
+        if proceed.lower() != "yes":
+            logger.info("Exiting due to validation concern.")
+            return
+
+    # Step 3: Process all resources
+    logger.info("Step 3: Processing all resources...")
+    all_resources, config_total_count = fetch_all_resources(
+        config_payload, 
+        limit=resource_config['full_limit'],
+        timeout=resource_config['timeout'],
+        max_retries=resource_config['max_retries']
+    )
+    
+    if total_summary_count != config_total_count and resource_config['full_limit'] is None:
+        logger.warning(f"Count mismatch: Summary={total_summary_count}, Actual={config_total_count}")
+
+    # Step 4: Calculate metrics
+    logger.info("Step 4: Calculating compliance metrics...")
+    tier1_numerator, tier1_non_compliant_df = filter_tier1_resources(
+        all_resources, 
+        resource_config["config_key"], 
+        resource_config["desired_fields"]
+    )
+    
+    tier2_numerator, tier2_non_compliant_df = filter_tier2_resources(
+        all_resources, 
+        resource_config["config_key"], 
+        resource_config["config_value"], 
+        resource_config["desired_fields"]
+    )
+
+    # Step 5: Determine compliance status
+    logger.info("Step 5: Determining compliance status...")
+    thresholds_df = load_thresholds(spark)
+    
+    if thresholds_df.empty:
+        logger.warning("Using default thresholds")
+        tier1_threshold = {"ALERT_THRESHOLD": 0.05, "WARNING_THRESHOLD": 0.10}
+        tier2_threshold = {"ALERT_THRESHOLD": 0.05, "WARNING_THRESHOLD": 0.10}
+    else:
+        tier1_threshold = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == resource_config["tier1_metric_id"]].iloc[0]
+        tier2_threshold = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == resource_config["tier2_metric_id"]].iloc[0]
+
+    # Calculate compliance metrics
+    tier1_metric = tier1_numerator / config_total_count if config_total_count > 0 else 0
+    tier1_status = get_compliance_status(
+        1 - tier1_metric, 
+        tier1_threshold["ALERT_THRESHOLD"], 
+        tier1_threshold["WARNING_THRESHOLD"]
+    )
+    
+    tier2_denominator = tier1_numerator
+    tier2_metric = tier2_numerator / tier2_denominator if tier2_denominator > 0 else 0
+    tier2_status = get_compliance_status(
+        1 - tier2_metric, 
+        tier2_threshold["ALERT_THRESHOLD"], 
+        tier2_threshold["WARNING_THRESHOLD"]
+    )
+
+    # Step 6: Generate report
+    logger.info("Step 6: Generating compliance report...")
+    monitoring_df = pd.DataFrame([
+        {
+            "DATE": datetime.now().strftime("%Y-%m-%d"),
+            "MONITORING_METRIC_NUMBER": resource_config["tier1_metric_id"],
+            "MONITORING_METRIC": f"{round(tier1_metric * 100, 2)}%",
+            "COMPLIANCE_STATUS": tier1_status,
+            "NUMERATOR": tier1_numerator,
+            "DENOMINATOR": config_total_count
+        },
+        {
+            "DATE": datetime.now().strftime("%Y-%m-%d"),
+            "MONITORING_METRIC_NUMBER": resource_config["tier2_metric_id"],
+            "MONITORING_METRIC": f"{round(tier2_metric * 100, 2)}%",
+            "COMPLIANCE_STATUS": tier2_status,
+            "NUMERATOR": tier2_numerator,
+            "DENOMINATOR": tier2_denominator
+        }
+    ])
+
+    # Display results
+    print(f"\nTier 1 Non-compliant Resources ({resource_config['config_key']} missing or empty):")
+    print(tier1_non_compliant_df if not tier1_non_compliant_df.empty else "None found")
+    print(f"\nTier 2 Non-compliant Resources ({resource_config['config_key']} != {resource_config['config_value']}):")
+    print(tier2_non_compliant_df if not tier2_non_compliant_df.empty else "None found")
+    print("\nMonitoring Metrics:")
+    print(monitoring_df)
+    logger.info(f"Results: Total={config_total_count}, T1={tier1_numerator}, T2={tier2_numerator}")
+
+if __name__ == "__main__":
+    main()
