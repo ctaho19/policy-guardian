@@ -17,16 +17,17 @@ payload = {
         "resourceType", "configurationList", "configuration.origin"
     ]
 }
-params = {"limit": 10000}  # URL parameter
 next_record_key = ""
 
 # Loop to get all pages
 page = 1
 while True:
-    print(f"Fetching page {page} with nextRecordKey: '{next_record_key or 'None'}'")
-    
+    # Set query parameters (limit and nextRecordKey if present)
+    params = {"limit": 10000}
     if next_record_key:
-        payload["nextRecordKey"] = next_record_key
+        params["nextRecordKey"] = next_record_key
+    
+    print(f"Fetching page {page} with nextRecordKey: '{next_record_key or 'None'}'")
     
     response = requests.post(url, headers=headers, json=payload, params=params, verify=False)
     data = response.json()
