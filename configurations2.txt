@@ -1,7 +1,103 @@
+def fetch_kms_resources(page_size: int = 10000, max_pages: int = 50) -> List[Dict]:
+    """
+    Fetch all AWS KMS Key resources using pagination with nextRecordKey.
+
+    Args:
+        page_size: Number of resources per page (max 10000 per API owners)
+        max_pages: Maximum pages to fetch to prevent infinite loops
+
+    Returns:
+        List of resource configuration dictionaries
+    """
+    all_resources = []
+    unique_resource_ids = set()  # Track duplicates by resourceId
+    next_record_key = ""
+    page_count = 0
+    consecutive_empty_pages = 0
+    max_consecutive_empty = 2
+
+    # Base payload with responseFields
+    payload = {
+        "searchParameters": [{"resourceType": "AWS::KMS::Key"}],
         "responseFields": [
-            "accountName", "accountResourceId", "amazonResourceName", "asvName", 
-            "awsAccountId", "awsRegion", "businessApplicationName", 
-            "environment", "resourceCreationTimestamp", "resourceId", 
-            "resourceType", "configurationList",
-            "configuration.origin"
+            "accountName", "accountResourceId", "amazonResourceName", "asvName",
+            "awsAccountId", "awsRegion", "businessApplicationName",
+            "environment", "resourceCreationTimestamp", "resourceId",
+            "resourceType", "configurationList", "configuration.origin"
         ],
+        "limit": min(page_size, 10000)  # Cap at API max
+    }
+
+    logger.info(f"Starting pagination with page_size={page_size}")
+
+    while True:
+        current_page_key = next_record_key
+        logger.info(f"Fetching page {page_count + 1} with nextRecordKey: '{next_record_key or 'None'}'")
+
+        # Add nextRecordKey to payload if present
+        if next_record_key:
+            payload["nextRecordKey"] = next_record_key
+
+        try:
+            response = requests.post(
+                BASE_URL,
+                headers=HEADERS,
+                json=payload,
+                timeout=60,
+                verify=False
+            )
+            response.raise_for_status()
+            data = response.json()
+            resources = data.get("resourceConfigurations", [])
+            new_next_record_key = data.get("nextRecordKey", "")
+
+            logger.info(f"Page {page_count + 1}: {len(resources)} resources, nextRecordKey: '{new_next_record_key or 'None'}'")
+
+            # Handle empty pages
+            if not resources:
+                consecutive_empty_pages += 1
+                logger.warning(f"Empty page detected ({consecutive_empty_pages}/{max_consecutive_empty})")
+                if consecutive_empty_pages >= max_consecutive_empty:
+                    logger.error("Too many consecutive empty pages, stopping")
+                    break
+            else:
+                consecutive_empty_pages = 0
+
+            # Process resources
+            for resource in resources:
+                resource_id = resource.get("resourceId")
+                if not resource_id:
+                    logger.warning(f"Resource missing resourceId: {resource}")
+                    continue
+                if resource_id in unique_resource_ids:
+                    logger.warning(f"Duplicate resourceId found: {resource_id}")
+                    continue
+                unique_resource_ids.add(resource_id)
+                all_resources.append(resource)
+
+            # Check for duplicate nextRecordKey (keeping for safety)
+            if new_next_record_key == current_page_key and current_page_key:
+                logger.warning(f"Duplicate nextRecordKey '{new_next_record_key}' detected, stopping")
+                break
+
+            # Update nextRecordKey
+            next_record_key = new_next_record_key
+
+            # Exit if no more pages
+            if not next_record_key:
+                logger.info("No nextRecordKey, pagination complete")
+                break
+
+            page_count += 1
+            if page_count >= max_pages:
+                logger.error(f"Reached max pages ({max_pages}), stopping")
+                break
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            break
+
+        time.sleep(0.5)  # Small delay to avoid rate limiting
+
+    logger.info(f"Pagination complete: {len(all_resources)} resources in {page_count + 1} pages")
+    return all_resources
