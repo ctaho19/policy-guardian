@@ -94,10 +94,22 @@ def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_onl
     if limit:
         fetch_payload["limit"] = min(limit, 1000)  # API typically limits to 1000 per page
     
-    # Set reasonable max pages to prevent infinite loops
-    expected_total = limit if limit else 150000  # Estimate based on expected data volume
+    # Get total count from summary to set max pages
+    summary_response = requests.post(
+        CONFIG_URL, 
+        headers=HEADERS, 
+        data=json.dumps(summary_payload_all),
+        verify=False,
+        timeout=timeout
+    )
+    if summary_response.status_code == 200:
+        summary_data = summary_response.json()
+        expected_total = summary_data.get("totalCount", 0)
+    else:
+        expected_total = limit if limit else 150000  # Fallback to estimate
+    
     page_size = fetch_payload.get("limit", 1000)
-    max_pages = (expected_total // page_size) + 2  # Add buffer
+    max_pages = (expected_total // page_size) + 2  # Add buffer for any new resources
     
     logger.info(f"Fetching resources with payload: {json.dumps(fetch_payload, indent=2)}")
     logger.info(f"Max pages set to {max_pages}, timeout {timeout}s, max retries {max_retries}")
@@ -213,11 +225,14 @@ def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[
     for resource in resources:
         config_list = resource.get("configurationList", [])
         origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
-        if origin_config and origin_config.get("configurationValue") not in [None, ""]:
+        config_value = origin_config.get("configurationValue") if origin_config else None
+        
+        # Consider empty string, None, or whitespace-only strings as non-compliant
+        if config_value and config_value.strip():
             matching_count += 1
         else:
             filtered_resource = {field: resource.get(field, "N/A") for field in fields}
-            filtered_resource["configuration.origin"] = origin_config.get("configurationValue", "N/A") if origin_config else "N/A"
+            filtered_resource["configuration.origin"] = config_value if config_value else "N/A"
             non_matching_resources.append(filtered_resource)
     logger.info(f"Tier 1: {matching_count} keys with non-empty {config_key}")
     return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
@@ -229,11 +244,14 @@ def filter_tier2_resources(resources: List[Dict], config_key: str, config_value:
     for resource in resources:
         config_list = resource.get("configurationList", [])
         origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
-        if origin_config and origin_config.get("configurationValue") == config_value:
+        config_value_actual = origin_config.get("configurationValue", "N/A") if origin_config else "N/A"
+        
+        # Strict equality check with the expected value
+        if origin_config and config_value_actual == config_value:
             matching_count += 1
         else:
             filtered_resource = {field: resource.get(field, "N/A") for field in fields}
-            filtered_resource["configuration.origin"] = origin_config.get("configurationValue", "N/A") if origin_config else "N/A"
+            filtered_resource["configuration.origin"] = config_value_actual
             non_matching_resources.append(filtered_resource)
     logger.info(f"Tier 2: {matching_count} keys with {config_key} = {config_value}")
     return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
