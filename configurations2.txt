@@ -1,16 +1,7 @@
-next_record_key = ""  # Start with no key
-while True:
-    payload = {"searchParameters": [{"resourceType": "AWS::KMS::Key"}]}
-    if next_record_key:
-        payload["nextRecordKey"] = next_record_key
-
-    response = requests.post(BASE_URL, headers=HEADERS, json=payload, verify=False)
-    data = response.json()
-    resources = data.get("resourceConfigurations", [])
-    next_record_key = data.get("nextRecordKey", "")
-
-    print(f"Got {len(resources)} resources, nextRecordKey: '{next_record_key}'")
-    if not next_record_key:
-        break
-
-“Hi team, I’m using nextRecordKey like this to get the next page. After page 1, I got the same nextRecordKey again, not a new one. Shouldn’t it give me a new key each time so I can keep going until all resources are fetched? It stopped because it repeated, but I expect it to keep giving new keys until it’s blank (""). Why might I be getting the same key?"
+        "responseFields": [
+            "accountName", "accountResourceId", "amazonResourceName", "asvName", 
+            "awsAccountId", "awsRegion", "businessApplicationName", 
+            "environment", "resourceCreationTimestamp", "resourceId", 
+            "resourceType", "configurationList",
+            "configuration.origin"
+        ],
