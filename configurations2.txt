@@ -1,210 +1,22 @@
-def main():
-    """Main execution flow for AWS KMS Key resource monitoring."""
-    # Initialize Spark session (placeholder for Databricks)
-    try:
-        from pyspark.sql import SparkSession
-        spark = SparkSession.builder.appName("MNTR-1077125").getOrCreate()
-        logger.info("Spark session initialized")
-    except ImportError:
-        logger.warning("Spark not available; running without Spark (local mode)")
-        spark = None
-
-    # Resource monitoring configuration
-    resource_config = {
-        "resource_type": "AWS::KMS::Key",
-        "config_key": "origin",
-        "config_value": "AWS_KMS",
-        "desired_fields": ["accountResourceId", "resourceType", "configuration.origin"],
-        "tier1_metric_id": "MNTR-1077125-T1",
-        "tier2_metric_id": "MNTR-1077125-T2",
-        "validation_limit": 1000,
-        "full_limit": None,
-        "timeout": 60,
-        "max_retries": 3
-    }
-
-    # API request payloads
-    summary_payload_all = {
-        "searchParameters": [{
-            "resourceType": resource_config["resource_type"],
-            "aggregations": ["resourceType"]
-        }]
-    }
-    
-    summary_payload_filtered = {
-        "searchParameters": [{
-            "resourceType": resource_config["resource_type"],
-            "configurationItems": [
-                {"configurationName": resource_config["config_key"], 
-                 "configurationValue": resource_config["config_value"]}
-            ],
-            "aggregations": ["resourceType"]
-        }]
-    }
-    
-    config_payload = {
-        "searchParameters": [{"resourceType": resource_config["resource_type"]}]
-    }
-
-    # Step 1: Get summary counts
-    logger.info("Step 1: Getting summary counts...")
-    total_summary_count = get_summary_count(summary_payload_all)
-    filtered_summary_count = get_summary_count(summary_payload_filtered)
-    
-    if total_summary_count is None or filtered_summary_count is None:
-        logger.error("Failed to get summary counts. Exiting.")
-        return
-        
-    logger.info(f"Total {resource_config['resource_type']} resources: {total_summary_count}, "
-                f"Filtered by {resource_config['config_key']}={resource_config['config_value']}: {filtered_summary_count}")
-
-    # Step 2: Validate with sample resources
-    logger.info(f"Step 2: Validating with first {resource_config['validation_limit']} resources...")
-    validation_resources, validation_count = fetch_all_resources(
-        config_payload, 
-        limit=resource_config['validation_limit'], 
-        validate_only=True,
-        timeout=resource_config['timeout'],
-        max_retries=resource_config['max_retries']
-    )
-    
-    if validation_count == 0:
-        logger.error("No resources fetched in validation. Check API or payload.")
-        return
-
-    # Validate configuration extraction
-    config_values = []
-    for i, resource in enumerate(validation_resources[:5]):
+def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources based on Tier 2 criteria (specific configuration value).
+    Only processes resources that passed Tier 1 criteria (have non-empty configuration value).
+    """
+    matching_count = 0
+    non_matching_resources = []
+    for resource in resources:
         config_list = resource.get("configurationList", [])
-        config_item = next(
-            (c for c in config_list if c["configurationName"] == f"configuration.{resource_config['config_key']}"), 
-            None
-        )
-        config_value = config_item.get("configurationValue") if config_item else "N/A"
-        config_values.append(config_value)
-        logger.debug(f"Sample resource {i}: {resource_config['config_key']} = {config_value}")
-
-    # Perform validation filtering
-    tier1_count, tier1_non_compliant_df = filter_tier1_resources(
-        validation_resources, 
-        resource_config["config_key"], 
-        resource_config["desired_fields"]
-    )
-    
-    tier2_count, tier2_non_compliant_df = filter_tier2_resources(
-        validation_resources, 
-        resource_config["config_key"], 
-        resource_config["config_value"], 
-        resource_config["desired_fields"]
-    )
-
-    logger.info(f"Validation: Total={validation_count}, Tier 1={tier1_count}, Tier 2={tier2_count}")
-    
-    # Validation checks
-    configs_found = sum(1 for v in config_values if v != "N/A")
-    if configs_found == 0:
-        logger.error(f"No {resource_config['config_key']} fields found in sample. Check configuration structure.")
-        return
+        origin_config = next((c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), None)
+        config_value_actual = origin_config.get("configurationValue") if origin_config else None
         
-    if tier1_count == 0:
-        logger.error(f"No resources have a non-empty {resource_config['config_key']}. Check data or filtering logic.")
-        return
-        
-    if tier1_count == validation_count and tier2_count == validation_count:
-        logger.warning("All resources match both tiers. Filtering may not be distinguishing values.")
-        # In Databricks, replace input() with a hardcoded decision or parameter
-        proceed = "yes"  # Adjust as needed for automation
-        if proceed.lower() != "yes":
-            logger.info("Exiting due to validation concern.")
-            return
-
-    # Step 3: Process all resources
-    logger.info("Step 3: Processing all resources...")
-    all_resources, config_total_count = fetch_all_resources(
-        config_payload, 
-        limit=resource_config['full_limit'],
-        timeout=resource_config['timeout'],
-        max_retries=resource_config['max_retries']
-    )
+        # Only process resources that pass Tier 1 criteria (have non-empty configuration value)
+        if config_value_actual and config_value_actual.strip():
+            if config_value_actual == config_value:
+                matching_count += 1
+            else:
+                filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+                filtered_resource["configuration.origin"] = config_value_actual
+                non_matching_resources.append(filtered_resource)
     
-    if total_summary_count != config_total_count and resource_config['full_limit'] is None:
-        logger.warning(f"Count mismatch: Summary={total_summary_count}, Actual={config_total_count}")
-
-    # Step 4: Calculate metrics
-    logger.info("Step 4: Calculating compliance metrics...")
-    tier1_numerator, tier1_non_compliant_df = filter_tier1_resources(
-        all_resources, 
-        resource_config["config_key"], 
-        resource_config["desired_fields"]
-    )
-    
-    tier2_numerator, tier2_non_compliant_df = filter_tier2_resources(
-        all_resources, 
-        resource_config["config_key"], 
-        resource_config["config_value"], 
-        resource_config["desired_fields"]
-    )
-
-    # Step 5: Determine compliance status
-    logger.info("Step 5: Determining compliance status...")
-    thresholds_df = load_thresholds(spark)
-    
-    if thresholds_df.empty:
-        logger.warning("Using default thresholds")
-        tier1_threshold = {"ALERT_THRESHOLD": 0.05, "WARNING_THRESHOLD": 0.10}
-        tier2_threshold = {"ALERT_THRESHOLD": 0.05, "WARNING_THRESHOLD": 0.10}
-    else:
-        tier1_threshold = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == resource_config["tier1_metric_id"]].iloc[0]
-        tier2_threshold = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == resource_config["tier2_metric_id"]].iloc[0]
-
-    # Calculate compliance metrics
-    tier1_metric = tier1_numerator / config_total_count if config_total_count > 0 else 0
-    tier1_status = get_compliance_status(
-        1 - tier1_metric, 
-        tier1_threshold["ALERT_THRESHOLD"], 
-        tier1_threshold["WARNING_THRESHOLD"]
-    )
-    
-    tier2_denominator = tier1_numerator
-    tier2_metric = tier2_numerator / tier2_denominator if tier2_denominator > 0 else 0
-    tier2_status = get_compliance_status(
-        1 - tier2_metric, 
-        tier2_threshold["ALERT_THRESHOLD"], 
-        tier2_threshold["WARNING_THRESHOLD"]
-    )
-
-    # Step 6: Generate report
-    logger.info("Step 6: Generating compliance report...")
-    monitoring_df = pd.DataFrame([
-        {
-            "DATE": datetime.now().strftime("%Y-%m-%d"),
-            "MONITORING_METRIC_NUMBER": resource_config["tier1_metric_id"],
-            "MONITORING_METRIC": f"{(tier1_metric * 100):.4f}%",
-            "COMPLIANCE_STATUS": tier1_status,
-            "NUMERATOR": tier1_numerator,
-            "DENOMINATOR": config_total_count
-        },
-        {
-            "DATE": datetime.now().strftime("%Y-%m-%d"),
-            "MONITORING_METRIC_NUMBER": resource_config["tier2_metric_id"],
-            "MONITORING_METRIC": f"{(tier2_metric * 100):.4f}%",
-            "COMPLIANCE_STATUS": tier2_status,
-            "NUMERATOR": tier2_numerator,
-            "DENOMINATOR": tier2_denominator
-        }
-    ])
-
-    # Create clean dataframes for output
-    tier1_output_df = tier1_non_compliant_df if not tier1_non_compliant_df.empty else pd.DataFrame({"Status": ["No Non-Compliant Resources"]})
-    tier2_output_df = tier2_non_compliant_df if not tier2_non_compliant_df.empty else pd.DataFrame({"Status": ["No Non-Compliant Resources"]})
-    
-    # Display clean results without log statements
-    display(HTML("<h3>Monitoring Metrics</h3>"))
-    display(monitoring_df)
-    display(HTML("<h3>Tier 1 Non-compliant Resources</h3>"))
-    display(tier1_output_df)
-    display(HTML("<h3>Tier 2 Non-compliant Resources</h3>"))
-    display(tier2_output_df)
-
-if __name__ == "__main__":
-    main()
+    logger.info(f"Tier 2: {matching_count} keys with {config_key} = {config_value}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
