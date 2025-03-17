@@ -1,19 +1,76 @@
-def get_summary_count(payload: Dict) -> Optional[int]:
-    """Fetch the total count of KMS keys from the summary-view API."""
+def get_summary_count(payload: Dict, timeout: int = 30, max_retries: int = 2) -> Optional[int]:
+    """
+    Fetch the total count of resources from the summary-view API.
+    
+    Args:
+        payload: API request payload
+        timeout: Timeout in seconds for the API request
+        max_retries: Maximum number of retry attempts for failed requests
+        
+    Returns:
+        Resource count or None if the request failed
+    """
     logger.info(f"Calling Summary View API with payload: {json.dumps(payload, indent=2)}")
-    try:
-        response = requests.post(SUMMARY_URL, headers=HEADERS, data=json.dumps(payload), verify=False)
-        if response.status_code == 200:
-            data = response.json()
-            count = data.get("level1List", [{}])[0].get("level1ResourceCount", 0)
-            logger.info(f"Summary count: {count}")
-            return count
-        else:
-            logger.error(f"Summary API failed: {response.status_code} - {response.text}")
-            return None
-    except Exception as e:
-        logger.error(f"Exception in Summary API: {str(e)}")
-        return None
+    
+    for retry in range(max_retries + 1):
+        try:
+            response = requests.post(
+                SUMMARY_URL, 
+                headers=HEADERS, 
+                data=json.dumps(payload), 
+                verify=False,
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                # Extract count with better error handling
+                level1_list = data.get("level1List", [])
+                if not level1_list:
+                    logger.warning("Empty level1List in response")
+                    return 0
+                    
+                count = level1_list[0].get("level1ResourceCount", 0)
+                logger.info(f"Summary count: {count}")
+                return count
+                
+            elif response.status_code == 429:  # Rate limiting
+                wait_time = min(2 ** retry, 30)  # Exponential backoff
+                logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry {retry+1}/{max_retries}.")
+                time.sleep(wait_time)
+                if retry == max_retries:
+                    logger.error("Max retries reached for rate limiting.")
+                    return None
+            else:
+                logger.error(f"Summary API failed: {response.status_code} - {response.text}")
+                if retry < max_retries:
+                    wait_time = min(2 ** retry, 15)
+                    logger.info(f"Retrying in {wait_time}s... (Attempt {retry+1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    return None
+                    
+        except requests.exceptions.Timeout:
+            logger.warning(f"Request timeout after {timeout}s")
+            if retry < max_retries:
+                wait_time = min(2 ** retry, 15)
+                logger.info(f"Retrying in {wait_time}s... (Attempt {retry+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                logger.error("Max retries reached after timeouts.")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Exception in Summary API: {str(e)}")
+            if retry < max_retries:
+                wait_time = min(2 ** retry, 15)
+                logger.info(f"Retrying in {wait_time}s... (Attempt {retry+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                return None
+    
+    # Should not reach here, but just in case
+    return None
 
 def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_only: bool = False, 
                         timeout: int = 30, max_retries: int = 3) -> Tuple[List[Dict], int]:
@@ -66,7 +123,17 @@ def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_onl
                 
                 if response.status_code == 200:
                     data = response.json()
+                    # Log a sample of the response structure
+                    sample_data = json.dumps({k: v[:1] if isinstance(v, list) and len(v) > 0 else v 
+                                             for k, v in data.items()}, indent=2)
+                    logger.debug(f"Sample response structure: {sample_data}")
+                    
                     resources = data.get("resourceConfigurations", [])
+                    # Log structure of first resource and available configuration paths
+                    if resources:
+                        logger.debug(f"Resource structure: {json.dumps(resources[0], indent=2)}")
+                        logger.debug(f"Configuration paths available: {[c['configurationName'] for c in resources[0].get('configurationList', [])]}")
+                    
                     all_resources.extend(resources)
                     total_count += len(resources)
                     next_record_key = data.get("nextRecordKey", "")
@@ -414,4 +481,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
