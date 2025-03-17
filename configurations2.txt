@@ -19,14 +19,55 @@ HEADERS = {
     "Authorization": "Bearer your_auth_token"
 }
 
-def fetch_resources(limit: int = 100, timeout: int = 60, max_retries: int = 3) -> Tuple[List[Dict], Dict[str, int]]:
+def get_summary_count(payload: Dict, timeout: int = 30, max_retries: int = 2) -> Optional[int]:
+    """Fetch the total count of resources from the summary-view API."""
+    logger.info("Fetching summary count...")
+    
+    for retry in range(max_retries + 1):
+        try:
+            response = requests.post(
+                CONFIG_URL.replace('search_resource_configurations', 'summary_view'),
+                headers=HEADERS,
+                json=payload,
+                verify=False,
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                level1_list = data.get("level1List", [])
+                if not level1_list:
+                    logger.warning("Empty level1List in response")
+                    return 0
+                    
+                count = level1_list[0].get("level1ResourceCount", 0)
+                logger.info(f"Summary count: {count}")
+                return count
+            
+            elif response.status_code == 429:
+                wait_time = min(2 ** retry, 30)
+                logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry {retry+1}/{max_retries}.")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Summary API failed: {response.status_code} - {response.text}")
+                if retry < max_retries:
+                    time.sleep(min(2 ** retry, 15))
+                
+        except Exception as e:
+            logger.error(f"Summary API request failed: {str(e)}")
+            if retry < max_retries:
+                time.sleep(min(2 ** retry, 15))
+    
+    return None
+
+def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 1000) -> Tuple[List[Dict], Dict[str, int]]:
     """
-    Fetch KMS resources and analyze their origin values.
+    Fetch all KMS resources and analyze their origin values.
     
     Args:
-        limit: Maximum number of resources to fetch
         timeout: Request timeout in seconds
         max_retries: Maximum number of retry attempts
+        page_size: Number of resources to fetch per page
         
     Returns:
         Tuple containing list of resources and dictionary of origin value counts
@@ -35,6 +76,19 @@ def fetch_resources(limit: int = 100, timeout: int = 60, max_retries: int = 3) -
     origin_counts = {}
     next_record_key = ""
     page_count = 0
+    unique_resource_ids = set()
+    
+    # Get expected total count
+    payload = {
+        "searchParameters": [{
+            "resourceType": "AWS::KMS::Key"
+        }]
+    }
+    expected_count = get_summary_count(payload)
+    if expected_count is not None:
+        logger.info(f"Expected total resources from summary: {expected_count}")
+    else:
+        logger.warning("Could not get expected count from summary API")
     
     # Base payload with essential fields
     payload = {
@@ -52,12 +106,12 @@ def fetch_resources(limit: int = 100, timeout: int = 60, max_retries: int = 3) -
             "resourceType",
             "configuration.origin"
         ],
-        "limit": min(limit, 100)  # Ensure we don't exceed desired limit
+        "limit": page_size
     }
     
     start_time = datetime.now()
     
-    while len(all_resources) < limit:
+    while True:  # Continue until no more pages
         for retry in range(max_retries + 1):
             try:
                 logger.info(f"Requesting page {page_count + 1}" + (f" (retry {retry})" if retry > 0 else ""))
@@ -86,6 +140,13 @@ def fetch_resources(limit: int = 100, timeout: int = 60, max_retries: int = 3) -
                     
                     # Process resources
                     for resource in resources:
+                        resource_id = resource.get('resourceId')
+                        if resource_id in unique_resource_ids:
+                            logger.warning(f"Duplicate resource ID found: {resource_id} on page {page_count + 1}")
+                            continue
+                            
+                        unique_resource_ids.add(resource_id)
+                        
                         # Extract origin value
                         origin = "Unknown"
                         config_list = resource.get("configurationList", [])
@@ -100,6 +161,12 @@ def fetch_resources(limit: int = 100, timeout: int = 60, max_retries: int = 3) -
                         # Store resource with origin
                         resource["extracted_origin"] = origin
                         all_resources.append(resource)
+                        
+                    # Debug pagination
+                    logger.info(f"Next record key: {next_record_key}")
+                    if expected_count and len(all_resources) > expected_count:
+                        logger.error(f"Fetched more resources ({len(all_resources)}) than expected ({expected_count})")
+                        break
                     
                     # Update pagination info
                     next_record_key = data.get("nextRecordKey", "")
@@ -137,7 +204,7 @@ def fetch_resources(limit: int = 100, timeout: int = 60, max_retries: int = 3) -
                     break
         
         # Exit if no more pages or we've reached the limit
-        if not next_record_key or len(all_resources) >= limit:
+        if not next_record_key:
             break
     
     total_time = (datetime.now() - start_time).total_seconds()
@@ -146,14 +213,16 @@ def fetch_resources(limit: int = 100, timeout: int = 60, max_retries: int = 3) -
     return all_resources, origin_counts
 
 def main():
-    # Fetch resources and analyze origins
-    resources, origin_counts = fetch_resources(limit=100)
+    # Fetch all resources and analyze origins
+    resources, origin_counts = fetch_resources()
     
-    # Print summary
+    # Print summary with total count
+    print(f"\nTotal Resources Found: {len(resources)}")
     print("\nOrigin Value Distribution:")
     print("-" * 30)
     for origin, count in origin_counts.items():
-        print(f"{origin}: {count}")
+        percentage = (count / len(resources)) * 100
+        print(f"{origin}: {count} ({percentage:.1f}%)")
     
     # Print sample resources
     print("\nSample Resources (first 5):")
