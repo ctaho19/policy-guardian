@@ -1,69 +1,16 @@
-def fetch_kms_resources(page_size: int = DEFAULT_PAGE_SIZE, max_pages: int = 50) -> List[Dict]:
-    all_resources = []
-    unique_resource_ids = set()
-    next_record_key = ""
-    page_count = 0
-    consecutive_empty_pages = 0
-    max_consecutive_empty = 2
-
+next_record_key = ""  # Start with no key
+while True:
     payload = {"searchParameters": [{"resourceType": "AWS::KMS::Key"}]}
-    if page_size != DEFAULT_PAGE_SIZE:
-        payload["limit"] = min(page_size, DEFAULT_PAGE_SIZE)
+    if next_record_key:
+        payload["nextRecordKey"] = next_record_key
 
-    logger.info(f"Starting pagination with page_size={page_size}")
+    response = requests.post(BASE_URL, headers=HEADERS, json=payload, verify=False)
+    data = response.json()
+    resources = data.get("resourceConfigurations", [])
+    next_record_key = data.get("nextRecordKey", "")
 
-    while True:
-        logger.info(f"Fetching page {page_count + 1} with nextRecordKey: '{next_record_key or 'None'}'")
+    print(f"Got {len(resources)} resources, nextRecordKey: '{next_record_key}'")
+    if not next_record_key:
+        break
 
-        if next_record_key:
-            payload["nextRecordKey"] = next_record_key
-
-        try:
-            response = requests.post(BASE_URL, headers=HEADERS, json=payload, timeout=60, verify=False)
-            response.raise_for_status()
-            data = response.json()
-            resources = data.get("resourceConfigurations", [])
-            new_next_record_key = data.get("nextRecordKey", "")
-
-            logger.info(f"Page {page_count + 1}: {len(resources)} resources, nextRecordKey: '{new_next_record_key or 'None'}'")
-
-            if not resources:
-                consecutive_empty_pages += 1
-                logger.warning(f"Empty page detected ({consecutive_empty_pages}/{max_consecutive_empty})")
-                if consecutive_empty_pages >= max_consecutive_empty:
-                    logger.error("Too many consecutive empty pages, stopping")
-                    break
-            else:
-                consecutive_empty_pages = 0
-
-            for resource in resources:
-                resource_id = resource.get("resourceId")
-                if not resource_id:
-                    logger.warning(f"Resource missing resourceId: {resource}")
-                    continue
-                if resource_id in unique_resource_ids:
-                    logger.warning(f"Duplicate resourceId found: {resource_id}")
-                    continue
-                unique_resource_ids.add(resource_id)
-                all_resources.append(resource)
-
-            # Update nextRecordKey (no duplicate check)
-            next_record_key = new_next_record_key
-
-            if not next_record_key:
-                logger.info("No nextRecordKey, pagination complete")
-                break
-
-            page_count += 1
-            if page_count >= max_pages:
-                logger.error(f"Reached max pages ({max_pages}), stopping")
-                break
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            break
-
-        time.sleep(0.5)
-
-    logger.info(f"Pagination complete: {len(all_resources)} resources in {page_count + 1} pages")
-    return all_resources
+“Hi team, I’m using nextRecordKey like this to get the next page. After page 1, I got the same nextRecordKey again, not a new one. Shouldn’t it give me a new key each time so I can keep going until all resources are fetched? It stopped because it repeated, but I expect it to keep giving new keys until it’s blank (""). Why might I be getting the same key?"
