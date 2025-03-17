@@ -1,82 +1,32 @@
-
-import requests
-import logging
-import time
-from typing import Dict, List, Optional
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Console output
-        logging.FileHandler('kms_pagination.log')  # File output
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# API Configuration
-BASE_URL = "https://api.cloud.[company].com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
-HEADERS = {
-    "Accept": "application/json;v=1.0",
-    "Authorization": "Bearer {token}",  # Replace {token} with your actual token
-    "Content-Type": "application/json"
-}
-DEFAULT_PAGE_SIZE = 1000  # API default limit when not specified
-
 def fetch_kms_resources(page_size: int = DEFAULT_PAGE_SIZE, max_pages: int = 50) -> List[Dict]:
-    """
-    Fetch all AWS KMS Key resources using pagination with nextRecordKey.
-
-    Args:
-        page_size: Number of resources per page (max 1000)
-        max_pages: Maximum pages to fetch to prevent infinite loops
-
-    Returns:
-        List of resource configuration dictionaries
-    """
     all_resources = []
-    unique_resource_ids = set()  # Track duplicates by resourceId
+    unique_resource_ids = set()
     next_record_key = ""
     page_count = 0
     consecutive_empty_pages = 0
     max_consecutive_empty = 2
 
-    # Base payload
-    payload = {
-        "searchParameters": [{"resourceType": "AWS::KMS::Key"}]
-    }
-    if page_size != DEFAULT_PAGE_SIZE:  # Only include limit if not default
+    payload = {"searchParameters": [{"resourceType": "AWS::KMS::Key"}]}
+    if page_size != DEFAULT_PAGE_SIZE:
         payload["limit"] = min(page_size, DEFAULT_PAGE_SIZE)
 
     logger.info(f"Starting pagination with page_size={page_size}")
 
     while True:
-        current_page_key = next_record_key
         logger.info(f"Fetching page {page_count + 1} with nextRecordKey: '{next_record_key or 'None'}'")
 
-        # Add nextRecordKey to payload if present
         if next_record_key:
             payload["nextRecordKey"] = next_record_key
 
         try:
-            response = requests.post(
-                BASE_URL,
-                headers=HEADERS,
-                json=payload,
-                timeout=60,  # 60-second timeout
-                verify=True  # Set to False if SSL verification is an issue
-            )
-            response.raise_for_status()  # Raise exception for 4xx/5xx status codes
-
+            response = requests.post(BASE_URL, headers=HEADERS, json=payload, timeout=60, verify=False)
+            response.raise_for_status()
             data = response.json()
             resources = data.get("resourceConfigurations", [])
             new_next_record_key = data.get("nextRecordKey", "")
 
-            # Log page details
             logger.info(f"Page {page_count + 1}: {len(resources)} resources, nextRecordKey: '{new_next_record_key or 'None'}'")
 
-            # Handle empty pages
             if not resources:
                 consecutive_empty_pages += 1
                 logger.warning(f"Empty page detected ({consecutive_empty_pages}/{max_consecutive_empty})")
@@ -86,7 +36,6 @@ def fetch_kms_resources(page_size: int = DEFAULT_PAGE_SIZE, max_pages: int = 50)
             else:
                 consecutive_empty_pages = 0
 
-            # Process resources
             for resource in resources:
                 resource_id = resource.get("resourceId")
                 if not resource_id:
@@ -98,15 +47,9 @@ def fetch_kms_resources(page_size: int = DEFAULT_PAGE_SIZE, max_pages: int = 50)
                 unique_resource_ids.add(resource_id)
                 all_resources.append(resource)
 
-            # Check for duplicate nextRecordKey
-            if new_next_record_key == current_page_key and current_page_key:
-                logger.warning(f"Duplicate nextRecordKey '{new_next_record_key}' detected, stopping")
-                break
-
-            # Update nextRecordKey
+            # Update nextRecordKey (no duplicate check)
             next_record_key = new_next_record_key
 
-            # Exit conditions
             if not next_record_key:
                 logger.info("No nextRecordKey, pagination complete")
                 break
@@ -118,38 +61,9 @@ def fetch_kms_resources(page_size: int = DEFAULT_PAGE_SIZE, max_pages: int = 50)
 
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed: {e}")
-            break  # Stop on failure; could add retries if needed
+            break
 
-        # Small delay to avoid overwhelming the API
         time.sleep(0.5)
 
     logger.info(f"Pagination complete: {len(all_resources)} resources in {page_count + 1} pages")
     return all_resources
-
-def main():
-    """Run the pagination and display a summary."""
-    # Fetch resources (use default 1000 per page)
-    resources = fetch_kms_resources(page_size=1000)
-
-    # Summary
-    print("\nPagination Summary:")
-    print(f"Total Resources: {len(resources)}")
-    if resources:
-        print("\nSample Resource (first one):")
-        sample = resources[0]
-        print(f"Resource ID: {sample.get('resourceId')}")
-        print(f"AWS Account ID: {sample.get('awsAccountId')}")
-        print(f"Region: {sample.get('awsRegion')}")
-        print(f"Creation Timestamp: {sample.get('resourceCreationTimestamp')}")
-        # Extract origin from configurationList
-        origin = "Unknown"
-        for config in sample.get("configurationList", []):
-            if config.get("configurationName") == "configuration.origin":
-                origin = config.get("configurationValue")
-                break
-        print(f"Origin: {origin}")
-
-if __name__ == "__main__":
-    # Replace the token in HEADERS before running
-    HEADERS["Authorization"] = "Bearer your_actual_token_here"
-    main()
