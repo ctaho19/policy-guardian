@@ -1,3 +1,44 @@
+def get_summary_count(payload: Dict, timeout: int = 30, max_retries: int = 2) -> Optional[int]:
+    """Fetch the total count of resources from the summary-view API."""
+    logger.info("Fetching summary count...")
+    
+    for retry in range(max_retries + 1):
+        try:
+            response = requests.post(
+                CONFIG_URL.replace('search_resource_configurations', 'summary_view'),
+                headers=HEADERS,
+                json=payload,
+                verify=False,
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                level1_list = data.get("level1List", [])
+                if not level1_list:
+                    logger.warning("Empty level1List in response")
+                    return 0
+                    
+                count = level1_list[0].get("level1ResourceCount", 0)
+                logger.info(f"Summary count: {count}")
+                return count
+            
+            elif response.status_code == 429:
+                wait_time = min(2 ** retry, 30)
+                logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry {retry+1}/{max_retries}.")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Summary API failed: {response.status_code} - {response.text}")
+                if retry < max_retries:
+                    time.sleep(min(2 ** retry, 15))
+                
+        except Exception as e:
+            logger.error(f"Summary API request failed: {str(e)}")
+            if retry < max_retries:
+                time.sleep(min(2 ** retry, 15))
+    
+    return None
+
 def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 1000) -> Tuple[List[Dict], Dict[str, int]]:
     """
     Fetch all KMS resources and analyze their origin values.
@@ -50,6 +91,9 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
     start_time = datetime.now()
     
     while True:  # Continue until no more pages
+        current_page_key = next_record_key  # Store current key for comparison
+        logger.info(f"Processing page {page_count + 1} with record key: {current_page_key}")
+        
         for retry in range(max_retries + 1):
             try:
                 logger.info(f"Requesting page {page_count + 1}" + (f" (retry {retry})" if retry > 0 else ""))
@@ -57,6 +101,7 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
                 # Add nextRecordKey if we have one
                 if next_record_key:
                     payload["nextRecordKey"] = next_record_key
+                    logger.debug(f"Using nextRecordKey: {next_record_key}")
                 
                 response = requests.post(
                     CONFIG_URL,
@@ -70,13 +115,12 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
                     data = response.json()
                     resources = data.get("resourceConfigurations", [])
                     
-                    # Debug first page response
-                    if page_count == 0:
-                        logger.debug(f"First page response structure:\n{json.dumps(data, indent=2)}")
-                        if resources:
-                            logger.debug(f"Sample resource structure:\n{json.dumps(resources[0], indent=2)}")
+                    # Debug response data
+                    logger.debug(f"Response nextRecordKey: {data.get('nextRecordKey')}")
+                    logger.debug(f"Resources in this page: {len(resources)}")
                     
                     # Process resources
+                    new_resources_count = 0
                     for resource in resources:
                         resource_id = resource.get('resourceId')
                         if resource_id in unique_resource_ids:
@@ -84,6 +128,7 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
                             continue
                             
                         unique_resource_ids.add(resource_id)
+                        new_resources_count += 1
                         
                         # Extract origin value
                         origin = "Unknown"
@@ -99,22 +144,22 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
                         # Store resource with origin
                         resource["extracted_origin"] = origin
                         all_resources.append(resource)
-                        
+                    
                     # Update pagination info and validate
                     next_record_key = data.get("nextRecordKey", "")
-                    logger.info(f"Page {page_count + 1}: Fetched {len(resources)} resources (total: {len(all_resources)})")
+                    logger.info(f"Page {page_count + 1}: Added {new_resources_count} new resources (total: {len(all_resources)})")
                     logger.info(f"Next record key: {next_record_key}")
+                    
+                    # Check if we're stuck on the same page
+                    if next_record_key == current_page_key:
+                        logger.error(f"Detected same nextRecordKey as current page. Breaking loop to avoid infinite pagination.")
+                        next_record_key = ""
+                        break
                     
                     # Validate against expected count
                     if expected_count and len(all_resources) >= expected_count:
                         logger.info(f"Reached expected count of {expected_count} resources")
                         break
-                    
-                    # Update payload with next record key
-                    if next_record_key:
-                        payload["nextRecordKey"] = next_record_key
-                    else:
-                        logger.info("No more pages to fetch")
                     
                     page_count += 1
                     break
