@@ -1,65 +1,3 @@
-import requests
-import json
-import logging
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# API Configuration
-BASE_URL = "your_base_url"
-CONFIG_URL = f"{BASE_URL}/search_resource_configurations"
-HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": "Bearer your_auth_token"
-}
-
-def get_summary_count(payload: Dict, timeout: int = 30, max_retries: int = 2) -> Optional[int]:
-    """Fetch the total count of resources from the summary-view API."""
-    logger.info("Fetching summary count...")
-    
-    for retry in range(max_retries + 1):
-        try:
-            response = requests.post(
-                CONFIG_URL.replace('search_resource_configurations', 'summary_view'),
-                headers=HEADERS,
-                json=payload,
-                verify=False,
-                timeout=timeout
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                level1_list = data.get("level1List", [])
-                if not level1_list:
-                    logger.warning("Empty level1List in response")
-                    return 0
-                    
-                count = level1_list[0].get("level1ResourceCount", 0)
-                logger.info(f"Summary count: {count}")
-                return count
-            
-            elif response.status_code == 429:
-                wait_time = min(2 ** retry, 30)
-                logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry {retry+1}/{max_retries}.")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"Summary API failed: {response.status_code} - {response.text}")
-                if retry < max_retries:
-                    time.sleep(min(2 ** retry, 15))
-                
-        except Exception as e:
-            logger.error(f"Summary API request failed: {str(e)}")
-            if retry < max_retries:
-                time.sleep(min(2 ** retry, 15))
-    
-    return None
-
 def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 1000) -> Tuple[List[Dict], Dict[str, int]]:
     """
     Fetch all KMS resources and analyze their origin values.
@@ -162,15 +100,21 @@ def fetch_resources(timeout: int = 60, max_retries: int = 3, page_size: int = 10
                         resource["extracted_origin"] = origin
                         all_resources.append(resource)
                         
-                    # Debug pagination
+                    # Update pagination info and validate
+                    next_record_key = data.get("nextRecordKey", "")
+                    logger.info(f"Page {page_count + 1}: Fetched {len(resources)} resources (total: {len(all_resources)})")
                     logger.info(f"Next record key: {next_record_key}")
-                    if expected_count and len(all_resources) > expected_count:
-                        logger.error(f"Fetched more resources ({len(all_resources)}) than expected ({expected_count})")
+                    
+                    # Validate against expected count
+                    if expected_count and len(all_resources) >= expected_count:
+                        logger.info(f"Reached expected count of {expected_count} resources")
                         break
                     
-                    # Update pagination info
-                    next_record_key = data.get("nextRecordKey", "")
-                    logger.info(f"Page {page_count + 1}: Fetched {len(resources)} resources, total: {len(all_resources)}")
+                    # Update payload with next record key
+                    if next_record_key:
+                        payload["nextRecordKey"] = next_record_key
+                    else:
+                        logger.info("No more pages to fetch")
                     
                     page_count += 1
                     break
