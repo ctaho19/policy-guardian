@@ -1,36 +1,75 @@
-def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_only: bool = False, 
-                        timeout: int = 60, max_retries: int = 3) -> Tuple[List[Dict], int]:
+import requests
+import json
+import logging
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# API Configuration
+BASE_URL = "your_base_url"
+CONFIG_URL = f"{BASE_URL}/search_resource_configurations"
+HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer your_auth_token"
+}
+
+def fetch_resources(limit: int = 100, timeout: int = 60, max_retries: int = 3) -> Tuple[List[Dict], Dict[str, int]]:
+    """
+    Fetch KMS resources and analyze their origin values.
+    
+    Args:
+        limit: Maximum number of resources to fetch
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Tuple containing list of resources and dictionary of origin value counts
+    """
     all_resources = []
-    total_count = 0
+    origin_counts = {}
     next_record_key = ""
-    fetch_payload = {
-        "searchParameters": [payload.get("searchParameters", {})],
+    page_count = 0
+    
+    # Base payload with essential fields
+    payload = {
+        "searchParameters": [{
+            "resourceType": "AWS::KMS::Key"
+        }],
         "responseFields": [
-            "accountName", "accountResourceId", "amazonResourceName", "asvName", 
-            "awsAccountId", "awsRegion", "businessApplicationName", 
-            "environment", "resourceCreationTimestamp", "resourceId", 
-            "resourceType", "configurationList",
+            "accountName",
+            "accountResourceId", 
+            "awsAccountId",
+            "awsRegion",
+            "environment",
+            "resourceCreationTimestamp",
+            "resourceId",
+            "resourceType",
             "configuration.origin"
         ],
-        "limit": min(limit, 10000) if limit else 10000
+        "limit": min(limit, 100)  # Ensure we don't exceed desired limit
     }
     
-    if next_record_key:
-        fetch_payload["nextRecordKey"] = next_record_key
-    
-    display_log(f"Fetching resources with payload: {json.dumps(fetch_payload, indent=2)}")
-    
-    page_count = 0
     start_time = datetime.now()
     
-    while True:
+    while len(all_resources) < limit:
         for retry in range(max_retries + 1):
             try:
                 logger.info(f"Requesting page {page_count + 1}" + (f" (retry {retry})" if retry > 0 else ""))
+                
+                # Add nextRecordKey if we have one
+                if next_record_key:
+                    payload["nextRecordKey"] = next_record_key
+                
                 response = requests.post(
-                    CONFIG_URL,  # Don't modify the URL
+                    CONFIG_URL,
                     headers=HEADERS,
-                    data=json.dumps(fetch_payload),  # Match get_summary_count approach
+                    json=payload,
                     verify=False,
                     timeout=timeout
                 )
@@ -39,46 +78,92 @@ def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_onl
                     data = response.json()
                     resources = data.get("resourceConfigurations", [])
                     
+                    # Debug first page response
                     if page_count == 0:
-                        logger.debug(f"First page response structure: {json.dumps(data, indent=2)}")
+                        logger.debug(f"First page response structure:\n{json.dumps(data, indent=2)}")
                         if resources:
-                            logger.debug(f"Sample resource structure: {json.dumps(resources[0], indent=2)}")
+                            logger.debug(f"Sample resource structure:\n{json.dumps(resources[0], indent=2)}")
                     
-                    all_resources.extend(resources)
-                    total_count += len(resources)
+                    # Process resources
+                    for resource in resources:
+                        # Extract origin value
+                        origin = "Unknown"
+                        config_list = resource.get("configurationList", [])
+                        for config in config_list:
+                            if config["configurationName"] == "configuration.origin":
+                                origin = config["configurationValue"]
+                                break
+                        
+                        # Update counts
+                        origin_counts[origin] = origin_counts.get(origin, 0) + 1
+                        
+                        # Store resource with origin
+                        resource["extracted_origin"] = origin
+                        all_resources.append(resource)
+                    
+                    # Update pagination info
                     next_record_key = data.get("nextRecordKey", "")
-                    
-                    if next_record_key:
-                        fetch_payload["nextRecordKey"] = next_record_key  # Update payload instead of URL
-                    
-                    logger.info(f"Page {page_count + 1}: Fetched {len(resources)} resources, total: {total_count}")
+                    logger.info(f"Page {page_count + 1}: Fetched {len(resources)} resources, total: {len(all_resources)}")
                     
                     page_count += 1
                     break
                     
-                elif response.status_code == 502:
-                    logger.error(f"Bad Gateway (502) error. Response: {response.text}")
-                    if retry == max_retries:
-                        raise Exception(f"Failed after {max_retries} retries due to Bad Gateway")
+                elif response.status_code == 429:
                     wait_time = min(2 ** retry, 30)
-                    logger.warning(f"Waiting {wait_time}s before retry...")
+                    logger.warning(f"Rate limited (429). Waiting {wait_time}s before retry {retry+1}/{max_retries}.")
                     time.sleep(wait_time)
-                    
-                elif response.status_code != 200:
-                    logger.error(f"API error: {response.status_code} - {response.text}")
                     if retry == max_retries:
-                        raise Exception(f"Failed after {max_retries} retries")
-                    time.sleep(min(2 ** retry, 30))
-                    
+                        logger.error("Max retries reached for rate limiting.")
+                        break
+                        
+                else:
+                    logger.error(f"API error: {response.status_code} - {response.text}")
+                    if retry < max_retries:
+                        wait_time = min(2 ** retry, 30)
+                        logger.info(f"Retrying in {wait_time}s... (Attempt {retry+1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"Failed after {max_retries} retries")
+                        break
+                        
             except Exception as e:
                 logger.error(f"Request failed: {str(e)}")
-                if retry == max_retries:
-                    raise Exception(f"Failed after {max_retries} retries")
-                time.sleep(min(2 ** retry, 30))
+                if retry < max_retries:
+                    wait_time = min(2 ** retry, 30)
+                    logger.info(f"Retrying in {wait_time}s... (Attempt {retry+1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Failed after {max_retries} retries")
+                    break
         
-        if validate_only or not next_record_key or (limit and total_count >= limit):
+        # Exit if no more pages or we've reached the limit
+        if not next_record_key or len(all_resources) >= limit:
             break
     
     total_time = (datetime.now() - start_time).total_seconds()
-    logger.info(f"Fetch complete: {total_count} resources in {page_count} pages, {total_time:.1f} seconds")
-    return all_resources, total_count
+    logger.info(f"Fetch complete: {len(all_resources)} resources in {page_count} pages, {total_time:.1f} seconds")
+    
+    return all_resources, origin_counts
+
+def main():
+    # Fetch resources and analyze origins
+    resources, origin_counts = fetch_resources(limit=100)
+    
+    # Print summary
+    print("\nOrigin Value Distribution:")
+    print("-" * 30)
+    for origin, count in origin_counts.items():
+        print(f"{origin}: {count}")
+    
+    # Print sample resources
+    print("\nSample Resources (first 5):")
+    print("-" * 30)
+    for resource in resources[:5]:
+        print(f"Resource ID: {resource['resourceId']}")
+        print(f"Account: {resource['awsAccountId']}")
+        print(f"Region: {resource['awsRegion']}")
+        print(f"Origin: {resource['extracted_origin']}")
+        print("-" * 30)
+
+if __name__ == "__main__":
+    main()
