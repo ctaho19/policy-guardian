@@ -1,22 +1,4 @@
-def get_compliance_status(metric: float, alert_threshold: float, warning_threshold: float) -> str:
-    """Determine compliance status based on metric and thresholds.
-    
-    Args:
-        metric: The compliance metric as a decimal (0-1)
-        alert_threshold: The alert threshold as a whole number percentage (0-100)
-        warning_threshold: The warning threshold as a whole number percentage (0-100)
-    """
-    # Convert metric to percentage for comparison with whole number thresholds
-    metric_percentage = metric * 100
-    
-    if metric_percentage <= alert_threshold:
-        return "RED"
-    elif warning_threshold is not None and warning_threshold != "NULL" and metric_percentage <= warning_threshold:
-        return "YELLOW"
-    else:
-        return "GREEN"
-
-def main():
+ef main():
     # Initialize Spark session for Databricks
     spark = SparkSession.builder.appName("MNTR-1077125").getOrCreate()
     logger.info("Spark session initialized")
@@ -156,10 +138,6 @@ def main():
         logger.warning("All resources match both tiers. Filtering may not be distinguishing values.")
         print("Validation Warning: No variation in configuration values detected.")
         print(f"Sample values: {config_values}")
-        proceed = input("Continue full execution anyway? (yes/no): ")
-        if proceed.lower() != "yes":
-            logger.info("Exiting due to validation concern.")
-            return
 
     # Step 3: Fetch all resources (or limited set for testing)
     logger.info("Step 3: Validation passed or overridden. Fetching all resources...")
@@ -205,7 +183,7 @@ def main():
     tier1_status = get_compliance_status(
         1 - tier1_metric,  # Convert to non-compliance percentage
         float(tier1_threshold["ALERT_THRESHOLD"]),  # Convert string to float if needed
-        float(tier1_threshold["WARNING_THRESHOLD"]) if tier1_threshold["WARNING_THRESHOLD"] != "NULL" else None
+        float(tier1_threshold["WARNING_THRESHOLD"]) if tier1_threshold["WARNING_THRESHOLD"] not in ["NULL", None] else None
     )
     
     tier2_denominator = tier1_numerator
@@ -213,7 +191,7 @@ def main():
     tier2_status = get_compliance_status(
         1 - tier2_metric,  # Convert to non-compliance percentage
         float(tier2_threshold["ALERT_THRESHOLD"]),  # Convert string to float if needed
-        float(tier2_threshold["WARNING_THRESHOLD"]) if tier2_threshold["WARNING_THRESHOLD"] != "NULL" else None
+        float(tier2_threshold["WARNING_THRESHOLD"]) if tier2_threshold["WARNING_THRESHOLD"] not in ["NULL", None] else None
     )
 
     # Step 6: Create monitoring DataFrame
