@@ -1,69 +1,72 @@
-def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
-    """Filter for keys with any KeyRotationStatus value (Tier 1)."""
-    matching_count = 0
-    non_matching_resources = []
+def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_only: bool = False, 
+                       timeout: int = 60, max_retries: int = 3) -> Tuple[List[Dict], int]:
+    """
+    Fetch resources with pagination, timeout, and retry logic.
+    """
+    all_resources = []
+    total_count = 0
+    next_record_key = None  # Changed from empty string to None
     
-    for resource in resources:
-        supp_config = resource.get("supplementaryConfiguration", [])
-        config_item = next(
-            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"),
-            None
-        )
-        config_value = config_item.get("supplementaryConfigurationValue") if config_item else None
-        
-        if config_value and config_value.strip():
-            matching_count += 1
-        else:
-            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
-            filtered_resource[f"supplementaryConfiguration.{config_key}"] = config_value if config_value else "N/A"
-            non_matching_resources.append(filtered_resource)
-    
-    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
-
-def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
-    """Filter for keys with KeyRotationStatus = True (Tier 2)."""
-    matching_count = 0
-    non_matching_resources = []
-    
-    for resource in resources:
-        supp_config = resource.get("supplementaryConfiguration", [])
-        config_item = next(
-            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"),
-            None
-        )
-        config_value_actual = config_item.get("supplementaryConfigurationValue", "N/A") if config_item else "N/A"
-        
-        if config_item and config_value_actual.lower() == config_value.lower():
-            matching_count += 1
-        else:
-            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
-            filtered_resource[f"supplementaryConfiguration.{config_key}"] = config_value_actual
-            non_matching_resources.append(filtered_resource)
-    
-    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
-
-
+    # Restructure the fetch payload to match API expectations
     fetch_payload = {
-        "searchParameters": [payload.get("searchParameters", {})],
         "responseFields": [
-            "accountName", "accountResourceId", "amazonResourceName", 
-            "awsAccountId", "awsRegion", "resourceType", 
-            "supplementaryConfiguration",
-            "supplementaryConfiguration.KeyRotationStatus"  # Ensure this exact field name
+            "accountName", "accountResourceId", "amazonResourceName", "asvName", 
+            "awsAccountId", "awsRegion", "businessApplicationName", 
+            "environment", "resourceCreationTimestamp", "resourceId", 
+            "resourceType", "supplementaryConfiguration",
+            "supplementaryConfiguration.KeyRotationStatus"
         ],
-        "limit": min(limit, 10000) if limit else 10000
+        "searchParameters": payload.get("searchParameters", [])
     }
+    
+    if limit:
+        fetch_payload["limit"] = min(limit, 10000)
+    
+    logger.info(f"Fetching resources with initial payload: {json.dumps(fetch_payload, indent=2)}")
+    page_count = 0
+    start_time = datetime.now()
 
+    while True:
+        try:
+            current_url = CONFIG_URL
+            if next_record_key:
+                current_url = f"{CONFIG_URL}?nextRecordKey={next_record_key}"
 
+            response = requests.post(
+                current_url,
+                headers=HEADERS,
+                json=fetch_payload,  # Changed from data to json
+                verify=False,
+                timeout=timeout
+            )
 
-    # Sample and validate configuration extraction
-    config_values = []
-    for i, resource in enumerate(validation_resources[:5]):
-        supp_config = resource.get("supplementaryConfiguration", [])
-        config_item = next(
-            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{resource_config['config_key']}"),
-            None
-        )
-        config_value = config_item.get("supplementaryConfigurationValue") if config_item else "N/A"
-        config_values.append(config_value)
-        logger.debug(f"Sample resource {i}: {resource_config['config_key']} = {config_value}")
+            if response.status_code == 502:
+                logger.error(f"Bad Gateway (502) received. Response: {response.text}")
+                if page_count == 0:
+                    raise Exception("Initial request failed with 502")
+                break  # If we've already got some data, break and return what we have
+
+            response.raise_for_status()
+            data = response.json()
+            
+            resources = data.get("resourceConfigurations", [])
+            all_resources.extend(resources)
+            total_count += len(resources)
+            
+            next_record_key = data.get("nextRecordKey")
+            page_count += 1
+            
+            logger.info(f"Page {page_count}: Fetched {len(resources)} resources, total: {total_count}")
+            
+            if validate_only or not next_record_key or (limit and total_count >= limit):
+                break
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {str(e)}")
+            if page_count == 0:
+                raise  # Fail if we haven't got any data yet
+            break  # Otherwise return what we have
+
+    total_time = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Fetch complete: {total_count} resources in {page_count} pages, {total_time:.1f} seconds")
+    return all_resources, total_count
