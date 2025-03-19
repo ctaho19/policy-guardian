@@ -1,95 +1,181 @@
-def fetch_all_resources(payload: Dict, limit: Optional[int] = None, validate_only: bool = False, 
-                       timeout: int = 60, max_retries: int = 3) -> Tuple[List[Dict], int]:
-    all_resources = []
-    total_count = 0
-    next_record_key = None
-    
-    # Update fetch_payload to explicitly set higher limit
-    fetch_payload = {
-        "searchParameters": payload.get("searchParameters", []),
-        "responseFields": [
-            "accountName", "accountResourceId", "amazonResourceName", "asvName", 
-            "awsAccountId", "awsRegion", "businessApplicationName", 
-            "environment", "resourceCreationTimestamp", "resourceId", 
-            "resourceType", "supplementaryConfiguration",
-            "supplementaryConfiguration.KeyRotationStatus"
-        ],
-        "limit": 1000  # Explicitly set to 1000
-    }
-    
-    if limit:
-        fetch_payload["limit"] = min(limit, 1000)
+ACME Pipeline Walkthrough
+
+This document provides a step-by-step guide to understanding how the ACME_Pipeline.py works, explaining its core components and underlying logic.
+
+1. Pipeline Overview
+   The pipeline is designed to evaluate and monitor IAM roles in AWS, specifically focusing on machine roles and their compliance with security controls. It processes data from Snowflake and generates two tiers of metrics:
+   - Tier 1: Measures the coverage of role evaluation
+   - Tier 2: Measures the compliance status of evaluated roles
+
+2. Query Definitions (Initial Setup)
+   The pipeline starts by defining four crucial SQL queries:
+   a) all_iam_roles_query: Retrieves IAM roles with their attributes from IDENTITY_REPORTS_IAM_RESOURCE_V3
+      - Filters for role type resources
+      - Excludes roles with DENY-ALL or QUARANTINE policies
+      - Ensures latest records using ROW_NUMBER()
+   
+   b) evaluated_roles_query: Gets roles evaluated against control CM-2.AWS.12.v02
+      - Retrieves resource names and their compliance status
+   
+   c) tier1_threshold_query: Fetches monitoring thresholds for Tier 1 metrics
+   d) tier2_threshold_query: Fetches monitoring thresholds for Tier 2 metrics
+
+3. Data Loading Process
+   The pipeline loads data in two main steps:
+   a) Loading All IAM Roles:
+      - Connects to Snowflake using provided credentials
+      - Executes all_iam_roles_query
+      - Caches the result for improved performance
+      - Creates a temporary view 'all_iam_roles'
+
+   b) Loading Evaluated Roles:
+      - Executes evaluated_roles_query
+      - Caches the evaluated roles data
+      - Creates a temporary view 'evaluated_roles'
+
+4. Machine Role Filtering
+   The pipeline filters the roles based on two criteria:
+   - Roles must be from approved accounts
+   - Role type must be 'MACHINE'
+   This filtered dataset becomes the foundation for both Tier 1 and Tier 2 metrics calculations.
+
+5. Metrics Calculation Logic
+
+   a) Common Calculation Function:
+      The calculate_metrics() function handles both tiers and:
+      - Calculates the percentage (numerator/denominator * 100)
+      - Determines compliance status (GREEN, YELLOW, RED)
+      - Rounds metrics to 2 decimal places
+
+   b) Tier 1 Metrics (Coverage):
+      - Numerator: Number of evaluated roles
+      - Denominator: Total number of machine roles
+      - Purpose: Measures what percentage of roles have been evaluated
+
+   c) Tier 2 Metrics (Compliance):
+      - Numerator: Number of compliant roles
+      - Denominator: Number of evaluated roles
+      - Purpose: Measures what percentage of evaluated roles are compliant
+
+6. Supporting Evidence Generation
+
+   a) Tier 1 Supporting Evidence:
+      - Identifies roles that haven't been evaluated
+      - Creates a DataFrame with unevaluated roles' details
+      - If all roles are evaluated, generates a note indicating full coverage
+
+   b) Tier 2 Supporting Evidence:
+      - Identifies non-compliant roles
+      - Creates a DataFrame with details of non-compliant roles
+      - If all roles are compliant, generates a note indicating full compliance
+
+7. Data Quality and Error Handling
+   The pipeline includes various error handling mechanisms:
+   - Logging at each major step
+   - Try-except blocks around critical operations
+   - Data caching for performance optimization
+   - Schema validation for DataFrame operations
+
+8. Output and Reporting
+   The final output includes:
+   - Metrics for both tiers (percentage and status)
+   - Supporting evidence for both tiers
+   - Detailed logging of the process
+   - Temporary views for debugging and verification
+
+This pipeline demonstrates a robust approach to monitoring IAM role compliance, with clear separation between coverage monitoring (Tier 1) and compliance monitoring (Tier 2), making it easier to identify gaps in both evaluation coverage and actual compliance status.
 
 
-def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame, List[Dict]]:
-    """Filter for keys with any KeyRotationStatus value (Tier 1)."""
-    matching_resources = []
-    non_matching_resources = []
-    
-    for resource in resources:
-        supp_config = resource.get("supplementaryConfiguration", [])
-        rotation_config = next(
-            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"), 
-            None
-        )
-        config_value = rotation_config.get("supplementaryConfigurationValue") if rotation_config else None
-        
-        if config_value and config_value.strip():
-            matching_resources.append(resource)  # Store compliant resources
-        else:
-            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
-            filtered_resource[f"supplementaryConfiguration.{config_key}"] = config_value if config_value else "N/A"
-            non_matching_resources.append(filtered_resource)
-    
-    return len(matching_resources), pd.DataFrame(non_matching_resources), matching_resources
+API Pipeline Walkthrough
 
-def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
-    """Filter for keys with KeyRotationStatus = True (Tier 2)."""
-    matching_count = 0
-    non_matching_resources = []
-    
-    for resource in resources:  # Now only processing Tier 1 compliant resources
-        supp_config = resource.get("supplementaryConfiguration", [])
-        rotation_config = next(
-            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"),
-            None
-        )
-        config_value_actual = rotation_config.get("supplementaryConfigurationValue", "N/A") if rotation_config else "N/A"
-        
-        if config_value_actual.lower() == config_value.lower():
-            matching_count += 1
-        else:
-            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
-            filtered_resource[f"supplementaryConfiguration.{config_key}"] = config_value_actual
-            non_matching_resources.append(filtered_resource)
-    
-    return matching_count, pd.DataFrame(non_matching_resources)
+This document provides a step-by-step guide to understanding how the API_Pipeline.py works, explaining its core components and underlying logic.
 
+1. Pipeline Overview
+   The pipeline is designed to evaluate and monitor AWS KMS Key resources by interacting with a REST API, focusing on:
+   - Tier 1: Measures the presence of origin configuration
+   - Tier 2: Measures compliance with specific origin values
+   The pipeline uses robust error handling, pagination, and retry mechanisms to ensure reliable data collection.
 
-    # In main(), update the validation filtering
-    tier1_count, tier1_non_compliant_df, tier1_compliant_resources = filter_tier1_resources(
-        validation_resources, 
-        resource_config["config_key"], 
-        resource_config["desired_fields"]
-    )
-    
-    tier2_count, tier2_non_compliant_df = filter_tier2_resources(
-        tier1_compliant_resources,  # Only pass compliant resources from Tier 1
-        resource_config["config_key"], 
-        resource_config["config_value"], 
-        resource_config["desired_fields"]
-    )
+2. Initial Setup and Configuration
+   The pipeline begins with:
+   a) Logging Configuration
+      - Sets up detailed logging with timestamps and levels
+      - Configures console output for monitoring
+   
+   b) API Configuration
+      - Defines base URLs for different endpoints
+      - Sets up authentication headers
+      - Configures resource-specific parameters
 
-    # Later in the full filtering section
-    tier1_numerator, tier1_non_compliant_df, tier1_compliant_resources = filter_tier1_resources(
-        all_resources, 
-        resource_config["config_key"], 
-        resource_config["desired_fields"]
-    )
-    
-    tier2_numerator, tier2_non_compliant_df = filter_tier2_resources(
-        tier1_compliant_resources,  # Only pass compliant resources from Tier 1
-        resource_config["config_key"], 
-        resource_config["config_value"], 
-        resource_config["desired_fields"]
-    )
+3. Data Collection Process
+   The pipeline collects data in three main phases:
+
+   a) Summary Count Collection
+      - Calls summary-view API to get total resource counts
+      - Implements retry logic with exponential backoff
+      - Handles rate limiting and timeouts
+
+   b) Validation Phase
+      - Fetches a small subset of resources for validation
+      - Verifies data structure and field availability
+      - Validates filtering logic before full data collection
+
+   c) Full Resource Collection
+      - Implements pagination for large datasets
+      - Uses efficient batch processing
+      - Maintains consistent error handling and logging
+
+4. Resource Filtering Logic
+   The pipeline implements two-tier filtering:
+
+   a) Tier 1 Filtering (Coverage)
+      - Checks for presence of origin configuration
+      - Filters out resources with empty or missing origin
+      - Tracks non-compliant resources for reporting
+
+   b) Tier 2 Filtering (Compliance)
+      - Evaluates origin value against expected value (AWS_KMS)
+      - Maintains detailed records of non-compliant resources
+      - Calculates compliance percentages
+
+5. Metrics Calculation
+   The pipeline calculates metrics using:
+
+   a) Threshold Management
+      - Loads compliance thresholds from Snowflake
+      - Provides fallback default thresholds
+      - Handles NULL threshold values appropriately
+
+   b) Compliance Status Determination
+      - Calculates percentage-based metrics
+      - Applies threshold logic (GREEN/YELLOW/RED)
+      - Handles edge cases and zero denominators
+
+6. Supporting Evidence Generation
+   For each tier, the pipeline generates:
+   - Detailed DataFrames of non-compliant resources
+   - Resource identifiers and configurations
+   - Timestamp and compliance status information
+
+7. Error Handling and Resilience
+   The pipeline implements robust error handling:
+   - Exponential backoff for API retries
+   - Validation of API responses
+   - Detailed error logging and reporting
+   - Graceful handling of edge cases
+
+8. Output and Reporting
+   The final output includes:
+   - Monitoring metrics for both tiers
+   - Non-compliant resource details
+   - Summary statistics and counts
+   - Detailed logging for troubleshooting
+
+9. Performance Considerations
+   The pipeline optimizes performance through:
+   - Efficient pagination handling
+   - Data caching where appropriate
+   - Batch processing of resources
+   - Configurable timeout and retry parameters
+
+This pipeline demonstrates a comprehensive approach to monitoring AWS KMS Key resources, with robust error handling, clear separation of concerns between tiers, and detailed reporting capabilities. The modular design allows for easy modification of resource types and compliance criteria while maintaining consistent monitoring capabilities.
