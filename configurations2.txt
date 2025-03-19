@@ -1,58 +1,44 @@
-# Step 5: Load thresholds and calculate compliance
-    logger.info("Step 5: Loading thresholds and calculating compliance...")
-    thresholds_df = load_thresholds(spark)
-    
-    # Default thresholds (update to handle NULL properly)
-    default_thresholds = {
-        "MNTR-XXXXXXX-T1": {"ALERT_THRESHOLD": 5, "WARNING_THRESHOLD": None},  # Changed from "NULL" to None
-        "MNTR-XXXXXXX-T2": {"ALERT_THRESHOLD": 5, "WARNING_THRESHOLD": None}   # Changed from "NULL" to None
-    }
-    
-    if thresholds_df.empty:
-        logger.warning("No thresholds loaded. Using defaults.")
-        tier1_threshold = default_thresholds[resource_config["tier1_metric_id"]]
-        tier2_threshold = default_thresholds[resource_config["tier2_metric_id"]]
-    else:
-        # Safely get thresholds with fallback to defaults
-        tier1_df = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == resource_config["tier1_metric_id"]]
-        tier2_df = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == resource_config["tier2_metric_id"]]
+def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter for keys with any KeyRotationStatus value (Tier 1)."""
+    matching_count = 0
+    non_matching_resources = []
+    for resource in resources:
+        supp_config = resource.get("supplementaryConfiguration", [])
+        rotation_config = next(
+            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"), 
+            None
+        )
+        config_value = rotation_config.get("supplementaryConfigurationValue") if rotation_config else None
         
-        tier1_threshold = tier1_df.iloc[0].to_dict() if not tier1_df.empty else default_thresholds[resource_config["tier1_metric_id"]]
-        tier2_threshold = tier2_df.iloc[0].to_dict() if not tier2_df.empty else default_thresholds[resource_config["tier2_metric_id"]]
+        if config_value and config_value.strip():
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource["supplementaryConfiguration.KeyRotationStatus"] = config_value if config_value else "N/A"
+            non_matching_resources.append(filtered_resource)
+    
+    logger.info(f"Tier 1: {matching_count} keys with KeyRotationStatus configured")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+
+def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter for keys with KeyRotationStatus = True (Tier 2)."""
+    matching_count = 0
+    non_matching_resources = []
+    for resource in resources:
+        supp_config = resource.get("supplementaryConfiguration", [])
+        rotation_config = next(
+            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"), 
+            None
+        )
+        config_value_actual = rotation_config.get("supplementaryConfigurationValue", "N/A") if rotation_config else "N/A"
         
-        logger.info(f"Loaded thresholds - Tier1: {tier1_threshold}, Tier2: {tier2_threshold}")
-
-    # Calculate metrics and compliance status
-    tier1_metric = tier1_numerator / config_total_count if config_total_count > 0 else 0
-    tier1_status = get_compliance_status(
-        tier1_metric,
-        float(tier1_threshold["ALERT_THRESHOLD"]),
-        float(tier1_threshold["WARNING_THRESHOLD"]) if tier1_threshold["WARNING_THRESHOLD"] not in ["NULL", None, "None"] else None
-    )
+        # Case-insensitive comparison for "True"
+        if rotation_config and config_value_actual.lower() == config_value.lower():
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource["supplementaryConfiguration.KeyRotationStatus"] = config_value_actual
+            non_matching_resources.append(filtered_resource)
     
-    tier2_denominator = tier1_numerator
-    tier2_metric = tier2_numerator / tier2_denominator if tier2_denominator > 0 else 0
-    tier2_status = get_compliance_status(
-        tier2_metric,
-        float(tier2_threshold["ALERT_THRESHOLD"]),
-        float(tier2_threshold["WARNING_THRESHOLD"]) if tier2_threshold["WARNING_THRESHOLD"] not in ["NULL", None, "None"] else None
-    )
-
-
-
-def get_compliance_status(metric: float, alert_threshold: float, warning_threshold: Optional[float] = None) -> str:
-    """Determine compliance status based on metric and thresholds.
-    
-    Args:
-        metric: The compliance metric as a decimal (0-1)
-        alert_threshold: The alert threshold as a whole number percentage (0-100)
-        warning_threshold: Optional warning threshold as a whole number percentage (0-100)
-    """
-    metric_percentage = metric * 100
-    
-    if metric_percentage >= alert_threshold:
-        return "GREEN"
-    elif warning_threshold is not None and metric_percentage >= warning_threshold:
-        return "YELLOW"
-    else:
-        return "RED"
+    logger.info(f"Tier 2: {matching_count} keys with KeyRotationStatus = {config_value}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
