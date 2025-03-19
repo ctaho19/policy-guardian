@@ -1,55 +1,69 @@
 def filter_tier1_resources(resources: List[Dict], config_key: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
     """Filter for keys with any KeyRotationStatus value (Tier 1)."""
-    try:
-        matching_count = 0
-        non_matching_resources = []
+    matching_count = 0
+    non_matching_resources = []
+    
+    for resource in resources:
+        supp_config = resource.get("supplementaryConfiguration", [])
+        config_item = next(
+            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"),
+            None
+        )
+        config_value = config_item.get("supplementaryConfigurationValue") if config_item else None
         
-        for resource in resources:
-            supp_config = resource.get("supplementaryConfiguration", [])
-            rotation_config = next(
-                (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"), 
-                None
-            )
-            
-            if rotation_config and rotation_config.get("supplementaryConfigurationValue", "").strip():
-                matching_count += 1
-            else:
-                filtered_resource = {field: resource.get(field, "N/A") for field in fields}
-                filtered_resource[f"supplementaryConfiguration.{config_key}"] = (
-                    rotation_config.get("supplementaryConfigurationValue", "N/A") if rotation_config else "N/A"
-                )
-                non_matching_resources.append(filtered_resource)
-        
-        logger.info(f"Tier 1: {matching_count} keys with {config_key} configured")
-        return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
-    except Exception as e:
-        logger.error(f"Error in filter_tier1_resources: {str(e)}")
-        return 0, pd.DataFrame(columns=fields)
+        if config_value and config_value.strip():
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource[f"supplementaryConfiguration.{config_key}"] = config_value if config_value else "N/A"
+            non_matching_resources.append(filtered_resource)
+    
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
 
 def filter_tier2_resources(resources: List[Dict], config_key: str, config_value: str, fields: List[str]) -> Tuple[int, pd.DataFrame]:
     """Filter for keys with KeyRotationStatus = True (Tier 2)."""
-    try:
-        matching_count = 0
-        non_matching_resources = []
+    matching_count = 0
+    non_matching_resources = []
+    
+    for resource in resources:
+        supp_config = resource.get("supplementaryConfiguration", [])
+        config_item = next(
+            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"),
+            None
+        )
+        config_value_actual = config_item.get("supplementaryConfigurationValue", "N/A") if config_item else "N/A"
         
-        for resource in resources:
-            supp_config = resource.get("supplementaryConfiguration", [])
-            rotation_config = next(
-                (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"), 
-                None
-            )
-            config_value_actual = rotation_config.get("supplementaryConfigurationValue", "N/A") if rotation_config else "N/A"
-            
-            # Case-insensitive comparison for "True"
-            if rotation_config and config_value_actual.lower() == config_value.lower():
-                matching_count += 1
-            else:
-                filtered_resource = {field: resource.get(field, "N/A") for field in fields}
-                filtered_resource[f"supplementaryConfiguration.{config_key}"] = config_value_actual
-                non_matching_resources.append(filtered_resource)
-        
-        logger.info(f"Tier 2: {matching_count} keys with {config_key} = {config_value}")
-        return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
-    except Exception as e:
-        logger.error(f"Error in filter_tier2_resources: {str(e)}")
-        return 0, pd.DataFrame(columns=fields)
+        if config_item and config_value_actual.lower() == config_value.lower():
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource[f"supplementaryConfiguration.{config_key}"] = config_value_actual
+            non_matching_resources.append(filtered_resource)
+    
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+
+
+    fetch_payload = {
+        "searchParameters": [payload.get("searchParameters", {})],
+        "responseFields": [
+            "accountName", "accountResourceId", "amazonResourceName", 
+            "awsAccountId", "awsRegion", "resourceType", 
+            "supplementaryConfiguration",
+            "supplementaryConfiguration.KeyRotationStatus"  # Ensure this exact field name
+        ],
+        "limit": min(limit, 10000) if limit else 10000
+    }
+
+
+
+    # Sample and validate configuration extraction
+    config_values = []
+    for i, resource in enumerate(validation_resources[:5]):
+        supp_config = resource.get("supplementaryConfiguration", [])
+        config_item = next(
+            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{resource_config['config_key']}"),
+            None
+        )
+        config_value = config_item.get("supplementaryConfigurationValue") if config_item else "N/A"
+        config_values.append(config_value)
+        logger.debug(f"Sample resource {i}: {resource_config['config_key']} = {config_value}")
