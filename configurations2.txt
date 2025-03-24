@@ -1,1 +1,214 @@
+controls_config = [
+    {
+        "control_id": "KMS_ORIGIN_CHECK",
+        "resource_type": "AWS::KMS::Key",
+        "config_key": "origin",
+        "config_location": "configurationList",  # or "supplementaryConfiguration"
+        "config_value": "AWS_KMS",
+        "desired_fields": ["accountResourceId", "resourceType", "configuration.origin"],
+        "tier1_metric_id": "MNTR-XXXXXXX-T1",
+        "tier2_metric_id": "MNTR-XXXXXXX-T2",
+        "validation_limit": 1000,
+        "full_limit": None,
+        "timeout": 60,
+        "max_retries": 3
+    },
+    {
+        "control_id": "KMS_ROTATION_CHECK",
+        "resource_type": "AWS::KMS::Key",
+        "config_key": "KeyRotationStatus",
+        "config_location": "supplementaryConfiguration",
+        "config_value": "true",
+        "desired_fields": ["accountResourceId", "resourceType", "supplementaryConfiguration.KeyRotationStatus"],
+        "tier1_metric_id": "MNTR-YYYYYYY-T1",
+        "tier2_metric_id": "MNTR-YYYYYYY-T2",
+        "validation_limit": 1000,
+        "full_limit": None,
+        "timeout": 60,
+        "max_retries": 3
+    }
+]
 
+def get_config_value(resource: Dict, config_key: str, config_location: str) -> Optional[str]:
+    """Extract configuration value from the specified location."""
+    if config_location == "configurationList":
+        config_list = resource.get("configurationList", [])
+        config_item = next(
+            (c for c in config_list if c["configurationName"] == f"configuration.{config_key}"), 
+            None
+        )
+        return config_item.get("configurationValue") if config_item else None
+    elif config_location == "supplementaryConfiguration":
+        supp_config = resource.get("supplementaryConfiguration", [])
+        config_item = next(
+            (c for c in supp_config if c["supplementaryConfigurationName"] == f"supplementaryConfiguration.{config_key}"), 
+            None
+        )
+        return config_item.get("supplementaryConfigurationValue") if config_item else None
+    else:
+        raise ValueError(f"Unsupported config_location: {config_location}")
+
+def filter_tier1_resources(resources: List[Dict], control_config: Dict, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources for Tier 1 compliance (non-empty config value)."""
+    matching_count = 0
+    non_matching_resources = []
+    config_key = control_config["config_key"]
+    config_location = control_config["config_location"]
+    
+    for resource in resources:
+        config_value = get_config_value(resource, config_key, config_location)
+        
+        if config_value and config_value.strip():
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource[f"{config_location}.{config_key}"] = config_value if config_value else "N/A"
+            non_matching_resources.append(filtered_resource)
+    
+    logger.info(f"Tier 1 ({control_config['control_id']}): {matching_count} resources with non-empty {config_key}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+
+def filter_tier2_resources(resources: List[Dict], control_config: Dict, fields: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources for Tier 2 compliance (specific config value)."""
+    matching_count = 0
+    non_matching_resources = []
+    config_key = control_config["config_key"]
+    config_location = control_config["config_location"]
+    expected_value = control_config["config_value"]
+    
+    for resource in resources:
+        config_value = get_config_value(resource, config_key, config_location)
+        
+        if config_value == expected_value:
+            matching_count += 1
+        else:
+            filtered_resource = {field: resource.get(field, "N/A") for field in fields}
+            filtered_resource[f"{config_location}.{config_key}"] = config_value if config_value else "N/A"
+            non_matching_resources.append(filtered_resource)
+    
+    logger.info(f"Tier 2 ({control_config['control_id']}): {matching_count} resources with {config_key} = {expected_value}")
+    return matching_count, pd.DataFrame(non_matching_resources) if non_matching_resources else pd.DataFrame(columns=fields)
+
+def process_control(spark, control_config: Dict) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Process a single control and return monitoring and non-compliant DataFrames."""
+    logger.info(f"Processing control: {control_config['control_id']}")
+    
+    # Payloads for the control
+    summary_payload_all = {
+        "searchParameters": [{
+            "resourceType": control_config["resource_type"],
+            "aggregations": ["resourceType"]
+        }]
+    }
+    summary_payload_filtered = {
+        "searchParameters": [{
+            "resourceType": control_config["resource_type"],
+            "configurationItems": [
+                {"configurationName": control_config["config_key"], 
+                 "configurationValue": control_config["config_value"]}
+            ],
+            "aggregations": ["resourceType"]
+        }]
+    }
+    config_payload = {
+        "searchParameters": [{"resourceType": control_config["resource_type"]}]
+    }
+
+    # Step 1: Get summary counts
+    total_summary_count = get_summary_count(summary_payload_all)
+    filtered_summary_count = get_summary_count(summary_payload_filtered)
+    if total_summary_count is None or filtered_summary_count is None:
+        logger.error(f"Failed to get summary counts for {control_config['control_id']}. Skipping.")
+        return None, None, None
+
+    # Step 2: Validate with sample data
+    validation_resources, validation_count = fetch_all_resources(
+        config_payload, limit=control_config["validation_limit"], validate_only=True,
+        timeout=control_config["timeout"], max_retries=control_config["max_retries"]
+    )
+    if validation_count == 0:
+        logger.error(f"No resources fetched for validation in {control_config['control_id']}. Skipping.")
+        return None, None, None
+
+    # Step 3: Fetch all resources
+    all_resources, config_total_count = fetch_all_resources(
+        config_payload, limit=control_config["full_limit"],
+        timeout=control_config["timeout"], max_retries=control_config["max_retries"]
+    )
+
+    # Step 4: Apply filtering
+    tier1_numerator, tier1_non_compliant_df = filter_tier1_resources(
+        all_resources, control_config, control_config["desired_fields"]
+    )
+    tier2_numerator, tier2_non_compliant_df = filter_tier2_resources(
+        all_resources, control_config, control_config["desired_fields"]
+    )
+
+    # Step 5: Load thresholds and calculate compliance
+    thresholds_df = load_thresholds(spark)
+    default_thresholds = {
+        control_config["tier1_metric_id"]: {"ALERT_THRESHOLD": 5, "WARNING_THRESHOLD": None},
+        control_config["tier2_metric_id"]: {"ALERT_THRESHOLD": 5, "WARNING_THRESHOLD": None}
+    }
+    
+    tier1_threshold = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == control_config["tier1_metric_id"]].iloc[0].to_dict() if not thresholds_df.empty else default_thresholds[control_config["tier1_metric_id"]]
+    tier2_threshold = thresholds_df[thresholds_df["MONITORING_METRIC_ID"] == control_config["tier2_metric_id"]].iloc[0].to_dict() if not thresholds_df.empty else default_thresholds[control_config["tier2_metric_id"]]
+
+    tier1_metric = tier1_numerator / config_total_count if config_total_count > 0 else 0
+    tier1_status = get_compliance_status(tier1_metric, float(tier1_threshold["ALERT_THRESHOLD"]), None)
+    tier2_metric = tier2_numerator / tier1_numerator if tier1_numerator > 0 else 0
+    tier2_status = get_compliance_status(tier2_metric, float(tier2_threshold["ALERT_THRESHOLD"]), None)
+
+    # Step 6: Create monitoring DataFrame
+    monitoring_df = pd.DataFrame([
+        {
+            "DATE": datetime.now().strftime("%Y-%m-%d"),
+            "CONTROL_ID": control_config["control_id"],
+            "MONITORING_METRIC_NUMBER": control_config["tier1_metric_id"],
+            "MONITORING_METRIC": f"{round(tier1_metric * 100, 2)}%",
+            "COMPLIANCE_STATUS": tier1_status,
+            "NUMERATOR": tier1_numerator,
+            "DENOMINATOR": config_total_count
+        },
+        {
+            "DATE": datetime.now().strftime("%Y-%m-%d"),
+            "CONTROL_ID": control_config["control_id"],
+            "MONITORING_METRIC_NUMBER": control_config["tier2_metric_id"],
+            "MONITORING_METRIC": f"{round(tier2_metric * 100, 2)}%",
+            "COMPLIANCE_STATUS": tier2_status,
+            "NUMERATOR": tier2_numerator,
+            "DENOMINATOR": tier1_numerator
+        }
+    ])
+    
+    return monitoring_df, tier1_non_compliant_df, tier2_non_compliant_df
+
+def main():
+    spark = SparkSession.builder.appName("Multi-Control-Pipeline").getOrCreate()
+    logger.info("Spark session initialized")
+
+    all_monitoring_dfs = []
+    all_tier1_non_compliant_dfs = {}
+    all_tier2_non_compliant_dfs = {}
+
+    for control_config in controls_config:
+        monitoring_df, tier1_non_compliant_df, tier2_non_compliant_df = process_control(spark, control_config)
+        if monitoring_df is not None:
+            all_monitoring_dfs.append(monitoring_df)
+            all_tier1_non_compliant_dfs[control_config["control_id"]] = tier1_non_compliant_df
+            all_tier2_non_compliant_dfs[control_config["control_id"]] = tier2_non_compliant_df
+
+    # Combine and report results
+    if all_monitoring_dfs:
+        final_monitoring_df = pd.concat(all_monitoring_dfs, ignore_index=True)
+        print("\nMonitoring Metrics:")
+        print(final_monitoring_df)
+        
+        for control_id in all_tier1_non_compliant_dfs:
+            print(f"\nTier 1 Non-compliant Resources ({control_id}):")
+            print(all_tier1_non_compliant_dfs[control_id] if not all_tier1_non_compliant_dfs[control_id].empty else "None found")
+            print(f"\nTier 2 Non-compliant Resources ({control_id}):")
+            print(all_tier2_non_compliant_dfs[control_id] if not all_tier2_non_compliant_dfs[control_id].empty else "None found")
+
+if __name__ == "__main__":
+    main()
