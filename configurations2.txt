@@ -1,6 +1,7 @@
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 import sys
+import csv
 
 # Function to extract apps from Mac XML
 def extract_mac_apps(xml_file):
@@ -9,7 +10,6 @@ def extract_mac_apps(xml_file):
         tree = ET.parse(xml_file)
         root = tree.getroot()
 
-        # Extract all apps from ApplicationGroupOSX
         for app_group in root.findall('.//ApplicationGroupOSX'):
             for app in app_group.findall('.//ApplicationOSX'):
                 app_name = app.get('FileName', '').lower()
@@ -30,7 +30,6 @@ def extract_windows_apps(xml_file):
         tree = ET.parse(xml_file)
         root = tree.getroot()
 
-        # Extract all apps from ApplicationGroup
         for app_group in root.findall('.//ApplicationGroup'):
             for app in app_group.findall('.//Application'):
                 app_name = app.get('FileName', '').lower()
@@ -49,7 +48,7 @@ def is_partial_match(blocked_app, xml_app, threshold=0.75):
     return SequenceMatcher(None, blocked_app.lower(), xml_app.lower()).ratio() >= threshold
 
 # Main comparison function
-def compare_blocklist_with_xml(blocklist_file, windows_xml, mac_xml):
+def compare_blocklist_with_xml(blocklist_file, windows_xml, mac_xml, output_file='blocklist_validation.csv'):
     # Read blocklist
     with open(blocklist_file, 'r') as f:
         blocklist = [line.strip().lower() for line in f if line.strip()]
@@ -76,30 +75,61 @@ def compare_blocklist_with_xml(blocklist_file, windows_xml, mac_xml):
         
         results.append({
             'blocklist_app': blocked_app,
-            'mac_match': mac_match,
-            'windows_match': windows_match
+            'mac_found': 'Yes' if mac_match else 'No',
+            'mac_match': mac_match if mac_match else '',
+            'windows_found': 'Yes' if windows_match else 'No',
+            'windows_match': windows_match if windows_match else ''
         })
 
-    # Output results
-    print("\nBlocklist Validation Results:")
-    print(f"{'Blocklist App':<30} {'Found in Mac XML':<30} {'Found in Windows XML':<30}")
-    print("-" * 90)
-    for result in results:
-        mac_status = f"Yes ({result['mac_match']})" if result['mac_match'] else "No"
-        windows_status = f"Yes ({result['windows_match']})" if result['windows_match'] else "No"
-        print(f"{result['blocklist_app']:<30} {mac_status:<30} {windows_status:<30}")
+    # Sort results by blocklist_app
+    results.sort(key=lambda x: x['blocklist_app'])
 
-    # Summary
-    missing_mac = [r['blocklist_app'] for r in results if not r['mac_match']]
-    missing_windows = [r['blocklist_app'] for r in results if not r['windows_match']]
-    
-    print("\nSummary:")
-    print(f"Apps missing from Mac XML: {len(missing_mac)}")
-    if missing_mac:
-        print("  " + ", ".join(missing_mac))
-    print(f"Apps missing from Windows XML: {len(missing_windows)}")
-    if missing_windows:
-        print("  " + ", ".join(missing_windows))
+    # Write to CSV
+    with open(output_file, 'w', newline='') as csvfile:
+        fieldnames = [
+            'Blocklist Application',
+            'Found in Mac XML',
+            'Mac XML Match',
+            'Found in Windows XML',
+            'Windows XML Match'
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        # Write header
+        writer.writeheader()
+        
+        # Write main table
+        for result in results:
+            writer.writerow({
+                'Blocklist Application': result['blocklist_app'],
+                'Found in Mac XML': result['mac_found'],
+                'Mac XML Match': result['mac_match'],
+                'Found in Windows XML': result['windows_found'],
+                'Windows XML Match': result['windows_match']
+            })
+
+        # Add blank row
+        writer.writerow({field: '' for field in fieldnames})
+
+        # Write summary
+        missing_mac = [r['blocklist_app'] for r in results if r['mac_found'] == 'No']
+        missing_windows = [r['blocklist_app'] for r in results if r['windows_found'] == 'No']
+
+        writer.writerow({'Blocklist Application': 'Summary', 'Found in Mac XML': ''})
+        writer.writerow({'Blocklist Application': f'Apps missing from Mac XML: {len(missing_mac)}'})
+        if missing_mac:
+            writer.writerow({'Blocklist Application': 'Missing Mac Apps:'})
+            for app in sorted(missing_mac):
+                writer.writerow({'Blocklist Application': app})
+        
+        writer.writerow({'Blocklist Application': ''})
+        writer.writerow({'Blocklist Application': f'Apps missing from Windows XML: {len(missing_windows)}'})
+        if missing_windows:
+            writer.writerow({'Blocklist Application': 'Missing Windows Apps:'})
+            for app in sorted(missing_windows):
+                writer.writerow({'Blocklist Application': app})
+
+    print(f"Results written to {output_file}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
@@ -111,5 +141,3 @@ if __name__ == "__main__":
     mac_xml = sys.argv[3]
 
     compare_blocklist_with_xml(blocklist_file, windows_xml, mac_xml)
-
-python3 script.py eapl.txt WinProductionPolicy-Green_v39_202503241210.xml MacProductionPolicy-Blue_v56_202503241210.xml
