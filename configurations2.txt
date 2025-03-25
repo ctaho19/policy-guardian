@@ -1,1 +1,30 @@
-
+def calculate_metrics(alert_val, warning_val, numerator, denominator):
+    """Calculate a percentage and status (RED, YELLOW, GREEN, UNKNOWN) based on thresholds."""
+    alert = float(alert_val) if alert_val is not None else None  # Convert alert to float if present
+    warning = float(warning_val) if warning_val is not None else None  # Convert warning to float if present
+    numerator = float(numerator)  # Ensure float for Snowflake
+    denominator = float(denominator)  # Ensure float for Snowflake
+    
+    # Calculate percentage (100% if denominator is 0)
+    metric = numerator / denominator * 100 if denominator > 0 else 100.0
+    metric = round(metric, 2)
+    
+    # Determine status based on available thresholds
+    if alert is not None:  # If alert threshold exists, use it
+        if metric < alert:
+            status = "RED"  # Below alert is always RED
+        elif warning is not None and metric < warning:  # Check warning only if it exists
+            status = "YELLOW"  # Between alert and warning is YELLOW
+        else:
+            status = "GREEN"  # Above warning (or alert if no warning) is GREEN
+    else:
+        status = "UNKNOWN"  # No alert threshold means we can’t judge compliance
+        logger.warning(f"No alert threshold provided; status set to UNKNOWN for metric calculation")
+    
+    logger.debug(f"Metric calculated: {metric}%, status: {status}, alert={alert}, warning={warning}, num={numerator}, denom={denominator}")
+    return {
+        "metric": metric,
+        "status": status,
+        "numerator": numerator,
+        "denominator": denominator
+    }
