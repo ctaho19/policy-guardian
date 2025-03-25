@@ -1,1 +1,30 @@
-
+function compareAppLists() {
+  var sheet1 = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1"); // Blocker list
+  var sheet2 = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet2"); // Tracker list
+  
+  var blockerList = sheet1.getRange("A2:A501").getValues().flat(); // Adjust range
+  var trackerList = sheet2.getRange("A2:A501").getValues().flat(); // Adjust range
+  var results = [];
+  
+  for (var i = 0; i < trackerList.length; i++) {
+    var trackerApp = trackerList[i].toLowerCase();
+    var found = false;
+    
+    for (var j = 0; j < blockerList.length; j++) {
+      var blockerApp = blockerList[j].toLowerCase();
+      // Check if any word in trackerApp appears in blockerApp
+      var trackerWords = trackerApp.split(" ");
+      for (var k = 0; k < trackerWords.length; k++) {
+        if (blockerApp.includes(trackerWords[k]) && trackerWords[k].length > 3) { // Avoid short words like "app"
+          found = true;
+          break;
+        }
+      }
+      if (found) break;
+    }
+    results.push([found ? "Found" : "Not Found"]);
+  }
+  
+  // Write results next to tracker list
+  sheet2.getRange(2, 2, results.length, 1).setValues(results); // Column B
+}
