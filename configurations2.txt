@@ -2,58 +2,49 @@ import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 import sys
 
-# Function to extract application names from Mac OS XML
+# Function to extract apps from Mac XML
 def extract_mac_apps(xml_file):
-    apps = []
+    apps = set()
     try:
         tree = ET.parse(xml_file)
         root = tree.getroot()
-        for app_group in root.findall(".//ApplicationGroupOSX"):
-            for app in app_group.findall(".//ApplicationOSX"):
-                # Extract identifiers
-                filename = app.get("FileName", "")
-                desc = app.get("Description", "")
-                app_type = app.get("Type", "")
-                # Use filename or description as the app name; skip wildcards unless specific
-                if filename and filename != "*":
-                    apps.append(filename.lower())
-                elif desc and "Any" not in desc:  # Avoid generic "Any macOS Binary" entries
-                    apps.append(desc.lower())
-                # Add more fields if needed (e.g., URI, CertificateString)
+
+        # Extract all apps from ApplicationGroupOSX
+        for app_group in root.findall('.//ApplicationGroupOSX'):
+            for app in app_group.findall('.//ApplicationOSX'):
+                app_name = app.get('FileName', '').lower()
+                desc = app.get('Description', '').lower()
+                if app_name and app_name != '*':
+                    apps.add(app_name)
+                elif desc and 'any' not in desc:
+                    apps.add(desc)
         return apps
     except ET.ParseError as e:
-        print(f"Error parsing {xml_file}: {e}")
-        return []
+        print(f"Error parsing Mac XML {xml_file}: {e}")
+        return set()
 
-# Function to extract application names from Windows XML
+# Function to extract apps from Windows XML
 def extract_windows_apps(xml_file):
-    apps = []
+    apps = set()
     try:
         tree = ET.parse(xml_file)
         root = tree.getroot()
-        for app_group in root.findall(".//ApplicationGroup"):
-            for app in app_group.findall(".//Application"):
-                # Extract identifiers
-                filename = app.get("FileName", "")
-                desc = app.get("Description", "")
-                app_type = app.get("Type", "")
-                service_name = app.get("ServiceName", "")
-                appx_name = app.get("AppxPackageName", "")
-                # Use filename, description, or other fields; skip wildcards unless specific
-                if filename and filename != "*":
-                    apps.append(filename.lower())
-                elif desc and "Any" not in desc:
-                    apps.append(desc.lower())
-                elif service_name and service_name != "*":
-                    apps.append(service_name.lower())
-                elif appx_name and appx_name != "*":
-                    apps.append(appx_name.lower())
+
+        # Extract all apps from ApplicationGroup
+        for app_group in root.findall('.//ApplicationGroup'):
+            for app in app_group.findall('.//Application'):
+                app_name = app.get('FileName', '').lower()
+                desc = app.get('Description', '').lower()
+                if app_name and app_name != '*':
+                    apps.add(app_name)
+                elif desc and 'any' not in desc:
+                    apps.add(desc)
         return apps
     except ET.ParseError as e:
-        print(f"Error parsing {xml_file}: {e}")
-        return []
+        print(f"Error parsing Windows XML {xml_file}: {e}")
+        return set()
 
-# Function for partial matching
+# Partial match function
 def is_partial_match(blocked_app, xml_app, threshold=0.75):
     return SequenceMatcher(None, blocked_app.lower(), xml_app.lower()).ratio() >= threshold
 
@@ -63,37 +54,53 @@ def compare_blocklist_with_xml(blocklist_file, windows_xml, mac_xml):
     with open(blocklist_file, 'r') as f:
         blocklist = [line.strip().lower() for line in f if line.strip()]
 
-    # Extract apps from XML files
-    windows_apps = extract_windows_apps(windows_xml)
+    # Extract apps
     mac_apps = extract_mac_apps(mac_xml)
-    all_apps = set(windows_apps + mac_apps)
+    windows_apps = extract_windows_apps(windows_xml)
 
-    # Compare blocklist with XML apps
-    found = []
-    not_found = []
-
+    # Compare separately
+    results = []
     for blocked_app in blocklist:
-        matched = False
-        for xml_app in all_apps:
+        mac_match = None
+        windows_match = None
+        
+        for xml_app in mac_apps:
             if is_partial_match(blocked_app, xml_app):
-                found.append((blocked_app, xml_app))
-                matched = True
+                mac_match = xml_app
                 break
-        if not matched:
-            not_found.append(blocked_app)
+        
+        for xml_app in windows_apps:
+            if is_partial_match(blocked_app, xml_app):
+                windows_match = xml_app
+                break
+        
+        results.append({
+            'blocklist_app': blocked_app,
+            'mac_match': mac_match,
+            'windows_match': windows_match
+        })
 
     # Output results
-    print("\nApplications from blocklist found in XML policies:")
-    for b_app, x_app in found:
-        print(f"Blocklist: '{b_app}' -> Matched in XML: '{x_app}'")
+    print("\nBlocklist Validation Results:")
+    print(f"{'Blocklist App':<30} {'Found in Mac XML':<30} {'Found in Windows XML':<30}")
+    print("-" * 90)
+    for result in results:
+        mac_status = f"Yes ({result['mac_match']})" if result['mac_match'] else "No"
+        windows_status = f"Yes ({result['windows_match']})" if result['windows_match'] else "No"
+        print(f"{result['blocklist_app']:<30} {mac_status:<30} {windows_status:<30}")
 
-    print("\nApplications from blocklist NOT found in XML policies:")
-    for app in not_found:
-        print(f"'{app}'")
+    # Summary
+    missing_mac = [r['blocklist_app'] for r in results if not r['mac_match']]
+    missing_windows = [r['blocklist_app'] for r in results if not r['windows_match']]
+    
+    print("\nSummary:")
+    print(f"Apps missing from Mac XML: {len(missing_mac)}")
+    if missing_mac:
+        print("  " + ", ".join(missing_mac))
+    print(f"Apps missing from Windows XML: {len(missing_windows)}")
+    if missing_windows:
+        print("  " + ", ".join(missing_windows))
 
-    return found, not_found
-
-# Example usage
 if __name__ == "__main__":
     if len(sys.argv) != 4:
         print("Usage: python script.py blocklist.txt windows.xml mac.xml")
@@ -104,3 +111,5 @@ if __name__ == "__main__":
     mac_xml = sys.argv[3]
 
     compare_blocklist_with_xml(blocklist_file, windows_xml, mac_xml)
+
+python3 script.py eapl.txt WinProductionPolicy-Green_v39_202503241210.xml MacProductionPolicy-Blue_v56_202503241210.xml
