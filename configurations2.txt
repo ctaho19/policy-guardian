@@ -1,1 +1,148 @@
+import csv
+import re
+from thefuzz import fuzz # Import the fuzzy matching library
 
+# --- Configuration ---
+FILE_A = 'list_a.csv'  # Path to your first CSV file
+FILE_B = 'list_b.csv'  # Path to your second CSV file
+COLUMN_NAME_A = 'ApplicationName' # Column header containing app names in FILE_A
+COLUMN_NAME_B = 'SoftwareTitle'   # Column header containing app names in FILE_B
+OUTPUT_FILE = 'delta_apps.csv' # File to write the results
+SIMILARITY_THRESHOLD = 85 # Score out of 100. Adjust based on your data! (80-90 is common)
+# --- End Configuration ---
+
+def read_app_list(filename, column_name):
+    """Reads application names from a specific column in a CSV file."""
+    apps = set() # Use a set for efficient lookup later if needed, and uniqueness
+    try:
+        with open(filename, 'r', newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            if column_name not in reader.fieldnames:
+                raise ValueError(f"Column '{column_name}' not found in {filename}. Available columns: {reader.fieldnames}")
+            for row in reader:
+                app_name = row[column_name]
+                if app_name: # Ensure the cell is not empty
+                    apps.add(app_name.strip()) # Basic cleaning: remove leading/trailing whitespace
+    except FileNotFoundError:
+        print(f"Error: File not found - {filename}")
+        return None
+    except Exception as e:
+        print(f"Error reading {filename}: {e}")
+        return None
+    return list(apps) # Convert back to list for ordered iteration if needed
+
+def normalize_name(name):
+    """Applies more aggressive normalization (optional)."""
+    # 1. Lowercase
+    name = name.lower()
+    # 2. Remove common version patterns (e.g., v1.2.3, 10.1, build 5) - adjust regex as needed
+    name = re.sub(r'v\d+(\.\d+)*', '', name) # Matches v1, v1.0, v1.2.3 etc.
+    name = re.sub(r'\b\d+(\.\d+){1,}\b', '', name) # Matches 1.0, 10.5.2 etc. (but not single digits)
+    name = re.sub(r'\bbuild\s+\d+\b', '', name)
+    # 3. Remove common suffixes/prefixes (add more based on your data)
+    common_terms = ['app', 'inc', 'corp', 'ltd', 'limited', '(x64)', '(x86)', '64-bit', '32-bit', 'edition', 'professional', 'standard']
+    for term in common_terms:
+        name = name.replace(term, '')
+    # 4. Remove punctuation (optional, might remove important chars)
+    # name = re.sub(r'[^\w\s]', '', name) # Removes punctuation
+    # 5. Remove extra whitespace
+    name = ' '.join(name.split())
+    return name.strip()
+
+# --- Main Script Logic ---
+
+print(f"Reading applications from {FILE_A} (Column: '{COLUMN_NAME_A}')...")
+list_a = read_app_list(FILE_A, COLUMN_NAME_A)
+
+print(f"Reading applications from {FILE_B} (Column: '{COLUMN_NAME_B}')...")
+list_b = read_app_list(FILE_B, COLUMN_NAME_B)
+
+if list_a is None or list_b is None:
+    print("Exiting due to file reading errors.")
+    exit()
+
+print(f"Found {len(list_a)} unique apps in List A.")
+print(f"Found {len(list_b)} unique apps in List B.")
+
+delta_apps = []
+
+print(f"\nComparing List A against List B using threshold {SIMILARITY_THRESHOLD}...")
+
+# --- Choose ONE normalization strategy ---
+# Strategy 1: Simple normalization (lowercase, strip whitespace) - done during read
+# processed_list_a = [name.lower() for name in list_a]
+# processed_list_b = [name.lower() for name in list_b]
+
+# Strategy 2: More aggressive normalization (using the function)
+print("Normalizing names for comparison...")
+processed_list_a = {original: normalize_name(original) for original in list_a}
+processed_list_b = [normalize_name(name) for name in list_b]
+# --- ---
+
+count_a = 0
+total_a = len(list_a)
+
+for original_a, norm_a in processed_list_a.items():
+    count_a += 1
+    found_match = False
+    best_match_score = 0
+    best_match_b = ""
+
+    if not norm_a: # Skip empty normalized names
+         print(f"Skipping empty normalized name for original: '{original_a}'")
+         continue
+
+    for norm_b in processed_list_b:
+        if not norm_b: continue # Skip empty normalized names in list B
+
+        # --- Choose a Fuzzy Matching Ratio ---
+        # Simple Ratio: Basic Levenshtein distance ratio
+        # score = fuzz.ratio(norm_a, norm_b)
+
+        # Partial Ratio: Good if one name is a substring of the other
+        # score = fuzz.partial_ratio(norm_a, norm_b)
+
+        # Token Sort Ratio: Ignores word order
+        # score = fuzz.token_sort_ratio(norm_a, norm_b)
+
+        # Token Set Ratio: Ignores word order and duplicate words (often best for this)
+        score = fuzz.token_set_ratio(norm_a, norm_b)
+        # --- ---
+
+        if score >= SIMILARITY_THRESHOLD:
+            found_match = True
+            best_match_score = score # Keep track if you want to see the match
+            best_match_b = norm_b   # Keep track if you want to see the match
+            break # Found a good enough match, move to the next app in List A
+
+    if not found_match:
+        delta_apps.append(original_a) # Add the ORIGINAL name from List A
+        print(f"[{count_a}/{total_a}] No match found for: '{original_a}'")
+    else:
+        # Optional: Print matched items for verification
+        # print(f"[{count_a}/{total_a}] Match found for: '{original_a}' -> '{best_match_b}' (Score: {best_match_score})")
+        # Simple progress indicator for matches
+        if count_a % 50 == 0: # Print progress every 50 apps
+             print(f"[{count_a}/{total_a}] Processing...")
+
+
+print(f"\nComparison complete. Found {len(delta_apps)} applications in '{FILE_A}' not found in '{FILE_B}'.")
+
+# --- Output Results ---
+if delta_apps:
+    print(f"\nApplications in '{FILE_A}' potentially not in '{FILE_B}':")
+    for app in delta_apps:
+        print(f"- {app}")
+
+    # Write to CSV
+    try:
+        with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8') as outfile:
+            writer = csv.writer(outfile)
+            writer.writerow(['ApplicationNotInListB']) # Header row
+            for app in sorted(delta_apps): # Sort for readability
+                writer.writerow([app])
+        print(f"\nResults also written to '{OUTPUT_FILE}'")
+    except Exception as e:
+        print(f"\nError writing output file '{OUTPUT_FILE}': {e}")
+else:
+    print("\nNo applications found in the delta (all apps in List A seem to have a match in List B).")
