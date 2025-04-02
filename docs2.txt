@@ -1,0 +1,113 @@
+Solution: Simplify QuickSight Visual Setup and Use Correct Aggregation
+
+The most robust way to achieve this is to let QuickSight handle the primary aggregation before sending data to Highcharts.
+
+Step 1: Modify the QuickSight Visual Fields
+
+Go to the field wells for your Highcharts custom visual in QuickSight.
+Remove Fields:
+Remove DATE from the "Group/Color by" field well.
+Remove CTRL_ID from the "Group/Color by" field well.
+Remove the test_cnt_over_03-27 calculated field from the "Value" field well.
+Keep/Add Fields:
+Group/Color by: Ensure AGGREGATED_STATUS is the only field here. It will now be at index 0.
+Value: Create a new calculated field specifically for this visual, or use a standard aggregation:
+Option A (New Calculated Field - Recommended for Clarity):
+Name: Distinct Control Count (or similar)
+Formula: distinct_count(CTRL_ID)
+Add this new calculated field to the "Value" field well.
+Option B (Direct Aggregation):
+Drag CTRL_ID to the "Value" field well.
+Click the dropdown next to CTRL_ID in the field well and change the aggregation to Count Distinct.
+This distinct count measure will now be at index 1.
+Step 2: Update the Highcharts JSON Configuration
+
+Now that QuickSight is sending correctly aggregated data (one row per AGGREGATED_STATUS with its corresponding distinct CTRL_ID count), update the JSON to reference the new column indices.
+
+{
+    "chart": {
+        "type": "pie"
+    },
+    "title": {
+        "text": "DISTRIBUTION BREAKDOWN: PERCENTAGE SPLIT BY COMPLIANCE STATUS"
+    },
+    "tooltip": {
+         // Shows the actual count and the percentage
+        "pointFormat": "{series.name}: <b>{point.y}</b> ({point.percentage:.1f}%)"
+    },
+    "plotOptions": {
+        "pie": {
+            "allowPointSelect": true,
+            "cursor": "pointer",
+            "colors": [ // Optional: Define specific colors if needed
+                "#008000", // Green
+                "#FFA500", // Yellow/Orange
+                "#FF0000"  // Red
+                // Ensure order matches your expected status order or rely on Highcharts default
+            ],
+            "dataLabels": [
+                {
+                    // Configuration for the connector lines (optional, adjust distance)
+                    "enabled": true,
+                    "distance": 20,
+                     // Ensure labels don't show if filtered out by the percentage rule below
+                    "filter": {
+                        "operator": ">",
+                        "property": "percentage",
+                        "value": 10
+                    }
+                },
+                {
+                    // Configuration for the percentage text labels inside/outside slices
+                    "enabled": true,
+                    "distance": -40, // Position inside the slice
+                    "format": "{point.percentage:.1f}%",
+                    "style": {
+                        "fontSize": "1.2em",
+                        "fontWeight": "bold",
+                        "color": "white", // Ensure contrast with slice color
+                        "textOutline": "none" // Cleaner look
+                    },
+                    "filter": {
+                        "operator": ">",
+                        "property": "percentage",
+                        "value": 10 // Only show label if slice > 10%
+                    }
+                }
+            ],
+             "showInLegend": true // Optional: Add a legend
+        }
+    },
+    "series": [
+        {
+            "type": "pie",
+            "name": "Controls", // Changed name to reflect the count value
+            "colorByPoint": true, // If not using specific colors above, this assigns defaults
+            "data": {
+                "type": "array",
+                // Use index 0 for AGGREGATED_STATUS (Category Name)
+                // Use index 1 for the Distinct Control Count (Value)
+                "values": [
+                    ["getColumn", 0],
+                    ["getColumn", 1]
+                ]
+                // Optional: If you want specific statuses mapped to specific colors,
+                // you might need to use data.processor or map names explicitly if colors array doesn't align
+            }
+        }
+    ]
+}
+Use code with caution.
+Json
+Explanation of Changes:
+
+QuickSight Visual Fields: By removing DATE and CTRL_ID from the grouping and using distinct_count(CTRL_ID) as the value, QuickSight now performs the aggregation. It will send only a few rows to Highcharts:
+["green", <distinct_count_of_CTRL_ID_for_green>]
+["yellow", <distinct_count_of_CTRL_ID_for_yellow>]
+["red", <distinct_count_of_CTRL_ID_for_red>]
+Highcharts JSON series.data.values: Updated to [["getColumn", 0], ["getColumn", 1]] to match the simplified data structure being sent (Status Name at index 0, Distinct Count at index 1).
+Tooltip: Updated pointFormat to show both the raw count ({point.y}) and the percentage.
+Data Labels: Refined the data label configuration slightly for clarity and added a filter to the connector line label as well, ensuring consistency. Added fontWeight and color for better visibility inside slices.
+Colors (Optional): Added a plotOptions.pie.colors array. You can customize this to match your desired colors for green, yellow, red. Ensure the order aligns with how the data might be sorted or processed. If you remove this, colorByPoint: true will use Highcharts default colors.
+Series Name: Changed series.name to "Controls" to better reflect that the y value represents the count of controls. The tooltip clarifies the percentage.
+Why this works: This approach leverages QuickSight's aggregation engine to prepare the data correctly before it hits Highcharts. Highcharts then simply needs to render the pre-aggregated data, which is exactly what the pie chart type is designed for. The data label filtering and formatting should work as expected on this correctly structured data.
