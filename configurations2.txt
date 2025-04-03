@@ -1,0 +1,90 @@
+{
+    "chart": {
+        "type": "pie" // Use standard pie
+    },
+    "title": {
+        "text": "DISTRIBUTION BREAKDOWN: PERCENTAGE SPLIT BY COMPLIANCE STATUS"
+    },
+    "tooltip": {
+        // Show Status Name, the count (y value), and the percentage
+        "pointFormat": "{series.name}: <b>{point.y}</b> ({point.percentage:.1f}%)<br/>Status: <b>{point.name}</b>"
+    },
+    "plotOptions": {
+        "pie": {
+            "allowPointSelect": true,
+            "cursor": "pointer",
+            // Optional: If you want a donut chart, uncomment the next line
+             "innerSize": "50%",
+            "colors": [
+                // Define colors. Highcharts tries to match these to the point names
+                // if `colorByPoint` is false, or assigns them sequentially if true.
+                // For explicit matching, structure data as {name: 'Red', y: value, color: '#FF0000'} below.
+                // Let's rely on `colorByPoint` for simplicity first. Remove this `colors` array for now
+                // or ensure the order matches your data (e.g., Green, Yellow, Red if sorted that way).
+            ],
+            "dataLabels": [
+                {
+                    // Optional: Connector line label (shows category name by default)
+                    "enabled": true,
+                    "distance": 20,
+                     // Filter based on percentage
+                    "filter": {
+                        "operator": ">",
+                        "property": "percentage",
+                        "value": 10
+                    }
+                },
+                {
+                    // Percentage label inside/outside slice
+                    "enabled": true,
+                    "distance": -40, // Adjust position as needed (-ve = inside)
+                    "format": "{point.percentage:.1f}%",
+                    "style": {
+                        "fontSize": "1.2em",
+                        "fontWeight": "bold",
+                        "color": "white",
+                        "textOutline": "none"
+                    },
+                     // Filter based on percentage
+                    "filter": {
+                        "operator": ">",
+                        "property": "percentage",
+                        "value": 10
+                    }
+                }
+            ],
+            "showInLegend": true
+        }
+    },
+    "series": [
+        {
+            "type": "pie", // Ensure series type matches chart type
+            "name": "Control Count", // Name for the series (appears in tooltip)
+            "colorByPoint": true, // Assign colors from default palette or `plotOptions.pie.colors` sequentially
+            "data": {
+                // Simple array mapping for pre-aggregated data
+                "type": "array",
+                "values": [
+                    // Column 0 (AGGREGATED_STATUS) -> Point Name
+                    ["getColumn", 0],
+                    // Column 1 (Distinct Count) -> Point Value (y)
+                    ["getColumn", 1]
+                ]
+
+                /* --- Alternative Data Structure for Explicit Color Mapping ---
+                // If colorByPoint doesn't give the right colors consistently,
+                // you might need to structure data points explicitly.
+                // This usually requires processing *within* Highcharts if QuickSight
+                // doesn't let you add a 'color' column easily.
+                // Example (conceptual - harder to achieve with direct QuickSight mapping):
+                 "values": [
+                     { "name": "Red", "y": ["getColumn", 1, {"where": {"field": ["getColumn",0], "eq": "Red"}}], "color": "#FF0000" },
+                     { "name": "Green", "y": ["getColumn", 1, {"where": {"field": ["getColumn",0], "eq": "Green"}}], "color": "#008000" },
+                     { "name": "Yellow", "y": ["getColumn", 1, {"where": {"field": ["getColumn",0], "eq": "Yellow"}}], "color": "#FFA500" }
+                 ]
+                // Stick to the simple ["getColumn", 0], ["getColumn", 1] for now.
+                */
+            }
+        }
+    ]
+}
