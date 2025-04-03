@@ -1,90 +1,91 @@
-{
-    "chart": {
-        "type": "pie" // Use standard pie
-    },
-    "title": {
-        "text": "DISTRIBUTION BREAKDOWN: PERCENTAGE SPLIT BY COMPLIANCE STATUS"
-    },
-    "tooltip": {
-        // Show Status Name, the count (y value), and the percentage
-        "pointFormat": "{series.name}: <b>{point.y}</b> ({point.percentage:.1f}%)<br/>Status: <b>{point.name}</b>"
-    },
-    "plotOptions": {
-        "pie": {
-            "allowPointSelect": true,
-            "cursor": "pointer",
-            // Optional: If you want a donut chart, uncomment the next line
-             "innerSize": "50%",
-            "colors": [
-                // Define colors. Highcharts tries to match these to the point names
-                // if `colorByPoint` is false, or assigns them sequentially if true.
-                // For explicit matching, structure data as {name: 'Red', y: value, color: '#FF0000'} below.
-                // Let's rely on `colorByPoint` for simplicity first. Remove this `colors` array for now
-                // or ensure the order matches your data (e.g., Green, Yellow, Red if sorted that way).
-            ],
-            "dataLabels": [
-                {
-                    // Optional: Connector line label (shows category name by default)
-                    "enabled": true,
-                    "distance": 20,
-                     // Filter based on percentage
-                    "filter": {
-                        "operator": ">",
-                        "property": "percentage",
-                        "value": 10
-                    }
-                },
-                {
-                    // Percentage label inside/outside slice
-                    "enabled": true,
-                    "distance": -40, // Adjust position as needed (-ve = inside)
-                    "format": "{point.percentage:.1f}%",
-                    "style": {
-                        "fontSize": "1.2em",
-                        "fontWeight": "bold",
-                        "color": "white",
-                        "textOutline": "none"
-                    },
-                     // Filter based on percentage
-                    "filter": {
-                        "operator": ">",
-                        "property": "percentage",
-                        "value": 10
-                    }
-                }
-            ],
-            "showInLegend": true
-        }
-    },
-    "series": [
-        {
-            "type": "pie", // Ensure series type matches chart type
-            "name": "Control Count", // Name for the series (appears in tooltip)
-            "colorByPoint": true, // Assign colors from default palette or `plotOptions.pie.colors` sequentially
-            "data": {
-                // Simple array mapping for pre-aggregated data
-                "type": "array",
-                "values": [
-                    // Column 0 (AGGREGATED_STATUS) -> Point Name
-                    ["getColumn", 0],
-                    // Column 1 (Distinct Count) -> Point Value (y)
-                    ["getColumn", 1]
-                ]
+# --- Add this new function ---
+import random # Add import if not already present
 
-                /* --- Alternative Data Structure for Explicit Color Mapping ---
-                // If colorByPoint doesn't give the right colors consistently,
-                // you might need to structure data points explicitly.
-                // This usually requires processing *within* Highcharts if QuickSight
-                // doesn't let you add a 'color' column easily.
-                // Example (conceptual - harder to achieve with direct QuickSight mapping):
-                 "values": [
-                     { "name": "Red", "y": ["getColumn", 1, {"where": {"field": ["getColumn",0], "eq": "Red"}}], "color": "#FF0000" },
-                     { "name": "Green", "y": ["getColumn", 1, {"where": {"field": ["getColumn",0], "eq": "Green"}}], "color": "#008000" },
-                     { "name": "Yellow", "y": ["getColumn", 1, {"where": {"field": ["getColumn",0], "eq": "Yellow"}}], "color": "#FFA500" }
-                 ]
-                // Stick to the simple ["getColumn", 0], ["getColumn", 1] for now.
-                */
-            }
-        }
-    ]
-}
+def filter_out_of_scope_keys(resources: List[Dict], desired_fields_for_report: List[str]) -> Tuple[List[Dict], pd.DataFrame]:
+    """Filters out resources based on predefined exclusion criteria for KMS keys."""
+    in_scope_resources = []
+    excluded_resources_data = []
+    
+    # Ensure essential fields for reporting/debugging are included, even if not explicitly asked for in the report output
+    # These fields are REQUIRED for the filtering logic itself.
+    required_filter_fields = {"resourceId", "accountResourceId", "configuration.keyState", "ConfigurationObject.keyManager", "Source"}
+    report_fields = set(desired_fields_for_report) | required_filter_fields # Combine and ensure uniqueness
+    
+    logger.info(f"Starting filtering of {len(resources)} fetched resources based on exclusion rules...")
+
+    for resource in resources:
+        exclude = False
+        reason = "N/A"
+        
+        # --- Exclusion Check 1: Orphaned Keys (Source field) ---
+        source_field = resource.get("Source") 
+        if source_field == "CT-AccessDenied":
+            exclude = True
+            reason = "Source = CT-AccessDenied (Orphaned)"
+
+        # --- Exclusion Check 2 & 3: Configuration List Checks (Key State & Key Manager) ---
+        key_state = "N/A" # Default if not found
+        key_manager = "N/A" # Default if not found
+            
+        if not exclude: # Only check configurations if not already excluded by Source
+            config_list = resource.get("configurationList", [])
+            
+            for config in config_list:
+                config_name = config.get("configurationName")
+                config_value = config.get("configurationValue")
+
+                if config_name == "configuration.keyState":
+                    key_state = config_value if config_value is not None else "N/A" 
+                elif config_name == "ConfigurationObject.keyManager": 
+                    key_manager = config_value if config_value is not None else "N/A"
+            
+            # Check Key State (Using corrected values: PendingDeletion, PendingReplicaDeletion)
+            if key_state in ["PendingDeletion", "PendingReplicaDeletion"]:
+                exclude = True
+                reason = f"KeyState = {key_state} (Pending Deletion/Replica Deletion)"
+            
+            # Check Key Manager (Only if not excluded by KeyState)
+            elif key_manager == "AWS":
+                exclude = True
+                reason = "KeyManager = AWS (AWS Managed)"
+
+        # --- Store results ---
+        if exclude:
+            # Create dict for excluded report using fields needed for identification/reasoning
+            excluded_info = {}
+            for field in report_fields: # Populate based on the combined required+desired fields
+                 # Handle potential nested structure access for reporting
+                 if '.' in field:
+                     parts = field.split('.', 1)
+                     parent, child = parts[0], parts[1]
+                     value = "N/A"
+                     if parent == "configurationList":
+                         config_list_val = resource.get(parent, [])
+                         value = next((c.get("configurationValue") for c in config_list_val if c.get("configurationName") == field), "N/A")
+                     elif parent in ["configuration", "supplementaryConfiguration"]:
+                          # Use values already extracted if available, otherwise search configList
+                          if field == "configuration.keyState": value = key_state
+                          elif field == "ConfigurationObject.keyManager": value = key_manager # Note: This might differ slightly from field name if desired_fields has diff case
+                          else: 
+                              nested_config = next((c for c in resource.get("configurationList", []) if c.get("configurationName") == field), None)
+                              value = nested_config.get("configurationValue") if nested_config else "N/A (Not Found)"
+                     else: # Top level or other structure
+                          value = resource.get(parent, {}).get(child, "N/A")
+                     excluded_info[field] = value
+                 else: # Top-level field (like Source, resourceId)
+                     excluded_info[field] = resource.get(field, "N/A")
+
+            excluded_info["exclusionReason"] = reason
+            excluded_resources_data.append(excluded_info)
+        else:
+            # If not excluded, add to the list of resources to be processed for compliance
+            in_scope_resources.append(resource)
+
+    excluded_df = pd.DataFrame(excluded_resources_data)
+    logger.info(f"Exclusion filtering complete. In-scope: {len(in_scope_resources)}, Excluded: {len(excluded_resources_data)}")
+    
+    if not excluded_df.empty:
+        logger.debug("Exclusion reasons summary:")
+        logger.debug(excluded_df['exclusionReason'].value_counts().to_string())
+        
+    return in_scope_resources, excluded_df
