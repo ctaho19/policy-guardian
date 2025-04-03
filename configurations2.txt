@@ -1,60 +1,95 @@
-# --- Add this new function ---
-import random # Add import if not already present
-
-def filter_out_of_scope_keys(resources: List[Dict], desired_fields_for_report: List[str]) -> Tuple[List[Dict], pd.DataFrame]:
-    """Filters out resources based on predefined exclusion criteria for KMS keys."""
-    in_scope_resources = []
-    excluded_resources_data = []
+# --- Replace your existing filter_tier1_resources function with this ---
+def filter_tier1_resources(resources: List[Dict], config_key: str, fields_for_report: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources based on Tier 1 compliance (non-empty specified config_key)."""
+    matching_count = 0
+    non_matching_resources = []
     
-    # Ensure essential fields for reporting/debugging are included, even if not explicitly asked for in the report output
-    # These fields are REQUIRED for the filtering logic itself.
-    required_filter_fields = {"resourceId", "accountResourceId", "configuration.keyState", "ConfigurationObject.keyManager", "Source"}
-    report_fields = set(desired_fields_for_report) | required_filter_fields # Combine and ensure uniqueness
-    
-    logger.info(f"Starting filtering of {len(resources)} fetched resources based on exclusion rules...")
+    target_config_name = config_key # Assume full name like 'configuration.origin' or 'supplementaryConfiguration.KeyRotationStatus' is provided
+    output_config_col_name = config_key # Column name for the report DataFrame
 
     for resource in resources:
-        exclude = False
-        reason = "N/A"
+        config_list = resource.get("configurationList", [])
+        target_config = next((c for c in config_list if c.get("configurationName") == target_config_name), None)
         
-        # --- Exclusion Check 1: Orphaned Keys (Source field) ---
-        source_field = resource.get("Source") 
-        if source_field == "CT-AccessDenied":
-            exclude = True
-            reason = "Source = CT-AccessDenied (Orphaned)"
+        config_value = target_config.get("configurationValue") if target_config else None
+        
+        # Tier 1 Pass: Value exists and is not just whitespace
+        if config_value is not None and str(config_value).strip(): 
+            matching_count += 1
+        else:
+            # Tier 1 Fail: Value is None, empty string, or whitespace
+            filtered_resource = {}
+            # Populate report fields, handle potential nesting like in filter_out_of_scope
+            for field in fields_for_report:
+                 if '.' in field:
+                     parts = field.split('.', 1)
+                     parent, child = parts[0], parts[1]
+                     value = "N/A"
+                     if parent == "configurationList":
+                          config_list_val = resource.get(parent, [])
+                          value = next((c.get("configurationValue") for c in config_list_val if c.get("configurationName") == field), "N/A")
+                     elif parent in ["configuration", "supplementaryConfiguration"]: 
+                          # Get the value by searching configList for the specific key name
+                          nested_config = next((c for c in resource.get("configurationList", []) if c.get("configurationName") == field), None)
+                          value = nested_config.get("configurationValue") if nested_config else "N/A (Not Found)"
+                     else: # Top level or other structure
+                          value = resource.get(parent, {}).get(child, "N/A")
+                     filtered_resource[field] = value
+                 else:
+                     filtered_resource[field] = resource.get(field, "N/A")
 
-        # --- Exclusion Check 2 & 3: Configuration List Checks (Key State & Key Manager) ---
-        key_state = "N/A" # Default if not found
-        key_manager = "N/A" # Default if not found
+            # Ensure the specific config key's value is reported correctly
+            filtered_resource[output_config_col_name] = config_value if config_value is not None else "N/A (Not Found)"
+            non_matching_resources.append(filtered_resource)
             
-        if not exclude: # Only check configurations if not already excluded by Source
-            config_list = resource.get("configurationList", [])
-            
-            for config in config_list:
-                config_name = config.get("configurationName")
-                config_value = config.get("configurationValue")
+    logger.info(f"Tier 1 Check ({config_key} non-empty): Found {matching_count} compliant resources.")
+    
+    report_columns = list(fields_for_report)
+    # Ensure the specific config key column exists, even if the list is empty
+    if output_config_col_name not in report_columns:
+         report_columns.append(output_config_col_name)
+         
+    return matching_count, pd.DataFrame(non_matching_resources, columns=report_columns) if non_matching_resources else pd.DataFrame(columns=report_columns)
 
-                if config_name == "configuration.keyState":
-                    key_state = config_value if config_value is not None else "N/A" 
-                elif config_name == "ConfigurationObject.keyManager": 
-                    key_manager = config_value if config_value is not None else "N/A"
-            
-            # Check Key State (Using corrected values: PendingDeletion, PendingReplicaDeletion)
-            if key_state in ["PendingDeletion", "PendingReplicaDeletion"]:
-                exclude = True
-                reason = f"KeyState = {key_state} (Pending Deletion/Replica Deletion)"
-            
-            # Check Key Manager (Only if not excluded by KeyState)
-            elif key_manager == "AWS":
-                exclude = True
-                reason = "KeyManager = AWS (AWS Managed)"
+# --- Replace your existing filter_tier2_resources function with this ---
+def filter_tier2_resources(resources: List[Dict], config_key: str, expected_config_value: str, fields_for_report: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources based on Tier 2 compliance (config_key == expected_config_value).
+       Assumes input `resources` are those potentially compliant (e.g., all in-scope).
+    """
+    matching_count = 0
+    non_matching_resources = []
+    
+    target_config_name = config_key
+    output_config_col_name = config_key
 
-        # --- Store results ---
-        if exclude:
-            # Create dict for excluded report using fields needed for identification/reasoning
-            excluded_info = {}
-            for field in report_fields: # Populate based on the combined required+desired fields
-                 # Handle potential nested structure access for reporting
+    # Handle boolean comparison robustly (treat 'TRUE'/'FALSE' strings like booleans)
+    is_bool_expected = str(expected_config_value).upper() in ['TRUE', 'FALSE']
+    if is_bool_expected:
+        expected_bool_str = str(expected_config_value).upper()
+
+    for resource in resources:
+        config_list = resource.get("configurationList", [])
+        target_config = next((c for c in config_list if c.get("configurationName") == target_config_name), None)
+        
+        config_value_actual = None
+        if target_config:
+            config_value_actual = target_config.get("configurationValue")
+
+        # Tier 2 Pass Check:
+        is_match = False
+        if config_value_actual is not None: # Key must exist and have a value for Tier 2 comparison
+            if is_bool_expected:
+                is_match = str(config_value_actual).upper() == expected_bool_str
+            else:
+                is_match = str(config_value_actual) == str(expected_config_value)
+
+        if is_match:
+            matching_count += 1
+        else:
+            # Tier 2 Fail: Value exists but doesn't match, OR value doesn't exist (failed T1 implicitly)
+            filtered_resource = {}
+            # Populate report fields similarly to Tier 1
+            for field in fields_for_report:
                  if '.' in field:
                      parts = field.split('.', 1)
                      parent, child = parts[0], parts[1]
@@ -63,29 +98,23 @@ def filter_out_of_scope_keys(resources: List[Dict], desired_fields_for_report: L
                          config_list_val = resource.get(parent, [])
                          value = next((c.get("configurationValue") for c in config_list_val if c.get("configurationName") == field), "N/A")
                      elif parent in ["configuration", "supplementaryConfiguration"]:
-                          # Use values already extracted if available, otherwise search configList
-                          if field == "configuration.keyState": value = key_state
-                          elif field == "ConfigurationObject.keyManager": value = key_manager # Note: This might differ slightly from field name if desired_fields has diff case
-                          else: 
-                              nested_config = next((c for c in resource.get("configurationList", []) if c.get("configurationName") == field), None)
-                              value = nested_config.get("configurationValue") if nested_config else "N/A (Not Found)"
-                     else: # Top level or other structure
+                          nested_config = next((c for c in resource.get("configurationList", []) if c.get("configurationName") == field), None)
+                          value = nested_config.get("configurationValue") if nested_config else "N/A (Not Found)"
+                     else:
                           value = resource.get(parent, {}).get(child, "N/A")
-                     excluded_info[field] = value
-                 else: # Top-level field (like Source, resourceId)
-                     excluded_info[field] = resource.get(field, "N/A")
+                     filtered_resource[field] = value
+                 else:
+                     filtered_resource[field] = resource.get(field, "N/A")
+                     
+            # Report the actual value found (or N/A) for the specific config key
+            actual_value_str = config_value_actual if config_value_actual is not None else "N/A (Not Found)"
+            filtered_resource[output_config_col_name] = actual_value_str
+            non_matching_resources.append(filtered_resource)
+            
+    logger.info(f"Tier 2 Check ({config_key} == {expected_config_value}): Found {matching_count} compliant resources.")
 
-            excluded_info["exclusionReason"] = reason
-            excluded_resources_data.append(excluded_info)
-        else:
-            # If not excluded, add to the list of resources to be processed for compliance
-            in_scope_resources.append(resource)
+    report_columns = list(fields_for_report)
+    if output_config_col_name not in report_columns:
+         report_columns.append(output_config_col_name)
 
-    excluded_df = pd.DataFrame(excluded_resources_data)
-    logger.info(f"Exclusion filtering complete. In-scope: {len(in_scope_resources)}, Excluded: {len(excluded_resources_data)}")
-    
-    if not excluded_df.empty:
-        logger.debug("Exclusion reasons summary:")
-        logger.debug(excluded_df['exclusionReason'].value_counts().to_string())
-        
-    return in_scope_resources, excluded_df
+    return matching_count, pd.DataFrame(non_matching_resources, columns=report_columns) if non_matching_resources else pd.DataFrame(columns=report_columns)
