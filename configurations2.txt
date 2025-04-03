@@ -200,3 +200,223 @@ if __name__ == "__main__":
     main()
 # Or in Databricks interactive notebook, you can just call main() in the last cell:
 # main()
+
+
+
+
+
+
+
+# Block 10: Main Function - KMS Origin Check (CTRL-1077125)
+def main():
+    """Main pipeline for KMS Origin Compliance Monitoring (CTRL-1077125)."""
+    control_id = "CTRL-1077125"
+    logger.info(f"*** Starting Monitoring Run for {control_id} ***")
+
+    # Initialize Spark session 
+    try:
+        spark = SparkSession.builder.appName(f"KMS_Origin_Monitor_{control_id}").getOrCreate()
+        logger.info("Spark session initialized.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Spark session: {e}", exc_info=True)
+        return # Cannot proceed without Spark for thresholds
+
+    # --- Configuration specific to Origin Check ---
+    resource_config = {
+        "control_name": f"KMS Origin Check ({control_id})",
+        "resource_type": "AWS::KMS::Key",
+        "config_key": "configuration.origin", # Key to check for Tier 1/Tier 2 compliance
+        "config_value": "AWS_KMS",          # Expected value for Tier 2 compliance
+        # Fields needed for reporting AND for exclusion filtering
+        "desired_fields_for_report": [
+            "accountResourceId", "resourceId", "resourceType", 
+            "configuration.origin", # The key being checked
+            "configuration.keyState", # Needed for exclusion
+            "ConfigurationObject.keyManager", # Needed for exclusion
+            "Source" # Needed for exclusion
+        ],
+        "tier1_metric_id": "MNTR-XXXXXXX-T1", # <<< REPLACE with ACTUAL Metric ID for T1
+        "tier2_metric_id": "MNTR-XXXXXXX-T2", # <<< REPLACE with ACTUAL Metric ID for T2
+        "full_limit": None,        # None = fetch all, set number for testing (e.g., 50000)
+        "timeout": 120,            # API request timeout (increased for potentially large requests)
+        "max_retries": 3           # Max retries for failed API requests
+    }
+    logger.info(f"Configuration loaded for {resource_config['control_name']}")
+    logger.debug(f"Resource Config: {json.dumps(resource_config, indent=2)}")
+
+    # --- API Payload Definitions ---
+    # Payload to fetch detailed configurations for ALL keys (filtering happens later)
+    config_payload = {
+        "searchParameters": [{"resourceType": resource_config["resource_type"]}],
+        "responseFields": list(set(resource_config["desired_fields_for_report"])) # Ensure unique fields
+    }
+    
+    # Step 1: Fetch ALL relevant resources 
+    # No summary count needed beforehand, as we filter post-fetch.
+    logger.info("Step 1: Fetching all KMS Key configurations...")
+    all_resources, fetched_total_count = fetch_all_resources(
+        config_payload, 
+        limit=resource_config['full_limit'],
+        timeout=resource_config['timeout'],
+        max_retries=resource_config['max_retries']
+    )
+    
+    if fetched_total_count == 0:
+        logger.warning("No KMS Keys found via API. Check API endpoint or search parameters. Exiting.")
+        # Optionally create an empty monitoring report indicating no resources found
+        return
+        
+    logger.info(f"Successfully fetched {fetched_total_count} total KMS Key configurations.")
+
+    # Step 2: Filter out excluded resources
+    logger.info("Step 2: Filtering fetched resources for exclusions...")
+    in_scope_resources, excluded_resources_df = filter_out_of_scope_keys(
+        all_resources, 
+        resource_config["desired_fields_for_report"]
+    )
+    
+    final_denominator = len(in_scope_resources) 
+    logger.info(f"Filtering complete. In-Scope resources: {final_denominator}, Excluded: {len(excluded_resources_df)}")
+
+    # Optionally display/save excluded resources report
+    if not excluded_resources_df.empty:
+        print("\n--- Excluded Resources Report ---")
+        # In Databricks use: display(excluded_resources_df) 
+        print(f"(Showing first 50 of {len(excluded_resources_df)} excluded resources)")
+        print(excluded_resources_df.head(50).to_string())
+        # Consider saving: excluded_resources_df.to_csv("excluded_origin_check.csv", index=False)
+
+    # Handle case where no resources are left after filtering
+    if final_denominator == 0:
+        logger.warning("No resources remaining in scope after filtering. Setting metrics to N/A.")
+        tier1_numerator = 0
+        tier2_numerator = 0
+        tier1_non_compliant_df = pd.DataFrame(columns=resource_config["desired_fields_for_report"])
+        tier2_non_compliant_df = pd.DataFrame(columns=resource_config["desired_fields_for_report"])
+        tier2_denominator = 0 # Explicitly set for clarity
+    else:
+        # Step 3: Apply Tier 1 & Tier 2 compliance filtering ONLY to IN-SCOPE resources
+        logger.info(f"Step 3: Applying Tier 1 compliance filter ({resource_config['config_key']} non-empty) to {final_denominator} in-scope resources...")
+        tier1_numerator, tier1_non_compliant_df = filter_tier1_resources(
+            in_scope_resources, 
+            resource_config["config_key"], 
+            resource_config["desired_fields_for_report"]
+        )
+        
+        logger.info(f"Step 3b: Applying Tier 2 compliance filter ({resource_config['config_key']} == '{resource_config['config_value']}') to in-scope resources...")
+        # Tier 2 numerator is calculated based on the *in-scope* list.
+        # The denominator for the Tier 2 *metric* will be tier1_numerator.
+        tier2_numerator, tier2_non_compliant_df = filter_tier2_resources(
+            in_scope_resources, 
+            resource_config["config_key"], 
+            resource_config["config_value"], 
+            resource_config["desired_fields_for_report"]
+        )
+        # Tier 2 denominator is the count of resources that passed Tier 1
+        tier2_denominator = tier1_numerator
+
+    logger.info(f"Compliance counts: Tier 1 Compliant (Numerator) = {tier1_numerator}, Tier 2 Compliant (Numerator) = {tier2_numerator}")
+    logger.info(f"Denominators: Tier 1 Denom = {final_denominator}, Tier 2 Denom = {tier2_denominator}")
+
+    # Step 4: Load thresholds and calculate compliance status
+    logger.info("Step 4: Loading thresholds and calculating compliance...")
+    metric_ids_to_load = [resource_config["tier1_metric_id"], resource_config["tier2_metric_id"]]
+    thresholds_pd_df = load_thresholds(spark, metric_ids_to_load)
+    
+    # Function to safely get threshold value
+    def get_threshold_value(df, metric_id, threshold_type):
+        row = df[df["MONITORING_METRIC_ID"] == metric_id]
+        if not row.empty:
+            value = row.iloc[0][threshold_type]
+            # Convert to float if possible, handle various null representations
+            if value is None or str(value).upper() in ["NULL", "NONE", ""]:
+                return None
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert threshold '{threshold_type}' value '{value}' for {metric_id} to float. Treating as None.")
+                return None
+        logger.warning(f"Threshold definition not found for {metric_id}. Cannot get {threshold_type}.")
+        return None # Not found
+
+    # Get specific thresholds using the safe function
+    t1_alert = get_threshold_value(thresholds_pd_df, resource_config["tier1_metric_id"], "ALERT_THRESHOLD")
+    t1_warn = get_threshold_value(thresholds_pd_df, resource_config["tier1_metric_id"], "WARNING_THRESHOLD")
+    t2_alert = get_threshold_value(thresholds_pd_df, resource_config["tier2_metric_id"], "ALERT_THRESHOLD")
+    t2_warn = get_threshold_value(thresholds_pd_df, resource_config["tier2_metric_id"], "WARNING_THRESHOLD")
+
+    logger.info(f"Thresholds Used: T1 Alert={t1_alert}, T1 Warn={t1_warn}, T2 Alert={t2_alert}, T2 Warn={t2_warn}")
+        
+    # Calculate metrics
+    tier1_metric = tier1_numerator / final_denominator if final_denominator > 0 else 0
+    tier2_metric = tier2_numerator / tier2_denominator if tier2_denominator > 0 else 0 # Use T1 numerator as T2 denom
+
+    # Determine status
+    tier1_status = get_compliance_status(tier1_metric, t1_alert, t1_warn)
+    tier2_status = get_compliance_status(tier2_metric, t2_alert, t2_warn)
+    logger.info(f"Metrics: Tier 1 = {tier1_metric:.2%}, Tier 2 = {tier2_metric:.2%}")
+    logger.info(f"Status: Tier 1 = {tier1_status}, Tier 2 = {tier2_status}")
+
+    # Step 5: Format results into monitoring DataFrame
+    logger.info("Step 5: Creating final monitoring DataFrame...")
+    monitoring_data = [
+        {
+            "DATE": datetime.now().strftime("%Y-%m-%d"),
+            "MONITORING_METRIC_NUMBER": resource_config["tier1_metric_id"],
+            "MONITORING_METRIC": f"{round(tier1_metric * 100, 2)}%",
+            "COMPLIANCE_STATUS": tier1_status,
+            "NUMERATOR": tier1_numerator,
+            "DENOMINATOR": final_denominator # Total in-scope
+        },
+        {
+            "DATE": datetime.now().strftime("%Y-%m-%d"),
+            "MONITORING_METRIC_NUMBER": resource_config["tier2_metric_id"],
+            "MONITORING_METRIC": f"{round(tier2_metric * 100, 2)}%",
+            "COMPLIANCE_STATUS": tier2_status,
+            "NUMERATOR": tier2_numerator,
+            "DENOMINATOR": tier2_denominator # Tier 1 compliant count
+        }
+    ]
+    monitoring_df = pd.DataFrame(monitoring_data)
+
+    # Step 6: Output detailed compliance reports and metrics
+    logger.info("Step 6: Reporting results...")
+    print(f"\n--- Final Compliance Report for: {resource_config['control_name']} ---")
+    print(f"\nTotal Fetched Resources: {fetched_total_count}")
+    print(f"Total Excluded Resources: {len(excluded_resources_df)}")
+    print(f"Total In-Scope Resources (Tier 1 Denominator): {final_denominator}")
+    print(f"Total Tier 1 Compliant Resources (Tier 2 Denominator): {tier1_numerator}")
+    
+    tier1_non_compliant_header = f"\nTier 1 Non-compliant (In-Scope) Resources ({resource_config['config_key']} missing or empty):"
+    print(tier1_non_compliant_header)
+    if not tier1_non_compliant_df.empty:
+         print(f"(Showing first 50 of {len(tier1_non_compliant_df)} non-compliant resources)")
+         # In Databricks use: display(tier1_non_compliant_df)
+         print(tier1_non_compliant_df.head(50).to_string())
+         # Consider saving: tier1_non_compliant_df.to_csv("tier1_noncompliant_origin.csv", index=False)
+    else:
+        print("None found (All in-scope resources passed Tier 1)")
+    
+    tier2_non_compliant_header = f"\nTier 2 Non-compliant (In-Scope) Resources ({resource_config['config_key']} != {resource_config['config_value']}):"
+    print(tier2_non_compliant_header)
+    if not tier2_non_compliant_df.empty:
+         print(f"(Showing first 50 of {len(tier2_non_compliant_df)} non-compliant resources)")
+         # In Databricks use: display(tier2_non_compliant_df)
+         print(tier2_non_compliant_df.head(50).to_string())
+         # Consider saving: tier2_non_compliant_df.to_csv("tier2_noncompliant_origin.csv", index=False)
+    else:
+        print("None found (All in-scope resources meeting Tier 1 criteria also met Tier 2)")
+    
+    print("\n--- Monitoring Metrics Summary ---")
+    # In Databricks use: display(monitoring_df)
+    print(monitoring_df.to_string())
+    # Consider saving: monitoring_df.to_csv("monitoring_summary_origin.csv", index=False)
+    # Or save to Delta table: spark.createDataFrame(monitoring_df).write.format("delta").mode("append").saveAsTable("your_monitoring_table")
+
+    logger.info(f"*** Monitoring Run for {control_id} Completed ***")
+
+# Block 11: Main Execution Trigger (Common to both)
+if __name__ == "__main__":
+    main()
+# Or in Databricks interactive notebook, you can just call main() in the last cell:
+# main() 
