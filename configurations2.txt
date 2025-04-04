@@ -1,226 +1,35 @@
-import csv
-import xml.etree.ElementTree as ET
-import re
-from thefuzz import fuzz
-import os
+    # Function to safely get threshold value
+    def get_threshold_value(df, metric_id, threshold_type):
+        # --- !!! ADD THESE CHECKS AT THE START !!! ---
+        if df is None or df.empty:
+             logger.warning(f"Cannot get threshold for {metric_id}/{threshold_type} because the input DataFrame is empty or None.")
+             return None
 
-# --- Configuration ---
-DELTA_APP_CSV = 'delta_apps.csv'
-DELTA_APP_COLUMN = 'ApplicationNotInListB'
-MAC_POLICY_XML = 'mac_policy.xml'
-WIN_POLICY_XML = 'windows_policy.xml'
-OUTPUT_MATCH_CSV = 'policy_matches_detailed.csv' # New output filename
-SIMILARITY_THRESHOLD = 85
+        # Check if the essential column exists *before* trying to filter
+        required_col = "MONITORING_METRIC_ID" 
+        if required_col not in df.columns:
+            logger.error(f"Required column '{required_col}' not found in threshold DataFrame! Available columns: {df.columns.tolist()}")
+            return None # Cannot proceed without this column
+        # --- !!! END CHECKS !!! ---
 
-# Attributes/elements to check (same as before)
-MAC_APP_TAG = 'ApplicationOSX'
-MAC_ATTRS_TO_CHECK = ['FileName', 'Description']
-MAC_GROUP_TAG = 'ApplicationGroupOSX'
-MAC_GROUP_ATTRS_TO_CHECK = ['Name', 'Description']
-
-WIN_APP_TAG = 'Application'
-WIN_ATTRS_TO_CHECK = ['FileName', 'Description', 'ServiceName', 'AppxPackageName', 'FileNameEx']
-WIN_GROUP_TAG = 'ApplicationGroup'
-WIN_GROUP_ATTRS_TO_CHECK = ['Name', 'Description']
-# --- End Configuration ---
-
-def read_delta_apps(filename, column_name):
-    """Reads delta application names from a CSV file."""
-    apps = set()
-    if not os.path.exists(filename):
-        print(f"Error: Delta CSV file not found - {filename}")
-        return None
-    try:
-        with open(filename, 'r', newline='', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            if column_name not in reader.fieldnames:
-                raise ValueError(f"Column '{column_name}' not found in {filename}. Available columns: {reader.fieldnames}")
-            for row in reader:
-                app_name = row[column_name]
-                if app_name:
-                    apps.add(app_name.strip())
-    except Exception as e:
-        print(f"Error reading delta CSV {filename}: {e}")
-        return None
-    # Return as a list to maintain order if needed, though set is fine here
-    return sorted(list(apps))
-
-def normalize_name(name):
-    """Applies normalization."""
-    if not name:
-        return ""
-    name = name.lower()
-    # Keep normalization consistent, adjust if needed
-    name = re.sub(r'v\d+(\.\d+)*', '', name)
-    name = re.sub(r'\b\d+(\.\d+){1,}\b', '', name)
-    name = re.sub(r'\bbuild\s+\d+\b', '', name)
-    common_terms = ['app', 'inc', 'corp', 'ltd', 'limited', '(x64)', '(x86)', '64-bit', '32-bit', 'edition', 'professional', 'standard', '.exe', '.app', '.msi', '.pkg']
-    # Use word boundaries for terms to avoid partial matches within words
-    for term in common_terms:
-         # Simple replace might be okay, but regex is safer for some terms
-         # name = name.replace(term, '')
-         name = re.sub(r'\b' + re.escape(term) + r'\b', '', name, flags=re.IGNORECASE)
-    name = ' '.join(name.split()) # Remove extra whitespace
-    return name.strip()
-
-def extract_policy_identifiers(filename, app_tag, app_attrs, group_tag, group_attrs):
-    """Extracts potential application identifiers from policy XML."""
-    # Store as list of dicts: [{'original': value, 'normalized': norm_value}, ...]
-    identifiers = []
-    if not os.path.exists(filename):
-        print(f"Warning: Policy file not found - {filename}. Skipping.")
-        return identifiers
-    try:
-        tree = ET.parse(filename)
-        root = tree.getroot()
-        seen_originals = set() # Avoid duplicate original strings
-
-        # Process Application elements
-        for app_elem in root.findall(f'.//{app_tag}'):
-            for attr in app_attrs:
-                value = app_elem.get(attr)
-                if value and value.strip() and value != "*" and value.strip() not in seen_originals:
-                    norm_value = normalize_name(value)
-                    if norm_value:
-                        identifiers.append({'original': value.strip(), 'normalized': norm_value})
-                        seen_originals.add(value.strip())
-
-        # Process Group elements
-        for group_elem in root.findall(f'.//{group_tag}'):
-             for attr in group_attrs:
-                value = group_elem.get(attr)
-                if value and value.strip() and value.strip() not in seen_originals:
-                    norm_value = normalize_name(value)
-                    if norm_value:
-                        identifiers.append({'original': value.strip(), 'normalized': norm_value})
-                        seen_originals.add(value.strip())
-
-    except ET.ParseError as e:
-        print(f"Error parsing XML file {filename}: {e}")
-    except Exception as e:
-        print(f"An unexpected error occurred while processing {filename}: {e}")
-
-    print(f"Extracted {len(identifiers)} unique, non-wildcard, potential identifiers from {filename}")
-    return identifiers
-
-# --- Main Script Logic ---
-
-print(f"Reading delta applications from '{DELTA_APP_CSV}'...")
-delta_apps = read_delta_apps(DELTA_APP_CSV, DELTA_APP_COLUMN)
-
-if delta_apps is None:
-    print("Exiting due to errors reading delta apps.")
-    exit()
-
-print(f"Found {len(delta_apps)} delta applications to check.")
-if not delta_apps:
-    print("No delta applications found to process.")
-    exit()
-
-print("\nExtracting policy identifiers...")
-mac_policy_identifiers = extract_policy_identifiers(MAC_POLICY_XML, MAC_APP_TAG, MAC_ATTRS_TO_CHECK, MAC_GROUP_TAG, MAC_GROUP_ATTRS_TO_CHECK)
-win_policy_identifiers = extract_policy_identifiers(WIN_POLICY_XML, WIN_APP_TAG, WIN_ATTRS_TO_CHECK, WIN_GROUP_TAG, WIN_GROUP_ATTRS_TO_CHECK)
-
-print(f"\nComparing delta apps against policies (Threshold: {SIMILARITY_THRESHOLD})...")
-
-results_data = [] # List to hold dictionaries for CSV writing
-checked_count = 0
-
-for delta_app in delta_apps:
-    checked_count += 1
-    norm_delta_app = normalize_name(delta_app)
-    if not norm_delta_app:
-        print(f"Skipping delta app '{delta_app}' due to empty normalized name.")
-        # Still add a row to CSV indicating no matches found
-        results_data.append({
-            'DeltaApplication': delta_app,
-            'MacMatchFound': False,
-            'MacMatchedPolicyEntry': '',
-            'MacMatchScore': '',
-            'WinMatchFound': False,
-            'WinMatchedPolicyEntry': '',
-            'WinMatchScore': ''
-        })
-        continue
-
-    # --- Check against Mac Policies ---
-    best_mac_score = -1
-    best_mac_match_entry = ""
-    mac_match_found = False
-
-    for policy_entry in mac_policy_identifiers:
-        norm_policy_id = policy_entry["normalized"]
-        if not norm_policy_id: continue
-
-        score = fuzz.token_set_ratio(norm_delta_app, norm_policy_id)
-
-        if score >= SIMILARITY_THRESHOLD and score > best_mac_score:
-            best_mac_score = score
-            best_mac_match_entry = policy_entry["original"]
-            mac_match_found = True
-            # Don't break, find the absolute best match within this file
-
-    # --- Check against Windows Policies ---
-    best_win_score = -1
-    best_win_match_entry = ""
-    win_match_found = False
-
-    for policy_entry in win_policy_identifiers:
-        norm_policy_id = policy_entry["normalized"]
-        if not norm_policy_id: continue
-
-        score = fuzz.token_set_ratio(norm_delta_app, norm_policy_id)
-
-        if score >= SIMILARITY_THRESHOLD and score > best_win_score:
-            best_win_score = score
-            best_win_match_entry = policy_entry["original"]
-            win_match_found = True
-            # Don't break, find the absolute best match within this file
-
-    # --- Store result for this delta app ---
-    app_result = {
-        'DeltaApplication': delta_app,
-        'MacMatchFound': mac_match_found,
-        'MacMatchedPolicyEntry': best_mac_match_entry if mac_match_found else '',
-        'MacMatchScore': best_mac_score if mac_match_found else '',
-        'WinMatchFound': win_match_found,
-        'WinMatchedPolicyEntry': best_win_match_entry if win_match_found else '',
-        'WinMatchScore': best_win_score if win_match_found else ''
-    }
-    results_data.append(app_result)
-
-    # --- Optional: Print progress/findings ---
-    if mac_match_found or win_match_found:
-         match_details = []
-         if mac_match_found:
-             match_details.append(f"MAC Match: '{best_mac_match_entry}' (Score: {best_mac_score})")
-         if win_match_found:
-             match_details.append(f"WIN Match: '{best_win_match_entry}' (Score: {best_win_score})")
-         print(f"[{checked_count}/{len(delta_apps)}] Potential match found for '{delta_app}': {'; '.join(match_details)}")
-    elif checked_count % 100 == 0: # Print progress periodically even if no matches
-        print(f"[{checked_count}/{len(delta_apps)}] Processing...")
-
-
-print(f"\nComparison complete.")
-
-# --- Output Results to CSV ---
-if results_data:
-    print(f"\nWriting detailed results to '{OUTPUT_MATCH_CSV}'...")
-    try:
-        # Define exact fieldnames for the CSV header
-        fieldnames = [
-            'DeltaApplication',
-            'MacMatchFound', 'MacMatchedPolicyEntry', 'MacMatchScore',
-            'WinMatchFound', 'WinMatchedPolicyEntry', 'WinMatchScore'
-        ]
-        with open(OUTPUT_MATCH_CSV, 'w', newline='', encoding='utf-8') as outfile:
-            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-            writer.writeheader()
-            # Write the data collected for each delta app
-            writer.writerows(results_data) # Use writerows for list of dicts
-        print(f"CSV output complete. {len(results_data)} rows written.")
-
-    except Exception as e:
-        print(f"\nError writing output file '{OUTPUT_MATCH_CSV}': {e}")
-else:
-    print("\nNo delta applications were processed or no results generated.")
+        # --- Existing logic ---
+        row = df[df[required_col] == metric_id] # Use variable required_col
+        if not row.empty:
+            # Check if the target threshold_type column exists
+            if threshold_type not in row.columns:
+                 logger.warning(f"Column '{threshold_type}' not found in threshold DataFrame for metric {metric_id}. Columns: {row.columns.tolist()}")
+                 return None
+                 
+            value = row.iloc[0][threshold_type]
+            # Convert to float if possible, handle various null representations
+            if value is None or str(value).upper() in ["NULL", "NONE", ""]:
+                return None
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert threshold '{threshold_type}' value '{value}' for {metric_id} to float. Treating as None.")
+                return None
+                
+        # If no row matched the metric_id after filtering
+        logger.warning(f"Threshold definition not found for metric_id '{metric_id}' within the loaded DataFrame.")
+        return None # Not found
