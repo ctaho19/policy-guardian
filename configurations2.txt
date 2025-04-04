@@ -2,28 +2,26 @@ import csv
 import xml.etree.ElementTree as ET
 import re
 from thefuzz import fuzz
-import os # To check file existence
+import os
 
 # --- Configuration ---
-DELTA_APP_CSV = 'delta_apps.csv'    # Input CSV from previous step
-DELTA_APP_COLUMN = 'ApplicationNotInListB' # Column name in the delta CSV
-MAC_POLICY_XML = 'mac_policy.xml'     # Path to your Mac policy XML
-WIN_POLICY_XML = 'windows_policy.xml' # Path to your Windows policy XML
-OUTPUT_MATCH_CSV = 'policy_matches.csv' # Output CSV for potential matches
-SIMILARITY_THRESHOLD = 85           # Adjust as needed (80-90 is common)
+DELTA_APP_CSV = 'delta_apps.csv'
+DELTA_APP_COLUMN = 'ApplicationNotInListB'
+MAC_POLICY_XML = 'mac_policy.xml'
+WIN_POLICY_XML = 'windows_policy.xml'
+OUTPUT_MATCH_CSV = 'policy_matches_detailed.csv' # New output filename
+SIMILARITY_THRESHOLD = 85
 
-# Attributes/elements to check for application names/descriptions in the XML
-# Add more attributes if needed based on your specific policies
+# Attributes/elements to check (same as before)
 MAC_APP_TAG = 'ApplicationOSX'
 MAC_ATTRS_TO_CHECK = ['FileName', 'Description']
 MAC_GROUP_TAG = 'ApplicationGroupOSX'
-MAC_GROUP_ATTRS_TO_CHECK = ['Name', 'Description'] # Check parent group too
+MAC_GROUP_ATTRS_TO_CHECK = ['Name', 'Description']
 
 WIN_APP_TAG = 'Application'
 WIN_ATTRS_TO_CHECK = ['FileName', 'Description', 'ServiceName', 'AppxPackageName', 'FileNameEx']
 WIN_GROUP_TAG = 'ApplicationGroup'
-WIN_GROUP_ATTRS_TO_CHECK = ['Name', 'Description'] # Check parent group too
-
+WIN_GROUP_ATTRS_TO_CHECK = ['Name', 'Description']
 # --- End Configuration ---
 
 def read_delta_apps(filename, column_name):
@@ -44,64 +42,65 @@ def read_delta_apps(filename, column_name):
     except Exception as e:
         print(f"Error reading delta CSV {filename}: {e}")
         return None
-    return list(apps)
+    # Return as a list to maintain order if needed, though set is fine here
+    return sorted(list(apps))
 
 def normalize_name(name):
-    """Applies normalization (same as before, adjust as needed)."""
+    """Applies normalization."""
     if not name:
         return ""
     name = name.lower()
-    # Optional: Add more aggressive cleaning (regex for versions, common terms)
+    # Keep normalization consistent, adjust if needed
     name = re.sub(r'v\d+(\.\d+)*', '', name)
     name = re.sub(r'\b\d+(\.\d+){1,}\b', '', name)
     name = re.sub(r'\bbuild\s+\d+\b', '', name)
     common_terms = ['app', 'inc', 'corp', 'ltd', 'limited', '(x64)', '(x86)', '64-bit', '32-bit', 'edition', 'professional', 'standard', '.exe', '.app', '.msi', '.pkg']
+    # Use word boundaries for terms to avoid partial matches within words
     for term in common_terms:
-        name = name.replace(term, '')
+         # Simple replace might be okay, but regex is safer for some terms
+         # name = name.replace(term, '')
+         name = re.sub(r'\b' + re.escape(term) + r'\b', '', name, flags=re.IGNORECASE)
     name = ' '.join(name.split()) # Remove extra whitespace
     return name.strip()
 
 def extract_policy_identifiers(filename, app_tag, app_attrs, group_tag, group_attrs):
     """Extracts potential application identifiers from policy XML."""
-    identifiers = {} # Store as {original_string: normalized_string}
+    # Store as list of dicts: [{'original': value, 'normalized': norm_value}, ...]
+    identifiers = []
     if not os.path.exists(filename):
         print(f"Warning: Policy file not found - {filename}. Skipping.")
         return identifiers
-
     try:
         tree = ET.parse(filename)
         root = tree.getroot()
+        seen_originals = set() # Avoid duplicate original strings
 
-        # Find all application elements directly
-        # Using './/' searches recursively from the root
+        # Process Application elements
         for app_elem in root.findall(f'.//{app_tag}'):
             for attr in app_attrs:
                 value = app_elem.get(attr)
-                if value and value.strip() and value != "*": # Extract non-empty, non-wildcard values
+                if value and value.strip() and value != "*" and value.strip() not in seen_originals:
                     norm_value = normalize_name(value)
                     if norm_value:
-                         identifiers[value.strip()] = norm_value
+                        identifiers.append({'original': value.strip(), 'normalized': norm_value})
+                        seen_originals.add(value.strip())
 
-            # Try to find the parent group for context (Name/Description)
-            # This is a bit more complex, requires navigating up or assumptions
-            # Simpler approach: find all groups and their apps separately
-            # Let's stick to extracting directly from app elements + group elements for now
-
-        # Find all group elements and extract their relevant attributes
+        # Process Group elements
         for group_elem in root.findall(f'.//{group_tag}'):
              for attr in group_attrs:
                 value = group_elem.get(attr)
-                if value and value.strip():
+                if value and value.strip() and value.strip() not in seen_originals:
                     norm_value = normalize_name(value)
                     if norm_value:
-                         identifiers[value.strip()] = norm_value
+                        identifiers.append({'original': value.strip(), 'normalized': norm_value})
+                        seen_originals.add(value.strip())
 
     except ET.ParseError as e:
         print(f"Error parsing XML file {filename}: {e}")
     except Exception as e:
         print(f"An unexpected error occurred while processing {filename}: {e}")
 
-    print(f"Extracted {len(identifiers)} potential identifiers from {filename}")
+    print(f"Extracted {len(identifiers)} unique, non-wildcard, potential identifiers from {filename}")
     return identifiers
 
 # --- Main Script Logic ---
@@ -122,97 +121,106 @@ print("\nExtracting policy identifiers...")
 mac_policy_identifiers = extract_policy_identifiers(MAC_POLICY_XML, MAC_APP_TAG, MAC_ATTRS_TO_CHECK, MAC_GROUP_TAG, MAC_GROUP_ATTRS_TO_CHECK)
 win_policy_identifiers = extract_policy_identifiers(WIN_POLICY_XML, WIN_APP_TAG, WIN_ATTRS_TO_CHECK, WIN_GROUP_TAG, WIN_GROUP_ATTRS_TO_CHECK)
 
-# Combine identifiers for easier searching, keeping track of the source
-all_policy_identifiers = []
-for original, normalized in mac_policy_identifiers.items():
-    all_policy_identifiers.append({"original": original, "normalized": normalized, "source_file": "Mac"})
-for original, normalized in win_policy_identifiers.items():
-    all_policy_identifiers.append({"original": original, "normalized": normalized, "source_file": "Windows"})
+print(f"\nComparing delta apps against policies (Threshold: {SIMILARITY_THRESHOLD})...")
 
-if not all_policy_identifiers:
-    print("\nWarning: No identifiers extracted from policy files. Cannot perform comparison.")
-    exit()
-
-print(f"\nComparing {len(delta_apps)} delta apps against {len(all_policy_identifiers)} policy identifiers (Threshold: {SIMILARITY_THRESHOLD})...")
-
-policy_matches = []
+results_data = [] # List to hold dictionaries for CSV writing
 checked_count = 0
-found_count = 0
 
 for delta_app in delta_apps:
     checked_count += 1
     norm_delta_app = normalize_name(delta_app)
     if not norm_delta_app:
-        # print(f"Skipping delta app '{delta_app}' due to empty normalized name.")
+        print(f"Skipping delta app '{delta_app}' due to empty normalized name.")
+        # Still add a row to CSV indicating no matches found
+        results_data.append({
+            'DeltaApplication': delta_app,
+            'MacMatchFound': False,
+            'MacMatchedPolicyEntry': '',
+            'MacMatchScore': '',
+            'WinMatchFound': False,
+            'WinMatchedPolicyEntry': '',
+            'WinMatchScore': ''
+        })
         continue
 
-    best_match_score = -1
-    best_match_info = None
+    # --- Check against Mac Policies ---
+    best_mac_score = -1
+    best_mac_match_entry = ""
+    mac_match_found = False
 
-    for policy_entry in all_policy_identifiers:
+    for policy_entry in mac_policy_identifiers:
         norm_policy_id = policy_entry["normalized"]
-        if not norm_policy_id:
-            continue
+        if not norm_policy_id: continue
 
-        # Using Token Set Ratio is often good for matching names within descriptions
         score = fuzz.token_set_ratio(norm_delta_app, norm_policy_id)
 
-        if score >= SIMILARITY_THRESHOLD:
-            # Found a potential match
-            # If we want the absolute best score across both files:
-            if score > best_match_score:
-                 best_match_score = score
-                 best_match_info = {
-                     "delta_app": delta_app,
-                     "policy_file": policy_entry["source_file"],
-                     "matched_policy_entry": policy_entry["original"],
-                     "score": score,
-                     "normalized_delta": norm_delta_app, # For debugging
-                     "normalized_policy": norm_policy_id # For debugging
-                 }
-            # If we just want the first good match found:
-            # best_match_score = score
-            # best_match_info = { ... }
-            # break # Uncomment this line to stop searching once *any* match is found for this delta_app
+        if score >= SIMILARITY_THRESHOLD and score > best_mac_score:
+            best_mac_score = score
+            best_mac_match_entry = policy_entry["original"]
+            mac_match_found = True
+            # Don't break, find the absolute best match within this file
+
+    # --- Check against Windows Policies ---
+    best_win_score = -1
+    best_win_match_entry = ""
+    win_match_found = False
+
+    for policy_entry in win_policy_identifiers:
+        norm_policy_id = policy_entry["normalized"]
+        if not norm_policy_id: continue
+
+        score = fuzz.token_set_ratio(norm_delta_app, norm_policy_id)
+
+        if score >= SIMILARITY_THRESHOLD and score > best_win_score:
+            best_win_score = score
+            best_win_match_entry = policy_entry["original"]
+            win_match_found = True
+            # Don't break, find the absolute best match within this file
+
+    # --- Store result for this delta app ---
+    app_result = {
+        'DeltaApplication': delta_app,
+        'MacMatchFound': mac_match_found,
+        'MacMatchedPolicyEntry': best_mac_match_entry if mac_match_found else '',
+        'MacMatchScore': best_mac_score if mac_match_found else '',
+        'WinMatchFound': win_match_found,
+        'WinMatchedPolicyEntry': best_win_match_entry if win_match_found else '',
+        'WinMatchScore': best_win_score if win_match_found else ''
+    }
+    results_data.append(app_result)
+
+    # --- Optional: Print progress/findings ---
+    if mac_match_found or win_match_found:
+         match_details = []
+         if mac_match_found:
+             match_details.append(f"MAC Match: '{best_mac_match_entry}' (Score: {best_mac_score})")
+         if win_match_found:
+             match_details.append(f"WIN Match: '{best_win_match_entry}' (Score: {best_win_score})")
+         print(f"[{checked_count}/{len(delta_apps)}] Potential match found for '{delta_app}': {'; '.join(match_details)}")
+    elif checked_count % 100 == 0: # Print progress periodically even if no matches
+        print(f"[{checked_count}/{len(delta_apps)}] Processing...")
 
 
-    if best_match_info:
-        policy_matches.append(best_match_info)
-        found_count += 1
-        # Optional: print immediate feedback
-        # print(f"  Match found for '{delta_app}' -> '{best_match_info['matched_policy_entry']}' in {best_match_info['policy_file']} (Score: {best_match_info['score']})")
+print(f"\nComparison complete.")
 
-    if checked_count % 50 == 0:
-        print(f"  Processed {checked_count}/{len(delta_apps)} delta apps...")
-
-
-print(f"\nComparison complete. Found {found_count} delta applications with potential matches in policy files.")
-
-# --- Output Results ---
-if policy_matches:
-    print(f"\nWriting potential matches to '{OUTPUT_MATCH_CSV}'...")
+# --- Output Results to CSV ---
+if results_data:
+    print(f"\nWriting detailed results to '{OUTPUT_MATCH_CSV}'...")
     try:
+        # Define exact fieldnames for the CSV header
+        fieldnames = [
+            'DeltaApplication',
+            'MacMatchFound', 'MacMatchedPolicyEntry', 'MacMatchScore',
+            'WinMatchFound', 'WinMatchedPolicyEntry', 'WinMatchScore'
+        ]
         with open(OUTPUT_MATCH_CSV, 'w', newline='', encoding='utf-8') as outfile:
-            # Add normalized fields to output for easier review if desired
-            # fieldnames = ['DeltaApplication', 'FoundInPolicyFile', 'MatchedPolicyEntry', 'SimilarityScore', 'NormalizedDelta', 'NormalizedPolicy']
-            fieldnames = ['DeltaApplication', 'FoundInPolicyFile', 'MatchedPolicyEntry', 'SimilarityScore']
             writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-
             writer.writeheader()
-            # Sort results for better readability
-            sorted_matches = sorted(policy_matches, key=lambda x: (x['delta_app'], x['policy_file']))
-            for match in sorted_matches:
-                 # Select only the desired fields for the standard output
-                 output_row = {k: match[k] for k in fieldnames if k in match}
-                 writer.writerow(output_row)
-        print("Output complete.")
+            # Write the data collected for each delta app
+            writer.writerows(results_data) # Use writerows for list of dicts
+        print(f"CSV output complete. {len(results_data)} rows written.")
+
     except Exception as e:
         print(f"\nError writing output file '{OUTPUT_MATCH_CSV}': {e}")
-
-    # Optional: Print a summary to console
-    print("\nSummary of Potential Matches:")
-    for match in sorted_matches:
-         print(f"- Delta App: '{match['delta_app']}' potentially matches Policy Entry: '{match['matched_policy_entry']}' in {match['policy_file']} file (Score: {match['score']})")
-
 else:
-    print("\nNo potential matches found between delta applications and policy file identifiers.")
+    print("\nNo delta applications were processed or no results generated.")
