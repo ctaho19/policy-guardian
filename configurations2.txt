@@ -1,12 +1,136 @@
-# Fallback if the alternative above still causes errors: Use a standard loop
+def fetch_all_resources(payload: Dict, limit: Optional[int] = None, 
+                        timeout: int = 60, max_retries: int = 3) -> Tuple[List[Dict], int]:
+    """Fetch resource configurations with pagination via URL params, timeout, and retry logic."""
+    all_resources = []
+    fetched_count = 0
+    next_record_key = ""
+    
+    # Define base fields needed internally + for filtering
+    base_required_fields = [
+        "resourceId", "accountResourceId", "configurationList", "supplementaryConfiguration", "Source" 
+    ]
+    # Combine required fields with desired fields from payload, ensuring uniqueness
+    response_fields = list(set(base_required_fields + payload.get("responseFields", [])))
+    
+    # --- Payload for the JSON BODY (does NOT include limit or nextRecordKey anymore) ---
+    fetch_payload_body = {
+        "searchParameters": payload.get("searchParameters", [{}]), 
+        "responseFields": response_fields,
+        # "limit" is removed from here
+    }
+    
+    logger.info(f"Fetching resources. Request Body payload: {json.dumps(fetch_payload_body, indent=2)}")
+    
+    page_count = 0
+    start_time = datetime.now()
 
-safe_metric_ids = []
-for mid in metric_ids:
-    if mid: # Ensure mid is not None or empty before processing
-        # 1. Clean the ID: remove internal single quotes
-        cleaned_mid = str(mid).replace("'", "") 
-        # 2. Wrap the cleaned ID in literal single quotes for SQL
-        quoted_id = f"'{cleaned_mid}'" 
-        safe_metric_ids.append(quoted_id)
+    while True:
+        page_start_time = time.time()
+        
+        # --- Prepare URL Query Parameters ---
+        current_page_params = {}
+        # Set the desired page size for the API call
+        current_page_params['limit'] = 10000 
+        
+        # Add pagination key if available for subsequent pages
+        if next_record_key:
+            current_page_params['nextRecordKey'] = next_record_key
+            # Note: Some APIs might not want 'limit' when 'nextRecordKey' is present.
+            # If you encounter issues, you might need to remove limit for subsequent pages:
+            # if 'limit' in current_page_params: del current_page_params['limit'] 
+        
+        # The request URL is always the base config URL now
+        request_url = CONFIG_URL 
 
-# Now safe_metric_ids list is built correctly
+        page_fetched_successfully = False
+        for retry in range(max_retries + 1):
+            try:
+                # Log the URL and params being used for this attempt
+                logger.info(f"Requesting page {page_count + 1} with URL params: {current_page_params}" + (f" (retry {retry})" if retry > 0 else ""))
+                
+                # --- Make the API call using the 'params' argument ---
+                response = requests.post(
+                    request_url,
+                    headers=HEADERS,
+                    json=fetch_payload_body, # The main search criteria go in the body
+                    params=current_page_params, # Limit and pagination key go in URL params
+                    verify=True, # Recommended: Set to True and manage certs
+                    timeout=timeout
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    resources_on_page = data.get("resourceConfigurations", [])
+                    num_on_page = len(resources_on_page)
+                    
+                    if page_count == 0 and num_on_page > 0:
+                        logger.debug(f"First page response structure keys: {list(data.keys())}")
+                        # Log structure of first resource's config lists if they exist
+                        sample_resource = resources_on_page[0]
+                        if "configurationList" in sample_resource:
+                             logger.debug(f"Sample resource configList structure (first item): {sample_resource['configurationList'][0] if sample_resource['configurationList'] else 'Empty'}")
+                        if "supplementaryConfiguration" in sample_resource:
+                             logger.debug(f"Sample resource supplementaryConfiguration structure (first item): {sample_resource['supplementaryConfiguration'][0] if sample_resource['supplementaryConfiguration'] else 'Empty'}")
+
+
+                    all_resources.extend(resources_on_page)
+                    fetched_count += num_on_page
+                    next_record_key = data.get("nextRecordKey", "") # Get key for the *next* page
+                    page_elapsed = time.time() - page_start_time
+                    logger.info(f"Page {page_count + 1}: Fetched {num_on_page} resources (Total: {fetched_count}) in {page_elapsed:.2f}s. NextKey: {'Yes' if next_record_key else 'No'}")
+                    
+                    page_count += 1
+                    page_fetched_successfully = True
+                    break # Success, exit retry loop for this page
+
+                elif response.status_code == 429:
+                    # Add jitter to backoff
+                    wait_time = min(2 ** retry, 60) * (1 + random.uniform(0.1, 0.5)) 
+                    logger.warning(f"Rate limited (429) on page {page_count + 1}. Waiting {wait_time:.1f}s before retry {retry+1}/{max_retries}.")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Config API error page {page_count + 1}: {response.status_code} - {response.text}")
+                    if retry < max_retries:
+                        wait_time = min(2 ** retry, 30) * (1 + random.uniform(0.1, 0.5))
+                        logger.info(f"Retrying page {page_count + 1} in {wait_time:.1f}s... (Attempt {retry+1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"Failed to fetch page {page_count + 1} after {max_retries + 1} attempts due to API error {response.status_code}")
+                        raise Exception(f"Failed to fetch page {page_count + 1} after {max_retries + 1} attempts due to API error {response.status_code}")
+
+            except requests.exceptions.Timeout:
+                 logger.warning(f"Request timeout fetching page {page_count + 1} after {timeout}s (Attempt {retry+1}/{max_retries})")
+                 if retry < max_retries:
+                     wait_time = min(2 ** retry, 30) * (1 + random.uniform(0.1, 0.5))
+                     logger.info(f"Retrying page {page_count + 1} due to timeout in {wait_time:.1f}s...")
+                     time.sleep(wait_time)
+                 else:
+                      logger.error(f"Failed to fetch page {page_count + 1} after {max_retries + 1} attempts due to timeout.")
+                      raise Exception(f"Failed to fetch page {page_count + 1} after {max_retries + 1} attempts due to timeout")
+                      
+            except Exception as e:
+                logger.error(f"Exception fetching page {page_count + 1} (Attempt {retry+1}/{max_retries}): {str(e)}", exc_info=True)
+                if retry < max_retries:
+                    wait_time = min(2 ** retry, 30) * (1 + random.uniform(0.1, 0.5))
+                    logger.info(f"Retrying page {page_count + 1} due to exception in {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                else:
+                     logger.error(f"Failed to fetch page {page_count + 1} after {max_retries + 1} attempts due to exception.")
+                     raise Exception(f"Failed to fetch page {page_count + 1} after {max_retries + 1} attempts due to exception: {e}")
+        
+        # Exit conditions for the main 'while' loop:
+        if not next_record_key:
+            logger.info("No nextRecordKey found, fetch complete.")
+            break
+            
+        # Check against overall fetch limit if provided by the caller
+        if limit is not None and fetched_count >= limit:
+            logger.info(f"Reached fetch limit of {limit} resources specified in function call.")
+            # Trim excess resources if the last page fetched more than needed
+            all_resources = all_resources[:limit]
+            fetched_count = len(all_resources)
+            break
+            
+    total_time = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Fetch complete: Retrieved {fetched_count} resources in {page_count} pages, total time {total_time:.1f} seconds")
+    return all_resources, fetched_count
