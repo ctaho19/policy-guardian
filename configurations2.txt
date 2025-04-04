@@ -1,35 +1,233 @@
-    # Function to safely get threshold value
-    def get_threshold_value(df, metric_id, threshold_type):
-        # --- !!! ADD THESE CHECKS AT THE START !!! ---
-        if df is None or df.empty:
-             logger.warning(f"Cannot get threshold for {metric_id}/{threshold_type} because the input DataFrame is empty or None.")
-             return None
+# --- Modify load_thresholds function ---
 
-        # Check if the essential column exists *before* trying to filter
-        required_col = "MONITORING_METRIC_ID" 
-        if required_col not in df.columns:
-            logger.error(f"Required column '{required_col}' not found in threshold DataFrame! Available columns: {df.columns.tolist()}")
-            return None # Cannot proceed without this column
-        # --- !!! END CHECKS !!! ---
+from typing import List # Ensure List is imported
 
-        # --- Existing logic ---
-        row = df[df[required_col] == metric_id] # Use variable required_col
-        if not row.empty:
-            # Check if the target threshold_type column exists
-            if threshold_type not in row.columns:
-                 logger.warning(f"Column '{threshold_type}' not found in threshold DataFrame for metric {metric_id}. Columns: {row.columns.tolist()}")
-                 return None
-                 
-            value = row.iloc[0][threshold_type]
-            # Convert to float if possible, handle various null representations
-            if value is None or str(value).upper() in ["NULL", "NONE", ""]:
-                return None
-            try:
-                return float(value)
-            except (ValueError, TypeError):
-                logger.warning(f"Could not convert threshold '{threshold_type}' value '{value}' for {metric_id} to float. Treating as None.")
-                return None
-                
-        # If no row matched the metric_id after filtering
-        logger.warning(f"Threshold definition not found for metric_id '{metric_id}' within the loaded DataFrame.")
-        return None # Not found
+# Define constants for Snowflake connection if not already defined globally
+# SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake" 
+# SF_OPTIONS = { ... your options ... }
+# THRESHOLD_TABLE = "CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD" 
+
+def load_thresholds(spark: SparkSession, metric_ids: List[str]) -> pd.DataFrame:
+    """Load compliance thresholds from Snowflake for specific metric IDs."""
+    
+    if not metric_ids:
+        logger.warning("No metric IDs provided to load_thresholds. Returning empty DataFrame.")
+        return pd.DataFrame()
+        
+    # Format metric IDs for SQL IN clause 
+    # Create list of properly quoted strings: ['id1', 'id2'] -> ["'id1'", "'id2'"]
+    safe_metric_ids = [f"'{str(mid).replace("'", "")}'" for mid in metric_ids if mid] 
+    
+    if not safe_metric_ids:
+         logger.warning("No valid metric IDs remaining after validation. Returning empty DataFrame.")
+         return pd.DataFrame()
+         
+    # --- !!! CORRECTLY FORMAT THE STRING FOR THE IN CLAUSE !!! ---
+    # Join the quoted strings with a comma: "'id1', 'id2'"
+    metric_ids_sql_string = ", ".join(safe_metric_ids) 
+    
+    # Construct the dynamic query using the correctly formatted string
+    query = f"""
+    SELECT MONITORING_METRIC_ID, ALERT_THRESHOLD, WARNING_THRESHOLD 
+    FROM {THRESHOLD_TABLE} 
+    WHERE MONITORING_METRIC_ID IN ({metric_ids_sql_string}) 
+    """
+    # --- End Correction ---
+
+    # Log the *exact* query being sent
+    logger.info(f"Loading thresholds from Snowflake with query:\n{query}") 
+    
+    try:
+        thresholds_spark_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+            .options(**SF_OPTIONS) \
+            .option("query", query) \
+            .load()
+        
+        thresholds_pd_df = thresholds_spark_df.toPandas() 
+        logger.info(f"Threshold data collected from Snowflake. Found {len(thresholds_pd_df)} rows.")
+        
+        if not thresholds_pd_df.empty:
+             thresholds_pd_df.columns = [col.upper() for col in thresholds_pd_df.columns]
+             required_cols = ["MONITORING_METRIC_ID", "ALERT_THRESHOLD", "WARNING_THRESHOLD"]
+             if not all(col in thresholds_pd_df.columns for col in required_cols):
+                  logger.error(f"Snowflake response missing required columns. Expected: {required_cols}, Got: {list(thresholds_pd_df.columns)}")
+                  return pd.DataFrame() 
+                  
+             logger.debug(f"Thresholds loaded:\n{thresholds_pd_df.to_string()}")
+             return thresholds_pd_df
+        else:
+             logger.warning("No threshold data found in Snowflake for the specified metric IDs.")
+             return pd.DataFrame() 
+             
+    except Exception as e:
+        # Log the specific query that failed along with the error
+        logger.error(f"Failed to load thresholds from Snowflake using query:\n{query}\nError: {e}", exc_info=True) 
+        return pd.DataFrame()
+
+
+
+
+# --- Replace filter_tier1_resources with this updated version ---
+def filter_tier1_resources(resources: List[Dict], config_key: str, fields_for_report: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources based on Tier 1 compliance (non-empty specified config_key),
+       checking supplementaryConfiguration or configurationList based on key prefix."""
+    matching_count = 0
+    non_matching_resources = []
+    
+    target_config_name = config_key 
+    output_config_col_name = config_key 
+
+    # --- !!! REMOVE TEMPORARY DEBUGGING if you added it earlier !!! ---
+
+    for resource in resources:
+        config_value = None # Default value if not found
+
+        # --- !!! PARSING LOGIC UPDATE !!! ---
+        if target_config_name.startswith("supplementaryConfiguration."):
+            search_list = resource.get("supplementaryConfiguration", [])
+            name_key = "supplementaryConfigurationName"
+            value_key = "supplementaryConfigurationValue"
+        elif target_config_name.startswith("configuration."):
+            search_list = resource.get("configurationList", [])
+            name_key = "configurationName"
+            value_key = "configurationValue"
+        else:
+            # Default or handle other cases - currently defaults to configurationList
+            logger.warning(f"Config key '{target_config_name}' does not have a recognized prefix. Assuming 'configurationList'. Resource ID: {resource.get('resourceId', 'N/A')}")
+            search_list = resource.get("configurationList", [])
+            name_key = "configurationName"
+            value_key = "configurationValue"
+
+        # Find the specific configuration item in the chosen list
+        target_config = next((item for item in search_list if item.get(name_key) == target_config_name), None)
+        
+        if target_config:
+            config_value = target_config.get(value_key)
+        # --- !!! END PARSING LOGIC UPDATE !!! ---
+            
+        # Tier 1 Pass: Value exists and is not just whitespace
+        if config_value is not None and str(config_value).strip(): 
+            matching_count += 1
+        else:
+            # Tier 1 Fail: Value is None, empty string, or whitespace
+            filtered_resource = {}
+            # --- Update report population to handle both lists ---
+            for field in fields_for_report:
+                 value = "N/A" # Default
+                 if field.startswith("supplementaryConfiguration."):
+                     s_list = resource.get("supplementaryConfiguration", [])
+                     item = next((i for i in s_list if i.get("supplementaryConfigurationName") == field), None)
+                     if item: value = item.get("supplementaryConfigurationValue", "N/A (Key Found, No Value)")
+                     else: value = "N/A (Key Not Found)"
+                 elif field.startswith("configuration."):
+                     c_list = resource.get("configurationList", [])
+                     item = next((i for i in c_list if i.get("configurationName") == field), None)
+                     if item: value = item.get("configurationValue", "N/A (Key Found, No Value)")
+                     else: value = "N/A (Key Not Found)"
+                 elif '.' in field: # Handle other potential nested structures if needed
+                     parts = field.split('.', 1)
+                     parent, child = parts[0], parts[1]
+                     value = resource.get(parent, {}).get(child, "N/A")
+                 else: # Top-level field
+                     value = resource.get(field, "N/A")
+                 filtered_resource[field] = value
+
+            # Ensure the specific target config key's value is reported correctly using the value found earlier
+            filtered_resource[output_config_col_name] = config_value if config_value is not None else "N/A (Not Found)"
+            non_matching_resources.append(filtered_resource)
+            
+    logger.info(f"Tier 1 Check ({config_key} non-empty): Found {matching_count} compliant resources.")
+    
+    report_columns = list(fields_for_report)
+    if output_config_col_name not in report_columns:
+         report_columns.append(output_config_col_name)
+         
+    return matching_count, pd.DataFrame(non_matching_resources, columns=report_columns) if non_matching_resources else pd.DataFrame(columns=report_columns)
+
+
+
+
+# --- Replace filter_tier2_resources with this updated version ---
+def filter_tier2_resources(resources: List[Dict], config_key: str, expected_config_value: str, fields_for_report: List[str]) -> Tuple[int, pd.DataFrame]:
+    """Filter resources based on Tier 2 compliance (config_key == expected_config_value),
+       checking supplementaryConfiguration or configurationList based on key prefix."""
+    matching_count = 0
+    non_matching_resources = []
+    
+    target_config_name = config_key
+    output_config_col_name = config_key
+
+    is_bool_expected = str(expected_config_value).upper() in ['TRUE', 'FALSE']
+    if is_bool_expected:
+        expected_bool_str = str(expected_config_value).upper()
+
+    for resource in resources:
+        config_value_actual = None # Default value if not found
+
+        # --- !!! PARSING LOGIC UPDATE (Identical to Tier 1) !!! ---
+        if target_config_name.startswith("supplementaryConfiguration."):
+            search_list = resource.get("supplementaryConfiguration", [])
+            name_key = "supplementaryConfigurationName"
+            value_key = "supplementaryConfigurationValue"
+        elif target_config_name.startswith("configuration."):
+            search_list = resource.get("configurationList", [])
+            name_key = "configurationName"
+            value_key = "configurationValue"
+        else:
+            logger.warning(f"Config key '{target_config_name}' does not have a recognized prefix. Assuming 'configurationList'. Resource ID: {resource.get('resourceId', 'N/A')}")
+            search_list = resource.get("configurationList", [])
+            name_key = "configurationName"
+            value_key = "configurationValue"
+
+        target_config = next((item for item in search_list if item.get(name_key) == target_config_name), None)
+        
+        if target_config:
+            config_value_actual = target_config.get(value_key)
+        # --- !!! END PARSING LOGIC UPDATE !!! ---
+
+        # Tier 2 Pass Check:
+        is_match = False
+        if config_value_actual is not None: 
+            if is_bool_expected:
+                is_match = str(config_value_actual).upper() == expected_bool_str
+            else:
+                is_match = str(config_value_actual) == str(expected_config_value)
+
+        if is_match:
+            matching_count += 1
+        else:
+            # Tier 2 Fail: Value exists but doesn't match, OR value doesn't exist
+            filtered_resource = {}
+            # --- Update report population (Identical to Tier 1) ---
+            for field in fields_for_report:
+                 value = "N/A" # Default
+                 if field.startswith("supplementaryConfiguration."):
+                     s_list = resource.get("supplementaryConfiguration", [])
+                     item = next((i for i in s_list if i.get("supplementaryConfigurationName") == field), None)
+                     if item: value = item.get("supplementaryConfigurationValue", "N/A (Key Found, No Value)")
+                     else: value = "N/A (Key Not Found)"
+                 elif field.startswith("configuration."):
+                     c_list = resource.get("configurationList", [])
+                     item = next((i for i in c_list if i.get("configurationName") == field), None)
+                     if item: value = item.get("configurationValue", "N/A (Key Found, No Value)")
+                     else: value = "N/A (Key Not Found)"
+                 elif '.' in field: 
+                     parts = field.split('.', 1)
+                     parent, child = parts[0], parts[1]
+                     value = resource.get(parent, {}).get(child, "N/A")
+                 else: # Top-level field
+                     value = resource.get(field, "N/A")
+                 filtered_resource[field] = value
+                     
+            # Report the actual value found (or N/A) for the specific config key
+            actual_value_str = config_value_actual if config_value_actual is not None else "N/A (Not Found)"
+            filtered_resource[output_config_col_name] = actual_value_str
+            non_matching_resources.append(filtered_resource)
+            
+    logger.info(f"Tier 2 Check ({config_key} == {expected_config_value}): Found {matching_count} compliant resources.")
+
+    report_columns = list(fields_for_report)
+    if output_config_col_name not in report_columns:
+         report_columns.append(output_config_col_name)
+
+    return matching_count, pd.DataFrame(non_matching_resources, columns=report_columns) if non_matching_resources else pd.DataFrame(columns=report_columns)
