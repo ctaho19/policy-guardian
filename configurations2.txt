@@ -1,1 +1,337 @@
+Okay, let's create a focused unit test script to debug the source attribute extraction and filtering within the filter_out_of_scope_keys function.
 
+This script will:
+
+Define sample resource data, including the exact problematic case ("source": "CT-AccessDenied") and other relevant scenarios.
+
+Include the latest version of the filter_out_of_scope_keys function we developed.
+
+Run the function against the sample data.
+
+Print detailed results, showing which resources were excluded, why, and which remained in scope.
+
+This will help us confirm if the function logic itself is correct and how it handles the source field.
+
+import pandas as pd
+import json
+from typing import Dict, List, Optional, Tuple
+import logging
+
+# --- Basic Logger Setup for the Test ---
+logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Function Under Test (Latest Version) ---
+# Make sure this exactly matches the version in your main script
+def filter_out_of_scope_keys(resources: List[Dict], desired_fields_for_report: List[str]) -> Tuple[List[Dict], pd.DataFrame]:
+    """Filters out resources based on predefined exclusion criteria for KMS keys."""
+    in_scope_resources = []
+    excluded_resources_data = []
+
+    required_filter_fields = {"resourceId", "accountResourceId", "configuration.keyState", "ConfigurationObject.keyManager", "source"} # Use lowercase 'source'
+    report_fields = set(desired_fields_for_report) | required_filter_fields
+
+    logger.info(f"Starting filtering of {len(resources)} test resources...")
+
+    for resource in resources:
+        exclude = False
+        reason = "N/A"
+
+        # --- Exclusion Check 1: Orphaned Keys (Source field - CORRECTED CASE) ---
+        source_field = resource.get("source") # Use lowercase 'source'
+        if source_field == "CT-AccessDenied":
+            exclude = True
+            reason = "Source = CT-AccessDenied (Orphaned)"
+            logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} matched exclusion rule: Source = CT-AccessDenied")
+
+
+        # --- Exclusion Check 2 & 3: Configuration List Checks ---
+        key_state = "N/A"
+        key_manager = "N/A"
+
+        if not exclude:
+            config_list = resource.get("configurationList", [])
+            found_key_state = False
+            found_key_manager = False
+
+            for config in config_list:
+                config_name = config.get("configurationName")
+                config_value = config.get("configurationValue")
+
+                if config_name == "configuration.keyState":
+                    key_state = config_value if config_value is not None else "N/A"
+                    found_key_state = True
+                elif config_name == "ConfigurationObject.keyManager": # Note: API might return diff case, adjust if needed
+                    key_manager = config_value if config_value is not None else "N/A"
+                    found_key_manager = True
+
+            if key_state in ["PendingDeletion", "PendingReplicaDeletion"]:
+                exclude = True
+                reason = f"KeyState = {key_state} (Pending Deletion/Replica Deletion)"
+                logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} matched exclusion rule: KeyState = {key_state}")
+
+            elif key_manager == "AWS": # Assuming API returns 'AWS' - verify case if needed
+                exclude = True
+                reason = "KeyManager = AWS (AWS Managed)"
+                logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} matched exclusion rule: KeyManager = AWS")
+
+        # --- Store results ---
+        if exclude:
+            excluded_info = {}
+            # --- Improved report population for excluded items ---
+            for field in report_fields:
+                 value = "N/A" # Default
+                 if field == "source": # Handle top-level source correctly
+                     value = resource.get("source", "N/A") # Use lowercase
+                 elif field.startswith("supplementaryConfiguration."):
+                     s_list = resource.get("supplementaryConfiguration", [])
+                     item = next((i for i in s_list if i.get("supplementaryConfigurationName") == field), None)
+                     if item: value = item.get("supplementaryConfigurationValue", "N/A (Key Found, No Value)")
+                     else: value = "N/A (Key Not Found)"
+                 elif field.startswith("configuration."):
+                     # Use values extracted earlier if available, otherwise search list
+                     if field == "configuration.keyState": value = key_state
+                     elif field == "ConfigurationObject.keyManager": value = key_manager
+                     else: # Search configList for other configuration.* fields
+                         c_list = resource.get("configurationList", [])
+                         item = next((i for i in c_list if i.get("configurationName") == field), None)
+                         if item: value = item.get("configurationValue", "N/A (Key Found, No Value)")
+                         else: value = "N/A (Key Not Found)"
+                 elif '.' in field:
+                     parts = field.split('.', 1); parent, child = parts[0], parts[1]
+                     value = resource.get(parent, {}).get(child, "N/A")
+                 else: # Other top-level fields like resourceId
+                     value = resource.get(field, "N/A")
+                 excluded_info[field] = value
+
+            excluded_info["exclusionReason"] = reason
+            excluded_resources_data.append(excluded_info)
+            logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} -> EXCLUDED. Reason: {reason}")
+        else:
+            in_scope_resources.append(resource)
+            logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} -> IN SCOPE.")
+
+    # Create DataFrame with columns in a predictable order if possible
+    # Ensure 'source' is included if it's in report_fields
+    ordered_columns = sorted(list(report_fields)) + ["exclusionReason"]
+    excluded_df = pd.DataFrame(excluded_resources_data)
+
+    # Reindex to ensure all columns are present and in order
+    # Use set operations to handle potential missing columns gracefully during reindex
+    existing_cols = set(excluded_df.columns)
+    all_expected_cols = set(ordered_columns)
+    final_cols = sorted(list(existing_cols.union(all_expected_cols))) # Combine and sort
+    excluded_df = excluded_df.reindex(columns=final_cols, fill_value="N/A (Column Added)")
+
+
+    logger.info(f"Exclusion filtering complete. In-scope: {len(in_scope_resources)}, Excluded: {len(excluded_resources_data)}")
+
+    return in_scope_resources, excluded_df
+
+# --- Sample Data ---
+# Includes the problematic case and others for context
+test_resources = [
+    # Case 1: The problematic key from your example
+    {
+        "accountResourceId": "119310032964_us-east-1_09caeaf2-c76a-40a6-9db0-dda45a55a017",
+        "resourceId": "09caeaf2-c76a-40a6-9db0-dda45a55a017", # <<< SHOULD BE EXCLUDED
+        "resourceType": "AWS::KMS::Key",
+        "source": "CT-AccessDenied", # <<< The key field
+        "configurationList": [
+            {"configurationName": "configuration.tags", "configurationValue": ""[]""},
+            {"configurationName": "configuration.aliases", "configurationValue": "[...]"},
+            {"configurationName": "configuration.kms_key.resourceId", "configurationValue": "09caeaf2-c76a-40a6-9db0-dda45a55a017"},
+            {"configurationName": "configuration.kms_key.ARN", "configurationValue": "arn:aws:kms:us-east-1:119310032964:key/09caeaf2-c76a-40a6-9db0-dda45a55a017"}
+        ],
+        "supplementaryConfiguration": [],
+    },
+    # Case 2: AWS Managed Key
+    {
+        "accountResourceId": "000000000000_us-east-1_aws-managed-key-1",
+        "resourceId": "aws-managed-key-1", # <<< SHOULD BE EXCLUDED
+        "resourceType": "AWS::KMS::Key",
+        "source": "AWS", # Different source
+        "configurationList": [
+            {"configurationName": "configuration.keyState", "configurationValue": "Enabled"},
+            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "AWS"} # <<< Exclusion criteria
+        ],
+        "supplementaryConfiguration": [],
+    },
+    # Case 3: Pending Deletion Key
+    {
+        "accountResourceId": "111111111111_us-east-1_pending-del-key-1",
+        "resourceId": "pending-del-key-1", # <<< SHOULD BE EXCLUDED
+        "resourceType": "AWS::KMS::Key",
+        "source": "Customer",
+        "configurationList": [
+            {"configurationName": "configuration.keyState", "configurationValue": "PendingDeletion"}, # <<< Exclusion criteria
+            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"}
+        ],
+        "supplementaryConfiguration": [
+            {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "False"}
+        ],
+    },
+    # Case 4: Pending Replica Deletion Key
+        {
+        "accountResourceId": "222222222222_us-east-1_pending-rep-key-1",
+        "resourceId": "pending-rep-key-1", # <<< SHOULD BE EXCLUDED
+        "resourceType": "AWS::KMS::Key",
+        "source": "Customer",
+        "configurationList": [
+            {"configurationName": "configuration.keyState", "configurationValue": "PendingReplicaDeletion"}, # <<< Exclusion criteria
+            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"}
+        ],
+        "supplementaryConfiguration": [
+            {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "False"}
+        ],
+    },
+    # Case 5: In-Scope Key (Should NOT be excluded)
+    {
+        "accountResourceId": "333333333333_us-east-1_in-scope-key-1",
+        "resourceId": "in-scope-key-1", # <<< SHOULD BE IN SCOPE
+        "resourceType": "AWS::KMS::Key",
+        "source": "Customer", # Not CT-AccessDenied
+        "configurationList": [
+            {"configurationName": "configuration.keyState", "configurationValue": "Enabled"}, # Not Pending...
+            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"} # Not AWS
+        ],
+        "supplementaryConfiguration": [
+             {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "True"}
+        ],
+    },
+    # Case 6: Missing Source Key (Should NOT be excluded by source rule)
+    {
+        "accountResourceId": "444444444444_us-east-1_missing-source-key-1",
+        "resourceId": "missing-source-key-1", # <<< SHOULD BE IN SCOPE
+        "resourceType": "AWS::KMS::Key",
+        # "source": field is missing entirely
+        "configurationList": [
+            {"configurationName": "configuration.keyState", "configurationValue": "Enabled"},
+            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"}
+        ],
+        "supplementaryConfiguration": [
+            {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "True"}
+        ],
+    },
+     # Case 7: Source Key is None (Should NOT be excluded by source rule)
+    {
+        "accountResourceId": "555555555555_us-east-1_none-source-key-1",
+        "resourceId": "none-source-key-1", # <<< SHOULD BE IN SCOPE
+        "resourceType": "AWS::KMS::Key",
+        "source": None, # Source is None
+        "configurationList": [
+            {"configurationName": "configuration.keyState", "configurationValue": "Enabled"},
+            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"}
+        ],
+        "supplementaryConfiguration": [
+            {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "True"}
+        ],
+    },
+]
+
+# --- Test Execution ---
+
+# Define fields needed for the report (must include fields used for filtering)
+report_fields_for_test = [
+    "resourceId",
+    "accountResourceId",
+    "source",
+    "configuration.keyState",
+    "ConfigurationObject.keyManager",
+    "supplementaryConfiguration.KeyRotationStatus" # Example other field
+]
+
+print("--- Running Unit Test for filter_out_of_scope_keys ---")
+
+# Call the function
+in_scope_resources, excluded_df = filter_out_of_scope_keys(test_resources, report_fields_for_test)
+
+# --- Analyze Results ---
+print(f"\nTotal resources tested: {len(test_resources)}")
+
+expected_excluded_ids = {
+    "09caeaf2-c76a-40a6-9db0-dda45a55a017", # Case 1: CT-AccessDenied
+    "aws-managed-key-1",                    # Case 2: AWS Managed
+    "pending-del-key-1",                    # Case 3: PendingDeletion
+    "pending-rep-key-1"                     # Case 4: PendingReplicaDeletion
+}
+expected_in_scope_ids = {
+    "in-scope-key-1",                       # Case 5: Normal
+    "missing-source-key-1",                 # Case 6: Source missing
+    "none-source-key-1"                     # Case 7: Source is None
+}
+
+print(f"\nExpected to be EXCLUDED: {len(expected_excluded_ids)}")
+print(f"Actually EXCLUDED: {len(excluded_df)}")
+
+print(f"\nExpected to be IN SCOPE: {len(expected_in_scope_ids)}")
+print(f"Actually IN SCOPE: {len(in_scope_resources)}")
+
+print("\n--- Details of EXCLUDED Resources ---")
+if not excluded_df.empty:
+    # Select specific columns for clearer output
+    cols_to_show = ["resourceId", "exclusionReason", "source", "configuration.keyState", "ConfigurationObject.keyManager"]
+    # Ensure columns exist before trying to select them
+    cols_present = [col for col in cols_to_show if col in excluded_df.columns]
+    print(excluded_df[cols_present].to_string())
+else:
+    print("No resources were excluded.")
+
+print("\n--- Resource IDs Remaining IN SCOPE ---")
+in_scope_ids_actual = {res.get("resourceId") for res in in_scope_resources}
+print(sorted(list(in_scope_ids_actual)))
+
+# --- Verification ---
+print("\n--- Verification ---")
+excluded_ids_actual = set(excluded_df["resourceId"]) if "resourceId" in excluded_df.columns and not excluded_df.empty else set()
+
+if excluded_ids_actual == expected_excluded_ids:
+    print("✅ SUCCESS: Excluded IDs match expected IDs.")
+else:
+    print(f"❌ FAILURE: Excluded IDs do NOT match expected IDs!")
+    print(f"   Expected Excluded: {sorted(list(expected_excluded_ids))}")
+    print(f"   Actual Excluded:   {sorted(list(excluded_ids_actual))}")
+    print(f"   Missing from Excluded: {sorted(list(expected_excluded_ids - excluded_ids_actual))}")
+    print(f"   Incorrectly Excluded: {sorted(list(excluded_ids_actual - expected_excluded_ids))}")
+
+if in_scope_ids_actual == expected_in_scope_ids:
+    print("✅ SUCCESS: In Scope IDs match expected IDs.")
+else:
+    print(f"❌ FAILURE: In Scope IDs do NOT match expected IDs!")
+    print(f"   Expected In Scope: {sorted(list(expected_in_scope_ids))}")
+    print(f"   Actual In Scope:   {sorted(list(in_scope_ids_actual))}")
+    print(f"   Missing from In Scope: {sorted(list(expected_in_scope_ids - in_scope_ids_actual))}")
+    print(f"   Incorrectly In Scope: {sorted(list(in_scope_ids_actual - expected_in_scope_ids))}")
+
+print("\n--- Test Complete ---")
+
+
+How to Use:
+
+Copy and Paste: Copy this entire script into a new Databricks notebook cell or a local Python file.
+
+Verify Function: Double-check that the filter_out_of_scope_keys function pasted into this script exactly matches the version currently in your main rotation script pipeline.
+
+Run: Execute the cell or the Python file.
+
+Analyze the Output:
+
+Look at the DEBUG messages printed during the filtering. Does it correctly log matched exclusion rule: Source = CT-AccessDenied for resource 09caeaf2-c76a-40a6-9db0-dda45a55a017?
+
+Examine the "Details of EXCLUDED Resources" table. Does it show the correct resourceId (09caeaf2-...), the correct exclusionReason (Source = CT-AccessDenied (Orphaned)), and the correct value in the source column (CT-AccessDenied)?
+
+Check the final "Verification" section. Does it report SUCCESS for both excluded and in-scope IDs? If not, the failure messages will tell you exactly which resource IDs were miscategorized.
+
+Interpreting Results:
+
+If the test script works correctly (shows SUCCESS): This means the filter_out_of_scope_keys function logic itself is correct regarding the "source" field. The problem in your main pipeline might be:
+
+You accidentally deployed an older version of the function that still used Source.
+
+The data being passed into the function in the main pipeline somehow differs from the sample (e.g., the "source" key is genuinely missing or has a different case in the actual API response for those 7 keys, despite the sample showing it).
+
+An error happens before the filter function is called in the main pipeline.
+
+If the test script fails (shows FAILURE, particularly for the CT-AccessDenied key): This indicates an issue within the filter_out_of_scope_keys function copy itself. Re-examine the resource.get("source") line and the reporting logic for the source column within the test script's function definition.
+
+This targeted test should quickly isolate whether the filtering logic for the "source" attribute is behaving as expected.
