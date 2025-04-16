@@ -1,20 +1,51 @@
-# --- Configuration & Setup ---
-# ... (other config like API Token, URL, etc.) ...
+Draft Escalation Email:
 
-# !!! IMPORTANT: SET THE FULL PATH TO YOUR CSV FILE HERE !!!
-# Example for Windows: DATASET_CSV_FILE = r"C:\Users\YourUser\Documents\MyProject\dataset_arns.csv"
-# Example for macOS/Linux: DATASET_CSV_FILE = "/Users/youruser/Documents/MyProject/dataset_arns.csv"
-DATASET_CSV_FILE = "/path/to/your/folder/dataset_arns.csv"  # <--- REPLACE THIS ENTIRE STRING
+Subject: Follow Up & Collaboration Request: Tier 1 Monitoring Approach for CTRL-1106307 System ID Certifications
 
-CSV_ARN_COLUMN_NAME = "CERTIFICATE_ARN" # Column header in your CSV
-OUTPUT_FILE = "tier1_test_results.txt" # Optional: File to write results
+To: Costa Grammenos; Robert Wirthman; Ali Abid
 
-# Add a check right after defining DATASET_CSV_FILE for debugging:
-print(f"Using explicit CSV file path: {DATASET_CSV_FILE}")
-if not os.path.exists(DATASET_CSV_FILE):
-     print(f"ERROR: The specified CSV file path does not exist: {DATASET_CSV_FILE}")
-     print("Please double-check the path.")
-     # Optional: exit if the file doesn't exist before trying to read it
-     # exit(1) # Uncomment this line to stop the script if the path is wrong
+Cc: Dariusz Szpunar; Ayalew Suraphel; Kevin Lai; [Your Senior Manager's Name/Email]; [Optional: Your Director's Name/Email]; [Optional: Devender Pun if relevant]
 
-# ... (rest of the configuration and script) ...
+Dear Costa, Rob, and Ali,
+
+Hope you are having a productive week.
+
+I am writing to follow up on our recent communications regarding the establishment of effective Tier 1 monitoring procedures for control CTRL-1106307: Centralized Access Management System ID Certifications. We appreciate the time and information you've shared thus far as we work through the technical details. We are keen to finalize a practical approach and wanted to reconnect on the outstanding points, particularly following up on our conversation last Friday, Costa.
+
+Our Goal:
+Our primary objective as the Cyber Controls Monitoring Team (CMT) is to implement a sustainable Tier 1 monitoring step that validates the completeness of the semi-annual System ID certification campaigns. Specifically, we need a method to gain assurance that all System IDs intended to be within the scope of a given certification cycle were indeed included, aligning with the control objective: "all assets/events that the control has purview over should be represented in the control execution". Establishing this proactive monitoring is crucial for identifying potential gaps early and ensuring confidence in the control's effectiveness during future testing cycles.
+
+Recap of Challenge & Discussions:
+We understand that determining the definitive scope is complex due to the exclusion rules hard-coded in BeanShell within All Access and the current lack of a readily available, comprehensive list of excluded System IDs.
+
+Initial discussions explored extracting lists of included vs. excluded IDs, which proved challenging due to the technical implementation of exclusions.
+
+Rob acknowledged the effort required to potentially generate a list of non-excluded IDs and suggested the possibility of providing the list of IDs intended for certification near campaign time.
+
+Ali provided valuable technical insight into the exclusion logic (custom objects, generic rules) and clarified the distinction between the enhancement team (his team) and the process ownership/certification execution team (Rob's team, including Costa, Dariusz, Ayalew).
+
+Costa helpfully confirmed that a list of excluded IDs isn't maintained, but mentioned a "validation sheet" exists showing what was included in the certification campaign.
+
+Our Ask & Path Forward:
+Building on Costa's suggestion, focusing on the list of included System IDs (the "validation sheet") seems like a pragmatic starting point. However, the core Tier 1 question remains: How can we validate that this list of included IDs accurately represents the complete intended scope for the certification period?
+
+To finalize our monitoring approach, we are seeking your collaboration on the following:
+
+Validation Method: Could you share how the control execution team currently gains assurance that the population included in the certification campaign (as reflected in the "validation sheet") is complete and accurate according to the defined scope and exclusion logic? Understanding your validation process would be immensely helpful.
+
+Feasible Data Comparison: Is there a feasible way – either through existing data, a query that can be developed (as Rob initially alluded to), or a combination of data points – to approximate the expected population for a given campaign? This could then be compared against the "included" list to satisfy the Tier 1 completeness check.
+
+Practical Monitoring Definition: Given the current state and technical constraints, what would you consider a practical and sustainable Tier 1 monitoring step that CMT can perform semi-annually? We are open to defining a pragmatic approach that provides reasonable assurance, acknowledging existing limitations.
+
+Engagement & Clarification:
+To ensure we engage efficiently, could we clarify the best points of contact within the Identity Lifecycle Management / Certification team versus the technical/enhancement team for specific requests moving forward (e.g., requesting the "validation sheet" vs. querying technical exclusion logic details)? We welcome any feedback on how we can improve our collaboration.
+
+We are eager to partner with you to define a clear and achievable monitoring process for this control. Please let us know your thoughts on the above points or if a brief meeting would be more effective to discuss and agree on a path forward.
+
+Thank you for your continued partnership and support.
+
+Best regards,
+
+Chris Taho
+[Your Title/Team Name]
+Cyber Controls Monitoring Team
