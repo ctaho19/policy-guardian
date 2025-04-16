@@ -2,23 +2,25 @@ import requests
 import json
 import os
 import datetime
-import csv # Import the csv module
+import csv
 from dotenv import load_dotenv
+from urllib.parse import urlencode # To help build query strings safely
 
 # --- Configuration & Setup ---
 load_dotenv() # Load variables from .env file
 
 # CloudRadar API Details from Environment Variables
 API_TOKEN = os.getenv("CLOUDRADAR_API_TOKEN")
-API_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
+# Base URL *without* any query parameters
+API_BASE_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
 API_HEADERS = {
     'Accept': 'application/json;v=1.0',
     'Authorization': f'Bearer {API_TOKEN}',
     'Content-Type': 'application/json'
 }
 API_LIMIT = 10000
-DATASET_CSV_FILE = "dataset_arns.csv" # <--- Name of your CSV file
-CSV_ARN_COLUMN_NAME = "CERTIFICATE_ARN" # <--- Column header in your CSV
+DATASET_CSV_FILE = "dataset_arns.csv" # Name of your CSV file
+CSV_ARN_COLUMN_NAME = "CERTIFICATE_ARN" # Column header in your CSV
 OUTPUT_FILE = "tier1_test_results.txt" # Optional: File to write results
 
 # Check if essential variables are loaded
@@ -26,48 +28,70 @@ if not API_TOKEN:
     print("ERROR: Missing CLOUDRADAR_API_TOKEN in .env file or environment variables.")
     exit(1)
 
-# --- Helper Function to Fetch CloudRadar ARNs with Pagination (Same as before) ---
-def fetch_cloudradar_arns(url, headers, limit):
-    """Fetches all AWS::ACM::Certificate ARNs issued by Amazon from CloudRadar, handling pagination."""
-    all_arns = set() # Using a set for automatic deduplication
+# --- CORRECTED Helper Function to Fetch CloudRadar ARNs ---
+def fetch_cloudradar_arns(base_url, headers, limit):
+    """
+    Fetches all AWS::ACM::Certificate ARNs issued by Amazon from CloudRadar,
+    handling pagination via URL query parameters.
+    """
+    all_arns = set()
     next_key = None
     page_count = 0
+    current_url = base_url # Start with the base URL for the first request
+
+    # Corrected Payload structure
+    payload = {
+        "responseFields": ["amazonResourceName"],
+        "searchParameters": [{
+            "resourceType": "AWS::ACM::Certificate",
+            "configurationItems": [{  # Corrected key
+                "configurationName": "issuer", # Corrected key
+                "configurationValue": "Amazon"
+            }]
+        }],
+        "limit": limit # Keep limit in the payload as per original example
+    }
+    payload_json = json.dumps(payload) # Prepare payload once
 
     while True:
         page_count += 1
-        print(f"Fetching page {page_count} from CloudRadar API...")
-        payload = {
-            "responseFields": ["amazonResourceName"],
-            "searchParameters": [{
-                "resourceType": "AWS::ACM::Certificate",
-                "configurationList": [{
-                    "configurationName": "ConfigurationObject.issuer",
-                    "configurationValue": "Amazon"
-                }]
-            }],
-            "limit": limit
-        }
-        if next_key:
-            payload["nextRecordKey"] = next_key
+        print(f"--- Fetching Page {page_count} ---")
+        print(f"URL: {current_url}")
+        # print(f"Payload: {payload_json}") # Optional: uncomment to debug payload
 
         try:
-            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=180)
-            response.raise_for_status()
+            # Make the POST request to the current URL (which includes nextRecordKey after 1st page)
+            response = requests.post(current_url, headers=headers, data=payload_json, timeout=180)
+            response.raise_for_status() # Check for HTTP errors
             data = response.json()
 
             resources = data.get("resourceConfigurations", [])
             fetched_count = 0
             if resources:
                 for config in resources:
-                    if config and "amazonResourceName" in config and config["amazonResourceName"]:
+                    # Add extra checks for robustness
+                    if isinstance(config, dict) and "amazonResourceName" in config and config["amazonResourceName"]:
                         all_arns.add(config["amazonResourceName"])
                         fetched_count += 1
+                    # else: # Optional: Log unexpected item format
+                    #     print(f"Warning: Skipping unexpected item format in page {page_count}: {config}")
 
+
+            # Extract the nextRecordKey *from the response*
             next_key = data.get("nextRecordKey")
+
             print(f"Page {page_count} fetched. Found {fetched_count} valid items. Next key exists: {bool(next_key)}")
 
-            if not next_key:
-                break
+            # --- Pagination Logic ---
+            if next_key:
+                # If there's a next key, prepare the URL for the *next* iteration
+                # by adding it as a query parameter to the *base* URL.
+                query_params = urlencode({'nextRecordKey': next_key})
+                current_url = f"{base_url}?{query_params}"
+            else:
+                # If no next key in the response, we are done.
+                print("No nextRecordKey found in response. Pagination complete.")
+                break # Exit the loop
 
         except requests.exceptions.Timeout:
             print(f"ERROR: CloudRadar API request timed out on page {page_count}.")
@@ -78,20 +102,27 @@ def fetch_cloudradar_arns(url, headers, limit):
             print(f"ERROR: CloudRadar API request failed: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 print(f"Response Status Code: {e.response.status_code}")
-                print(f"Response Text: {e.response.text[:500]}...")
+                # Try to decode response as JSON for error details if possible
+                try:
+                    error_details = e.response.json()
+                    print(f"Response JSON: {json.dumps(error_details, indent=2)}")
+                except json.JSONDecodeError:
+                    print(f"Response Text: {e.response.text[:1000]}...") # Log more text on error
             print("Returning ARNs fetched so far (might be incomplete).")
             return all_arns, False # Indicate failure
 
         except json.JSONDecodeError as e:
-            print(f"ERROR: Failed to decode JSON response from CloudRadar API: {e}")
-            if 'response' in locals():
+            print(f"ERROR: Failed to decode JSON response from CloudRadar API on page {page_count}: {e}")
+            # Ensure 'response' exists before trying to access its text attribute
+            if 'response' in locals() and hasattr(response, 'text'):
                  print(f"Response Text: {response.text[:500]}...")
             return all_arns, False # Indicate failure
+        # --- End of Loop ---
 
-    print(f"Finished fetching from CloudRadar. Total distinct ARNs found: {len(all_arns)}")
+    print(f"\nFinished fetching from CloudRadar. Total distinct ARNs found: {len(all_arns)}")
     return all_arns, True # Return True for success
 
-# --- Helper Function to Load Dataset ARNs from CSV ---
+# --- Helper Function to Load Dataset ARNs from CSV (Same as before) ---
 def load_dataset_arns_from_csv(filepath, arn_column_name):
     """Loads ARNs from a CSV file, expecting a specific column header."""
     dataset_arns = set()
@@ -101,7 +132,7 @@ def load_dataset_arns_from_csv(filepath, arn_column_name):
             print(f"ERROR: Dataset CSV file not found at '{filepath}'")
             return dataset_arns, False
 
-        with open(filepath, mode='r', newline='', encoding='utf-8') as csvfile:
+        with open(filepath, mode='r', newline='', encoding='utf-8-sig') as csvfile: # Use utf-8-sig to handle potential BOM
             reader = csv.reader(csvfile)
             try:
                 header = next(reader) # Read the header row
@@ -109,12 +140,14 @@ def load_dataset_arns_from_csv(filepath, arn_column_name):
                 print(f"ERROR: CSV file '{filepath}' appears to be empty.")
                 return dataset_arns, False # Empty file
 
-            # Find the index of the ARN column
+            # Find the index of the ARN column (case-insensitive strip)
+            header_processed = [h.strip() for h in header]
+            arn_column_name_stripped = arn_column_name.strip()
             try:
-                arn_column_index = header.index(arn_column_name)
-                print(f"Found ARN column '{arn_column_name}' at index {arn_column_index}.")
+                arn_column_index = header_processed.index(arn_column_name_stripped)
+                print(f"Found ARN column '{arn_column_name_stripped}' at index {arn_column_index}.")
             except ValueError:
-                print(f"ERROR: Column '{arn_column_name}' not found in CSV header: {header}")
+                print(f"ERROR: Column '{arn_column_name_stripped}' not found in CSV header: {header_processed}")
                 print(f"Please ensure the CSV file '{filepath}' has the correct header.")
                 return dataset_arns, False
 
@@ -124,13 +157,12 @@ def load_dataset_arns_from_csv(filepath, arn_column_name):
             for row in reader:
                 row_count += 1
                 if len(row) > arn_column_index:
-                    arn = row[arn_column_index].strip()
+                    arn = row[arn_column_index].strip() # Strip whitespace from ARN
                     if arn and arn.startswith("arn:aws:acm"): # Basic validation
                         dataset_arns.add(arn)
                         valid_arn_count += 1
                 # else: # Optional: warn about short rows
                 #     print(f"Warning: Row {row_count + 1} has fewer columns than expected: {row}")
-
 
         print(f"Processed {row_count} data rows from CSV.")
         print(f"Loaded {len(dataset_arns)} distinct and valid ACM ARNs from CSV file.")
@@ -139,11 +171,11 @@ def load_dataset_arns_from_csv(filepath, arn_column_name):
         print(f"ERROR reading dataset CSV file '{filepath}': {e}")
         return dataset_arns, False
 
-# --- Main Execution ---
+# --- Main Execution (No changes needed from here down) ---
 
-# 1. Fetch from CloudRadar
+# 1. Fetch from CloudRadar (using the corrected function)
 print("--- Step 1: Fetching Data from CloudRadar ---")
-cloudradar_arns_set, radar_success = fetch_cloudradar_arns(API_URL, API_HEADERS, API_LIMIT)
+cloudradar_arns_set, radar_success = fetch_cloudradar_arns(API_BASE_URL, API_HEADERS, API_LIMIT)
 if not radar_success:
     print("\nAborting due to failure fetching CloudRadar data.")
     exit(1)
@@ -156,20 +188,15 @@ dataset_arns_set, load_success = load_dataset_arns_from_csv(DATASET_CSV_FILE, CS
 if not load_success:
     print("\nAborting due to failure loading dataset CSV data.")
     exit(1)
-dataset_count = len(dataset_arns_set)
-# Note: dataset_count here is just the count loaded from the file, not directly used in T1 metric calculation
+# dataset_count = len(dataset_arns_set) # Not directly used in metric
 
 # 3. Calculate Tier 1 Metric
 print("\n--- Step 3: Calculating Tier 1 Metric ---")
 if cloudradar_count > 0:
-    # Find intersection (ARNs present in both CloudRadar and the dataset CSV)
     matched_arns_set = cloudradar_arns_set.intersection(dataset_arns_set)
     numerator_t1 = len(matched_arns_set)
     denominator_t1 = float(cloudradar_count)
-
-    # Handle potential division by zero, although checked cloudradar_count > 0
     metric_t1 = round((numerator_t1 * 100.0 / denominator_t1), 2) if denominator_t1 > 0 else 0.0
-    # Status check: strict equality needed for 100%
     status_t1 = "GREEN" if numerator_t1 == int(denominator_t1) else "RED"
 else:
     print("CloudRadar reported 0 in-scope certificates. Setting Tier 1 to 100% GREEN.")
@@ -214,7 +241,6 @@ for line in summary_lines:
 print("\n--- Step 4: Generating Supporting Evidence (ARNs Missing from Dataset CSV) ---")
 terminal_output.append("\n--- Supporting Evidence (Missing ARNs) ---")
 
-# Find difference (ARNs in CloudRadar but NOT in Dataset CSV)
 missing_arns_set = cloudradar_arns_set.difference(dataset_arns_set)
 missing_count = len(missing_arns_set)
 
@@ -223,12 +249,12 @@ if missing_count > 0:
     print(missing_header)
     terminal_output.append(missing_header)
     count = 0
-    for arn in sorted(list(missing_arns_set)): # Sort for consistent output
+    for arn in sorted(list(missing_arns_set)):
         line = f"  - {arn}"
         print(line)
         terminal_output.append(line)
         count += 1
-        if count >= 200: # Limit printed output if there are too many
+        if count >= 200:
             limit_msg = f"  ... (showing first 200 of {missing_count})"
             print(limit_msg)
             terminal_output.append(limit_msg)
