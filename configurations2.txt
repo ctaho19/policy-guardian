@@ -1,337 +1,229 @@
-Okay, let's create a focused unit test script to debug the source attribute extraction and filtering within the filter_out_of_scope_keys function.
-
-This script will:
-
-Define sample resource data, including the exact problematic case ("source": "CT-AccessDenied") and other relevant scenarios.
-
-Include the latest version of the filter_out_of_scope_keys function we developed.
-
-Run the function against the sample data.
-
-Print detailed results, showing which resources were excluded, why, and which remained in scope.
-
-This will help us confirm if the function logic itself is correct and how it handles the source field.
-
-import pandas as pd
+import requests
 import json
-from typing import Dict, List, Optional, Tuple
-import logging
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, DateType, Row
+import datetime
 
-# --- Basic Logger Setup for the Test ---
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+# --- Configuration ---
 
-# --- Function Under Test (Latest Version) ---
-# Make sure this exactly matches the version in your main script
-def filter_out_of_scope_keys(resources: List[Dict], desired_fields_for_report: List[str]) -> Tuple[List[Dict], pd.DataFrame]:
-    """Filters out resources based on predefined exclusion criteria for KMS keys."""
-    in_scope_resources = []
-    excluded_resources_data = []
+# IMPORTANT: Use Databricks Secrets to store the API token
+# Example: token = dbutils.secrets.get(scope="your-scope", key="cloudradar-api-token")
+# Replace placeholder below with your secret retrieval method
+# DO NOT HARDCODE THE TOKEN
+try:
+    # Replace "your-scope" and "cloudradar-api-token" with your actual secret scope and key
+    API_TOKEN = dbutils.secrets.get(scope="your-scope", key="cloudradar-api-token")
+    print("Successfully retrieved API Token from Databricks Secrets.")
+except Exception as e:
+    print("ERROR: Failed to retrieve API Token from Databricks Secrets.")
+    print("Please ensure the secret scope and key are configured correctly.")
+    # You might want to dbutils.notebook.exit("Failed to get API token") here
+    # For demonstration purposes, using a placeholder. THIS IS NOT SECURE FOR PRODUCTION.
+    API_TOKEN = "YOUR_BEARER_TOKEN_PLACEHOLDER" # <<<--- REPLACE THIS OR REMOVE IF USING SECRETS
+    if API_TOKEN == "YOUR_BEARER_TOKEN_PLACEHOLDER":
+       print("WARNING: Using a placeholder API token. Replace with secret retrieval for security.")
+       # Consider adding dbutils.notebook.exit("Placeholder token used. Exiting for security.")
 
-    required_filter_fields = {"resourceId", "accountResourceId", "configuration.keyState", "ConfigurationObject.keyManager", "source"} # Use lowercase 'source'
-    report_fields = set(desired_fields_for_report) | required_filter_fields
-
-    logger.info(f"Starting filtering of {len(resources)} test resources...")
-
-    for resource in resources:
-        exclude = False
-        reason = "N/A"
-
-        # --- Exclusion Check 1: Orphaned Keys (Source field - CORRECTED CASE) ---
-        source_field = resource.get("source") # Use lowercase 'source'
-        if source_field == "CT-AccessDenied":
-            exclude = True
-            reason = "Source = CT-AccessDenied (Orphaned)"
-            logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} matched exclusion rule: Source = CT-AccessDenied")
-
-
-        # --- Exclusion Check 2 & 3: Configuration List Checks ---
-        key_state = "N/A"
-        key_manager = "N/A"
-
-        if not exclude:
-            config_list = resource.get("configurationList", [])
-            found_key_state = False
-            found_key_manager = False
-
-            for config in config_list:
-                config_name = config.get("configurationName")
-                config_value = config.get("configurationValue")
-
-                if config_name == "configuration.keyState":
-                    key_state = config_value if config_value is not None else "N/A"
-                    found_key_state = True
-                elif config_name == "ConfigurationObject.keyManager": # Note: API might return diff case, adjust if needed
-                    key_manager = config_value if config_value is not None else "N/A"
-                    found_key_manager = True
-
-            if key_state in ["PendingDeletion", "PendingReplicaDeletion"]:
-                exclude = True
-                reason = f"KeyState = {key_state} (Pending Deletion/Replica Deletion)"
-                logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} matched exclusion rule: KeyState = {key_state}")
-
-            elif key_manager == "AWS": # Assuming API returns 'AWS' - verify case if needed
-                exclude = True
-                reason = "KeyManager = AWS (AWS Managed)"
-                logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} matched exclusion rule: KeyManager = AWS")
-
-        # --- Store results ---
-        if exclude:
-            excluded_info = {}
-            # --- Improved report population for excluded items ---
-            for field in report_fields:
-                 value = "N/A" # Default
-                 if field == "source": # Handle top-level source correctly
-                     value = resource.get("source", "N/A") # Use lowercase
-                 elif field.startswith("supplementaryConfiguration."):
-                     s_list = resource.get("supplementaryConfiguration", [])
-                     item = next((i for i in s_list if i.get("supplementaryConfigurationName") == field), None)
-                     if item: value = item.get("supplementaryConfigurationValue", "N/A (Key Found, No Value)")
-                     else: value = "N/A (Key Not Found)"
-                 elif field.startswith("configuration."):
-                     # Use values extracted earlier if available, otherwise search list
-                     if field == "configuration.keyState": value = key_state
-                     elif field == "ConfigurationObject.keyManager": value = key_manager
-                     else: # Search configList for other configuration.* fields
-                         c_list = resource.get("configurationList", [])
-                         item = next((i for i in c_list if i.get("configurationName") == field), None)
-                         if item: value = item.get("configurationValue", "N/A (Key Found, No Value)")
-                         else: value = "N/A (Key Not Found)"
-                 elif '.' in field:
-                     parts = field.split('.', 1); parent, child = parts[0], parts[1]
-                     value = resource.get(parent, {}).get(child, "N/A")
-                 else: # Other top-level fields like resourceId
-                     value = resource.get(field, "N/A")
-                 excluded_info[field] = value
-
-            excluded_info["exclusionReason"] = reason
-            excluded_resources_data.append(excluded_info)
-            logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} -> EXCLUDED. Reason: {reason}")
-        else:
-            in_scope_resources.append(resource)
-            logger.debug(f"Resource ID {resource.get('resourceId', 'N/A')} -> IN SCOPE.")
-
-    # Create DataFrame with columns in a predictable order if possible
-    # Ensure 'source' is included if it's in report_fields
-    ordered_columns = sorted(list(report_fields)) + ["exclusionReason"]
-    excluded_df = pd.DataFrame(excluded_resources_data)
-
-    # Reindex to ensure all columns are present and in order
-    # Use set operations to handle potential missing columns gracefully during reindex
-    existing_cols = set(excluded_df.columns)
-    all_expected_cols = set(ordered_columns)
-    final_cols = sorted(list(existing_cols.union(all_expected_cols))) # Combine and sort
-    excluded_df = excluded_df.reindex(columns=final_cols, fill_value="N/A (Column Added)")
-
-
-    logger.info(f"Exclusion filtering complete. In-scope: {len(in_scope_resources)}, Excluded: {len(excluded_resources_data)}")
-
-    return in_scope_resources, excluded_df
-
-# --- Sample Data ---
-# Includes the problematic case and others for context
-test_resources = [
-    # Case 1: The problematic key from your example
-    {
-        "accountResourceId": "119310032964_us-east-1_09caeaf2-c76a-40a6-9db0-dda45a55a017",
-        "resourceId": "09caeaf2-c76a-40a6-9db0-dda45a55a017", # <<< SHOULD BE EXCLUDED
-        "resourceType": "AWS::KMS::Key",
-        "source": "CT-AccessDenied", # <<< The key field
-        "configurationList": [
-            {"configurationName": "configuration.tags", "configurationValue": ""[]""},
-            {"configurationName": "configuration.aliases", "configurationValue": "[...]"},
-            {"configurationName": "configuration.kms_key.resourceId", "configurationValue": "09caeaf2-c76a-40a6-9db0-dda45a55a017"},
-            {"configurationName": "configuration.kms_key.ARN", "configurationValue": "arn:aws:kms:us-east-1:119310032964:key/09caeaf2-c76a-40a6-9db0-dda45a55a017"}
-        ],
-        "supplementaryConfiguration": [],
-    },
-    # Case 2: AWS Managed Key
-    {
-        "accountResourceId": "000000000000_us-east-1_aws-managed-key-1",
-        "resourceId": "aws-managed-key-1", # <<< SHOULD BE EXCLUDED
-        "resourceType": "AWS::KMS::Key",
-        "source": "AWS", # Different source
-        "configurationList": [
-            {"configurationName": "configuration.keyState", "configurationValue": "Enabled"},
-            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "AWS"} # <<< Exclusion criteria
-        ],
-        "supplementaryConfiguration": [],
-    },
-    # Case 3: Pending Deletion Key
-    {
-        "accountResourceId": "111111111111_us-east-1_pending-del-key-1",
-        "resourceId": "pending-del-key-1", # <<< SHOULD BE EXCLUDED
-        "resourceType": "AWS::KMS::Key",
-        "source": "Customer",
-        "configurationList": [
-            {"configurationName": "configuration.keyState", "configurationValue": "PendingDeletion"}, # <<< Exclusion criteria
-            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"}
-        ],
-        "supplementaryConfiguration": [
-            {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "False"}
-        ],
-    },
-    # Case 4: Pending Replica Deletion Key
-        {
-        "accountResourceId": "222222222222_us-east-1_pending-rep-key-1",
-        "resourceId": "pending-rep-key-1", # <<< SHOULD BE EXCLUDED
-        "resourceType": "AWS::KMS::Key",
-        "source": "Customer",
-        "configurationList": [
-            {"configurationName": "configuration.keyState", "configurationValue": "PendingReplicaDeletion"}, # <<< Exclusion criteria
-            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"}
-        ],
-        "supplementaryConfiguration": [
-            {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "False"}
-        ],
-    },
-    # Case 5: In-Scope Key (Should NOT be excluded)
-    {
-        "accountResourceId": "333333333333_us-east-1_in-scope-key-1",
-        "resourceId": "in-scope-key-1", # <<< SHOULD BE IN SCOPE
-        "resourceType": "AWS::KMS::Key",
-        "source": "Customer", # Not CT-AccessDenied
-        "configurationList": [
-            {"configurationName": "configuration.keyState", "configurationValue": "Enabled"}, # Not Pending...
-            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"} # Not AWS
-        ],
-        "supplementaryConfiguration": [
-             {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "True"}
-        ],
-    },
-    # Case 6: Missing Source Key (Should NOT be excluded by source rule)
-    {
-        "accountResourceId": "444444444444_us-east-1_missing-source-key-1",
-        "resourceId": "missing-source-key-1", # <<< SHOULD BE IN SCOPE
-        "resourceType": "AWS::KMS::Key",
-        # "source": field is missing entirely
-        "configurationList": [
-            {"configurationName": "configuration.keyState", "configurationValue": "Enabled"},
-            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"}
-        ],
-        "supplementaryConfiguration": [
-            {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "True"}
-        ],
-    },
-     # Case 7: Source Key is None (Should NOT be excluded by source rule)
-    {
-        "accountResourceId": "555555555555_us-east-1_none-source-key-1",
-        "resourceId": "none-source-key-1", # <<< SHOULD BE IN SCOPE
-        "resourceType": "AWS::KMS::Key",
-        "source": None, # Source is None
-        "configurationList": [
-            {"configurationName": "configuration.keyState", "configurationValue": "Enabled"},
-            {"configurationName": "ConfigurationObject.keyManager", "configurationValue": "CUSTOMER"}
-        ],
-        "supplementaryConfiguration": [
-            {"supplementaryConfigurationName": "supplementaryConfiguration.KeyRotationStatus", "supplementaryConfigurationValue": "True"}
-        ],
-    },
-]
-
-# --- Test Execution ---
-
-# Define fields needed for the report (must include fields used for filtering)
-report_fields_for_test = [
-    "resourceId",
-    "accountResourceId",
-    "source",
-    "configuration.keyState",
-    "ConfigurationObject.keyManager",
-    "supplementaryConfiguration.KeyRotationStatus" # Example other field
-]
-
-print("--- Running Unit Test for filter_out_of_scope_keys ---")
-
-# Call the function
-in_scope_resources, excluded_df = filter_out_of_scope_keys(test_resources, report_fields_for_test)
-
-# --- Analyze Results ---
-print(f"\nTotal resources tested: {len(test_resources)}")
-
-expected_excluded_ids = {
-    "09caeaf2-c76a-40a6-9db0-dda45a55a017", # Case 1: CT-AccessDenied
-    "aws-managed-key-1",                    # Case 2: AWS Managed
-    "pending-del-key-1",                    # Case 3: PendingDeletion
-    "pending-rep-key-1"                     # Case 4: PendingReplicaDeletion
-}
-expected_in_scope_ids = {
-    "in-scope-key-1",                       # Case 5: Normal
-    "missing-source-key-1",                 # Case 6: Source missing
-    "none-source-key-1"                     # Case 7: Source is None
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+# Define your sfOptions dictionary with Snowflake connection details
+# Ensure user/password or other auth methods are secure (e.g., keypair, OAuth)
+sfOptions = {
+  "sfUrl": "YOUR_ACCOUNT.snowflakecomputing.com",
+  "sfUser": "YOUR_USER",
+  "sfPassword": "YOUR_PASSWORD", # Or use other auth like sfRole, sfWarehouse, sfDatabase, sfSchema
+  "sfDatabase": "CYBR_DB",
+  "sfSchema": "PHDP_CYBR", # Default schema for reads
+  "sfWarehouse": "YOUR_WAREHOUSE"
 }
 
-print(f"\nExpected to be EXCLUDED: {len(expected_excluded_ids)}")
-print(f"Actually EXCLUDED: {len(excluded_df)}")
+# CloudRadar API Details
+API_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
+API_HEADERS = {
+    'Accept': 'application/json;v=1.0',
+    'Authorization': f'Bearer {API_TOKEN}',
+    'Content-Type': 'application/json'
+}
+API_LIMIT = 10000 # Match the limit in your payload
 
-print(f"\nExpected to be IN SCOPE: {len(expected_in_scope_ids)}")
-print(f"Actually IN SCOPE: {len(in_scope_resources)}")
+# Define schema matching the target table's structure for the final output
+# (DATE, CTRL_ID, MONITORING_METRIC_NUMBER, MONITORING_METRIC, COMPLIANCE_STATUS, NUMERATOR, DENOMINATOR)
+output_schema = StructType([
+    StructField("DATE", DateType(), True),
+    StructField("CTRL_ID", StringType(), True),
+    StructField("MONITORING_METRIC_NUMBER", StringType(), True),
+    StructField("MONITORING_METRIC", DoubleType(), True), # Using Double for percentage
+    StructField("COMPLIANCE_STATUS", StringType(), True),
+    StructField("NUMERATOR", DoubleType(), True),         # Using Double for counts
+    StructField("DENOMINATOR", DoubleType(), True)        # Using Double for counts
+])
 
-print("\n--- Details of EXCLUDED Resources ---")
-if not excluded_df.empty:
-    # Select specific columns for clearer output
-    cols_to_show = ["resourceId", "exclusionReason", "source", "configuration.keyState", "ConfigurationObject.keyManager"]
-    # Ensure columns exist before trying to select them
-    cols_present = [col for col in cols_to_show if col in excluded_df.columns]
-    print(excluded_df[cols_present].to_string())
+# --- Helper Function to Fetch CloudRadar ARNs with Pagination ---
+
+def fetch_cloudradar_arns(url, headers, limit):
+    """Fetches all AWS::ACM::Certificate ARNs issued by Amazon from CloudRadar, handling pagination."""
+    all_arns = set()
+    next_key = None
+    page_count = 0
+
+    while True:
+        page_count += 1
+        print(f"Fetching page {page_count} from CloudRadar API...")
+        payload = {
+            "responseFields": ["amazonResourceName"],
+            "searchParameters": [{
+                "resourceType": "AWS::ACM::Certificate",
+                "configurationList": [{
+                    "configurationName": "ConfigurationObject.issuer",
+                    "configurationValue": "Amazon"
+                }]
+            }],
+            "limit": limit
+        }
+        if next_key:
+            payload["nextRecordKey"] = next_key
+
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120) # Increased timeout
+            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+            data = response.json()
+
+            resources = data.get("resourceConfigurations", [])
+            if resources: # Check if the list exists and is not empty
+                 for config in resources:
+                    if "amazonResourceName" in config:
+                        all_arns.add(config["amazonResourceName"])
+
+            fetched_count = len(resources)
+            next_key = data.get("nextRecordKey")
+            print(f"Page {page_count} fetched. Found {fetched_count} items. Next key exists: {bool(next_key)}")
+
+            if not next_key:
+                break # Exit loop if no more pages
+
+        except requests.exceptions.Timeout:
+            print(f"ERROR: CloudRadar API request timed out on page {page_count}.")
+            print("Returning ARNs fetched so far (might be incomplete).")
+            return list(all_arns), False # Indicate failure due to timeout
+
+        except requests.exceptions.RequestException as e:
+            print(f"ERROR: CloudRadar API request failed: {e}")
+            # Log response text if available and helpful
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"Response Status Code: {e.response.status_code}")
+                print(f"Response Text: {e.response.text[:500]}...") # Log part of the response
+            print("Returning ARNs fetched so far (might be incomplete).")
+            return list(all_arns), False # Indicate failure
+
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Failed to decode JSON response from CloudRadar API: {e}")
+            print(f"Response Text: {response.text[:500]}...") # Log part of the response
+            return list(all_arns), False # Indicate failure
+
+    print(f"Finished fetching from CloudRadar. Total distinct ARNs found: {len(all_arns)}")
+    return list(all_arns), True # Return True to indicate success
+
+# --- Tier 1 Calculation Steps ---
+
+# 1. Fetch Authoritative List from CloudRadar
+print("--- Starting Tier 1 Calculation ---")
+cloudradar_arns_list, fetch_success = fetch_cloudradar_arns(API_URL, API_HEADERS, API_LIMIT)
+
+if not fetch_success:
+     print("ERROR: Failed to fetch complete data from CloudRadar API. Aborting Tier 1 calculation.")
+     dbutils.notebook.exit("CloudRadar API fetch failed.") # Exit notebook execution
+
+# 2. Create CloudRadar ARN DataFrame
+cloudradar_schema = StructType([StructField("cloudradar_arn", StringType(), True)]) # Renamed column for clarity
+if cloudradar_arns_list:
+    # Filter out any potential None values just in case
+    valid_arns = [arn for arn in cloudradar_arns_list if arn is not None]
+    cloudradar_df = spark.createDataFrame([(arn,) for arn in valid_arns], schema=cloudradar_schema).distinct()
 else:
-    print("No resources were excluded.")
+    # Create an empty DataFrame with the correct schema if the list is empty
+    cloudradar_df = spark.createDataFrame([], schema=cloudradar_schema)
 
-print("\n--- Resource IDs Remaining IN SCOPE ---")
-in_scope_ids_actual = {res.get("resourceId") for res in in_scope_resources}
-print(sorted(list(in_scope_ids_actual)))
+cloudradar_df.cache() # Cache as it might be used for supporting evidence later
+cloudradar_count = cloudradar_df.count()
+print(f"Total distinct ARNs from CloudRadar (Denominator): {cloudradar_count}")
 
-# --- Verification ---
-print("\n--- Verification ---")
-excluded_ids_actual = set(excluded_df["resourceId"]) if "resourceId" in excluded_df.columns and not excluded_df.empty else set()
+# 3. Get Dataset ARNs from Snowflake
+print("Fetching distinct ACM ARNs from Certificate Catalog table (Snowflake)...")
+dataset_arns_query = """
+SELECT DISTINCT CERTIFICATE_ARN
+FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
+WHERE CERTIFICATE_ARN LIKE 'arn:aws:acm:%' -- More specific than just %arn:aws:acm%
+  AND CERTIFICATE_ARN IS NOT NULL
+"""
 
-if excluded_ids_actual == expected_excluded_ids:
-    print("✅ SUCCESS: Excluded IDs match expected IDs.")
+try:
+    dataset_arns_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", dataset_arns_query) \
+        .load()
+    dataset_arns_df = dataset_arns_df.withColumnRenamed("CERTIFICATE_ARN", "dataset_arn") # Rename for join clarity
+    dataset_arns_df.cache() # Cache for the join and potentially supporting evidence
+    dataset_count = dataset_arns_df.count()
+    print(f"Distinct ACM ARNs found in dataset: {dataset_count}")
+except Exception as e:
+    print(f"ERROR: Failed to fetch ARNs from Snowflake table: {e}")
+    cloudradar_df.unpersist() # Clean up cache
+    dbutils.notebook.exit("Failed to query dataset ARNs.")
+
+# 4. Calculate Tier 1 Metric Values
+print("Calculating Tier 1 metric values...")
+
+if cloudradar_count > 0:
+    # Find ARNs from CloudRadar that ARE present in the dataset (inner join)
+    matched_arns_df = cloudradar_df.join(
+        dataset_arns_df,
+        cloudradar_df["cloudradar_arn"] == dataset_arns_df["dataset_arn"],
+        "inner"
+    )
+    numerator_t1 = matched_arns_df.count()
+    denominator_t1 = float(cloudradar_count) # Ensure float for division
+
+    # Handle potential division by zero, although checked cloudradar_count > 0
+    metric_t1 = round((numerator_t1 * 100.0 / denominator_t1), 2) if denominator_t1 > 0 else 0.0
+    # Status check: strict equality needed for 100%
+    status_t1 = "GREEN" if numerator_t1 == int(denominator_t1) else "RED"
+
 else:
-    print(f"❌ FAILURE: Excluded IDs do NOT match expected IDs!")
-    print(f"   Expected Excluded: {sorted(list(expected_excluded_ids))}")
-    print(f"   Actual Excluded:   {sorted(list(excluded_ids_actual))}")
-    print(f"   Missing from Excluded: {sorted(list(expected_excluded_ids - excluded_ids_actual))}")
-    print(f"   Incorrectly Excluded: {sorted(list(excluded_ids_actual - expected_excluded_ids))}")
+    # Handle case where CloudRadar returned no ARNs
+    print("CloudRadar reported 0 in-scope certificates. Setting Tier 1 to 100% GREEN.")
+    numerator_t1 = 0
+    denominator_t1 = 0.0
+    metric_t1 = 100.0 # Defined as 100% if population is zero
+    status_t1 = "GREEN"
 
-if in_scope_ids_actual == expected_in_scope_ids:
-    print("✅ SUCCESS: In Scope IDs match expected IDs.")
-else:
-    print(f"❌ FAILURE: In Scope IDs do NOT match expected IDs!")
-    print(f"   Expected In Scope: {sorted(list(expected_in_scope_ids))}")
-    print(f"   Actual In Scope:   {sorted(list(in_scope_ids_actual))}")
-    print(f"   Missing from In Scope: {sorted(list(expected_in_scope_ids - in_scope_ids_actual))}")
-    print(f"   Incorrectly In Scope: {sorted(list(in_scope_ids_actual - expected_in_scope_ids))}")
+# 5. Create Tier 1 Result DataFrame
+print("Creating Tier 1 output DataFrame...")
+current_date = datetime.date.today()
 
-print("\n--- Test Complete ---")
+tier1_data = [(
+    current_date,
+    'CTRL-1077188',
+    'MNTR-1077188-T1',
+    float(metric_t1),
+    status_t1,
+    float(numerator_t1),
+    float(denominator_t1)
+)]
 
+# Create the DataFrame using the predefined schema
+df_tier1 = spark.createDataFrame(tier1_data, schema=output_schema)
 
-How to Use:
+# --- Display Tier 1 Result ---
+print("\n--- Tier 1 Metric Result ---")
+df_tier1.show(truncate=False)
 
-Copy and Paste: Copy this entire script into a new Databricks notebook cell or a local Python file.
+print(f"\nCalculation Summary:")
+print(f"  CloudRadar ARNs (Denominator): {int(denominator_t1)}")
+print(f"  Matched ARNs in Dataset (Numerator): {int(numerator_t1)}")
+print(f"  Metric Value: {metric_t1}%")
+print(f"  Compliance Status: {status_t1}")
 
-Verify Function: Double-check that the filter_out_of_scope_keys function pasted into this script exactly matches the version currently in your main rotation script pipeline.
+# Keep cached dataframes if needed for Part 2, otherwise unpersist here
+# dataset_arns_df.unpersist()
+# cloudradar_df.unpersist()
 
-Run: Execute the cell or the Python file.
-
-Analyze the Output:
-
-Look at the DEBUG messages printed during the filtering. Does it correctly log matched exclusion rule: Source = CT-AccessDenied for resource 09caeaf2-c76a-40a6-9db0-dda45a55a017?
-
-Examine the "Details of EXCLUDED Resources" table. Does it show the correct resourceId (09caeaf2-...), the correct exclusionReason (Source = CT-AccessDenied (Orphaned)), and the correct value in the source column (CT-AccessDenied)?
-
-Check the final "Verification" section. Does it report SUCCESS for both excluded and in-scope IDs? If not, the failure messages will tell you exactly which resource IDs were miscategorized.
-
-Interpreting Results:
-
-If the test script works correctly (shows SUCCESS): This means the filter_out_of_scope_keys function logic itself is correct regarding the "source" field. The problem in your main pipeline might be:
-
-You accidentally deployed an older version of the function that still used Source.
-
-The data being passed into the function in the main pipeline somehow differs from the sample (e.g., the "source" key is genuinely missing or has a different case in the actual API response for those 7 keys, despite the sample showing it).
-
-An error happens before the filter function is called in the main pipeline.
-
-If the test script fails (shows FAILURE, particularly for the CT-AccessDenied key): This indicates an issue within the filter_out_of_scope_keys function copy itself. Re-examine the resource.get("source") line and the reporting logic for the source column within the test script's function definition.
-
-This targeted test should quickly isolate whether the filtering logic for the "source" attribute is behaving as expected.
+print("\n--- Tier 1 Code Execution Finished ---")
