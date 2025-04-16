@@ -1,67 +1,35 @@
 import requests
 import json
-from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, DateType, Row
+import os
 import datetime
+import csv # Import the csv module
+from dotenv import load_dotenv
 
-# --- Configuration ---
+# --- Configuration & Setup ---
+load_dotenv() # Load variables from .env file
 
-# IMPORTANT: Use Databricks Secrets to store the API token
-# Example: token = dbutils.secrets.get(scope="your-scope", key="cloudradar-api-token")
-# Replace placeholder below with your secret retrieval method
-# DO NOT HARDCODE THE TOKEN
-try:
-    # Replace "your-scope" and "cloudradar-api-token" with your actual secret scope and key
-    API_TOKEN = dbutils.secrets.get(scope="your-scope", key="cloudradar-api-token")
-    print("Successfully retrieved API Token from Databricks Secrets.")
-except Exception as e:
-    print("ERROR: Failed to retrieve API Token from Databricks Secrets.")
-    print("Please ensure the secret scope and key are configured correctly.")
-    # You might want to dbutils.notebook.exit("Failed to get API token") here
-    # For demonstration purposes, using a placeholder. THIS IS NOT SECURE FOR PRODUCTION.
-    API_TOKEN = "YOUR_BEARER_TOKEN_PLACEHOLDER" # <<<--- REPLACE THIS OR REMOVE IF USING SECRETS
-    if API_TOKEN == "YOUR_BEARER_TOKEN_PLACEHOLDER":
-       print("WARNING: Using a placeholder API token. Replace with secret retrieval for security.")
-       # Consider adding dbutils.notebook.exit("Placeholder token used. Exiting for security.")
-
-SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
-# Define your sfOptions dictionary with Snowflake connection details
-# Ensure user/password or other auth methods are secure (e.g., keypair, OAuth)
-sfOptions = {
-  "sfUrl": "YOUR_ACCOUNT.snowflakecomputing.com",
-  "sfUser": "YOUR_USER",
-  "sfPassword": "YOUR_PASSWORD", # Or use other auth like sfRole, sfWarehouse, sfDatabase, sfSchema
-  "sfDatabase": "CYBR_DB",
-  "sfSchema": "PHDP_CYBR", # Default schema for reads
-  "sfWarehouse": "YOUR_WAREHOUSE"
-}
-
-# CloudRadar API Details
+# CloudRadar API Details from Environment Variables
+API_TOKEN = os.getenv("CLOUDRADAR_API_TOKEN")
 API_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
 API_HEADERS = {
     'Accept': 'application/json;v=1.0',
     'Authorization': f'Bearer {API_TOKEN}',
     'Content-Type': 'application/json'
 }
-API_LIMIT = 10000 # Match the limit in your payload
+API_LIMIT = 10000
+DATASET_CSV_FILE = "dataset_arns.csv" # <--- Name of your CSV file
+CSV_ARN_COLUMN_NAME = "CERTIFICATE_ARN" # <--- Column header in your CSV
+OUTPUT_FILE = "tier1_test_results.txt" # Optional: File to write results
 
-# Define schema matching the target table's structure for the final output
-# (DATE, CTRL_ID, MONITORING_METRIC_NUMBER, MONITORING_METRIC, COMPLIANCE_STATUS, NUMERATOR, DENOMINATOR)
-output_schema = StructType([
-    StructField("DATE", DateType(), True),
-    StructField("CTRL_ID", StringType(), True),
-    StructField("MONITORING_METRIC_NUMBER", StringType(), True),
-    StructField("MONITORING_METRIC", DoubleType(), True), # Using Double for percentage
-    StructField("COMPLIANCE_STATUS", StringType(), True),
-    StructField("NUMERATOR", DoubleType(), True),         # Using Double for counts
-    StructField("DENOMINATOR", DoubleType(), True)        # Using Double for counts
-])
+# Check if essential variables are loaded
+if not API_TOKEN:
+    print("ERROR: Missing CLOUDRADAR_API_TOKEN in .env file or environment variables.")
+    exit(1)
 
-# --- Helper Function to Fetch CloudRadar ARNs with Pagination ---
-
+# --- Helper Function to Fetch CloudRadar ARNs with Pagination (Same as before) ---
 def fetch_cloudradar_arns(url, headers, limit):
     """Fetches all AWS::ACM::Certificate ARNs issued by Amazon from CloudRadar, handling pagination."""
-    all_arns = set()
+    all_arns = set() # Using a set for automatic deduplication
     next_key = None
     page_count = 0
 
@@ -83,147 +51,203 @@ def fetch_cloudradar_arns(url, headers, limit):
             payload["nextRecordKey"] = next_key
 
         try:
-            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120) # Increased timeout
-            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=180)
+            response.raise_for_status()
             data = response.json()
 
             resources = data.get("resourceConfigurations", [])
-            if resources: # Check if the list exists and is not empty
-                 for config in resources:
-                    if "amazonResourceName" in config:
+            fetched_count = 0
+            if resources:
+                for config in resources:
+                    if config and "amazonResourceName" in config and config["amazonResourceName"]:
                         all_arns.add(config["amazonResourceName"])
+                        fetched_count += 1
 
-            fetched_count = len(resources)
             next_key = data.get("nextRecordKey")
-            print(f"Page {page_count} fetched. Found {fetched_count} items. Next key exists: {bool(next_key)}")
+            print(f"Page {page_count} fetched. Found {fetched_count} valid items. Next key exists: {bool(next_key)}")
 
             if not next_key:
-                break # Exit loop if no more pages
+                break
 
         except requests.exceptions.Timeout:
             print(f"ERROR: CloudRadar API request timed out on page {page_count}.")
             print("Returning ARNs fetched so far (might be incomplete).")
-            return list(all_arns), False # Indicate failure due to timeout
+            return all_arns, False # Indicate failure
 
         except requests.exceptions.RequestException as e:
             print(f"ERROR: CloudRadar API request failed: {e}")
-            # Log response text if available and helpful
             if hasattr(e, 'response') and e.response is not None:
                 print(f"Response Status Code: {e.response.status_code}")
-                print(f"Response Text: {e.response.text[:500]}...") # Log part of the response
+                print(f"Response Text: {e.response.text[:500]}...")
             print("Returning ARNs fetched so far (might be incomplete).")
-            return list(all_arns), False # Indicate failure
+            return all_arns, False # Indicate failure
 
         except json.JSONDecodeError as e:
             print(f"ERROR: Failed to decode JSON response from CloudRadar API: {e}")
-            print(f"Response Text: {response.text[:500]}...") # Log part of the response
-            return list(all_arns), False # Indicate failure
+            if 'response' in locals():
+                 print(f"Response Text: {response.text[:500]}...")
+            return all_arns, False # Indicate failure
 
     print(f"Finished fetching from CloudRadar. Total distinct ARNs found: {len(all_arns)}")
-    return list(all_arns), True # Return True to indicate success
+    return all_arns, True # Return True for success
 
-# --- Tier 1 Calculation Steps ---
+# --- Helper Function to Load Dataset ARNs from CSV ---
+def load_dataset_arns_from_csv(filepath, arn_column_name):
+    """Loads ARNs from a CSV file, expecting a specific column header."""
+    dataset_arns = set()
+    print(f"\nLoading dataset ARNs from CSV file: {filepath}")
+    try:
+        if not os.path.exists(filepath):
+            print(f"ERROR: Dataset CSV file not found at '{filepath}'")
+            return dataset_arns, False
 
-# 1. Fetch Authoritative List from CloudRadar
-print("--- Starting Tier 1 Calculation ---")
-cloudradar_arns_list, fetch_success = fetch_cloudradar_arns(API_URL, API_HEADERS, API_LIMIT)
+        with open(filepath, mode='r', newline='', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile)
+            try:
+                header = next(reader) # Read the header row
+            except StopIteration:
+                print(f"ERROR: CSV file '{filepath}' appears to be empty.")
+                return dataset_arns, False # Empty file
 
-if not fetch_success:
-     print("ERROR: Failed to fetch complete data from CloudRadar API. Aborting Tier 1 calculation.")
-     dbutils.notebook.exit("CloudRadar API fetch failed.") # Exit notebook execution
+            # Find the index of the ARN column
+            try:
+                arn_column_index = header.index(arn_column_name)
+                print(f"Found ARN column '{arn_column_name}' at index {arn_column_index}.")
+            except ValueError:
+                print(f"ERROR: Column '{arn_column_name}' not found in CSV header: {header}")
+                print(f"Please ensure the CSV file '{filepath}' has the correct header.")
+                return dataset_arns, False
 
-# 2. Create CloudRadar ARN DataFrame
-cloudradar_schema = StructType([StructField("cloudradar_arn", StringType(), True)]) # Renamed column for clarity
-if cloudradar_arns_list:
-    # Filter out any potential None values just in case
-    valid_arns = [arn for arn in cloudradar_arns_list if arn is not None]
-    cloudradar_df = spark.createDataFrame([(arn,) for arn in valid_arns], schema=cloudradar_schema).distinct()
-else:
-    # Create an empty DataFrame with the correct schema if the list is empty
-    cloudradar_df = spark.createDataFrame([], schema=cloudradar_schema)
+            # Read the rest of the rows
+            row_count = 0
+            valid_arn_count = 0
+            for row in reader:
+                row_count += 1
+                if len(row) > arn_column_index:
+                    arn = row[arn_column_index].strip()
+                    if arn and arn.startswith("arn:aws:acm"): # Basic validation
+                        dataset_arns.add(arn)
+                        valid_arn_count += 1
+                # else: # Optional: warn about short rows
+                #     print(f"Warning: Row {row_count + 1} has fewer columns than expected: {row}")
 
-cloudradar_df.cache() # Cache as it might be used for supporting evidence later
-cloudradar_count = cloudradar_df.count()
-print(f"Total distinct ARNs from CloudRadar (Denominator): {cloudradar_count}")
 
-# 3. Get Dataset ARNs from Snowflake
-print("Fetching distinct ACM ARNs from Certificate Catalog table (Snowflake)...")
-dataset_arns_query = """
-SELECT DISTINCT CERTIFICATE_ARN
-FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
-WHERE CERTIFICATE_ARN LIKE 'arn:aws:acm:%' -- More specific than just %arn:aws:acm%
-  AND CERTIFICATE_ARN IS NOT NULL
-"""
+        print(f"Processed {row_count} data rows from CSV.")
+        print(f"Loaded {len(dataset_arns)} distinct and valid ACM ARNs from CSV file.")
+        return dataset_arns, True
+    except Exception as e:
+        print(f"ERROR reading dataset CSV file '{filepath}': {e}")
+        return dataset_arns, False
 
-try:
-    dataset_arns_df = spark.read.format(SNOWFLAKE_SOURCE_NAME) \
-        .options(**sfOptions) \
-        .option("query", dataset_arns_query) \
-        .load()
-    dataset_arns_df = dataset_arns_df.withColumnRenamed("CERTIFICATE_ARN", "dataset_arn") # Rename for join clarity
-    dataset_arns_df.cache() # Cache for the join and potentially supporting evidence
-    dataset_count = dataset_arns_df.count()
-    print(f"Distinct ACM ARNs found in dataset: {dataset_count}")
-except Exception as e:
-    print(f"ERROR: Failed to fetch ARNs from Snowflake table: {e}")
-    cloudradar_df.unpersist() # Clean up cache
-    dbutils.notebook.exit("Failed to query dataset ARNs.")
+# --- Main Execution ---
 
-# 4. Calculate Tier 1 Metric Values
-print("Calculating Tier 1 metric values...")
+# 1. Fetch from CloudRadar
+print("--- Step 1: Fetching Data from CloudRadar ---")
+cloudradar_arns_set, radar_success = fetch_cloudradar_arns(API_URL, API_HEADERS, API_LIMIT)
+if not radar_success:
+    print("\nAborting due to failure fetching CloudRadar data.")
+    exit(1)
+cloudradar_count = len(cloudradar_arns_set)
+print(f"CloudRadar distinct ARN count (Denominator): {cloudradar_count}")
 
+# 2. Load Dataset ARNs from CSV
+print("\n--- Step 2: Loading Dataset Data from CSV ---")
+dataset_arns_set, load_success = load_dataset_arns_from_csv(DATASET_CSV_FILE, CSV_ARN_COLUMN_NAME)
+if not load_success:
+    print("\nAborting due to failure loading dataset CSV data.")
+    exit(1)
+dataset_count = len(dataset_arns_set)
+# Note: dataset_count here is just the count loaded from the file, not directly used in T1 metric calculation
+
+# 3. Calculate Tier 1 Metric
+print("\n--- Step 3: Calculating Tier 1 Metric ---")
 if cloudradar_count > 0:
-    # Find ARNs from CloudRadar that ARE present in the dataset (inner join)
-    matched_arns_df = cloudradar_df.join(
-        dataset_arns_df,
-        cloudradar_df["cloudradar_arn"] == dataset_arns_df["dataset_arn"],
-        "inner"
-    )
-    numerator_t1 = matched_arns_df.count()
-    denominator_t1 = float(cloudradar_count) # Ensure float for division
+    # Find intersection (ARNs present in both CloudRadar and the dataset CSV)
+    matched_arns_set = cloudradar_arns_set.intersection(dataset_arns_set)
+    numerator_t1 = len(matched_arns_set)
+    denominator_t1 = float(cloudradar_count)
 
     # Handle potential division by zero, although checked cloudradar_count > 0
     metric_t1 = round((numerator_t1 * 100.0 / denominator_t1), 2) if denominator_t1 > 0 else 0.0
     # Status check: strict equality needed for 100%
     status_t1 = "GREEN" if numerator_t1 == int(denominator_t1) else "RED"
-
 else:
-    # Handle case where CloudRadar returned no ARNs
     print("CloudRadar reported 0 in-scope certificates. Setting Tier 1 to 100% GREEN.")
     numerator_t1 = 0
     denominator_t1 = 0.0
-    metric_t1 = 100.0 # Defined as 100% if population is zero
+    metric_t1 = 100.0
     status_t1 = "GREEN"
 
-# 5. Create Tier 1 Result DataFrame
-print("Creating Tier 1 output DataFrame...")
-current_date = datetime.date.today()
+# Format Tier 1 Output
+current_date_str = datetime.date.today().isoformat()
+tier1_result = {
+    "DATE": current_date_str,
+    "CTRL_ID": "CTRL-1077188",
+    "MONITORING_METRIC_NUMBER": "MNTR-1077188-T1",
+    "MONITORING_METRIC": float(metric_t1),
+    "COMPLIANCE_STATUS": status_t1,
+    "NUMERATOR": float(numerator_t1),
+    "DENOMINATOR": float(denominator_t1)
+}
 
-tier1_data = [(
-    current_date,
-    'CTRL-1077188',
-    'MNTR-1077188-T1',
-    float(metric_t1),
-    status_t1,
-    float(numerator_t1),
-    float(denominator_t1)
-)]
+# --- Output Results to Terminal ---
+print("\n--- Tier 1 Metric Result (Compared to Dataset CSV) ---")
+terminal_output = []
+terminal_output.append("--- Tier 1 Metric Result ---")
+for key, value in tier1_result.items():
+    line = f"  {key}: {value}"
+    print(line)
+    terminal_output.append(line)
 
-# Create the DataFrame using the predefined schema
-df_tier1 = spark.createDataFrame(tier1_data, schema=output_schema)
+terminal_output.append("\nCalculation Summary:")
+summary_lines = [
+    f"  CloudRadar ARNs (Denominator): {int(denominator_t1)}",
+    f"  Matched ARNs in Dataset CSV (Numerator): {int(numerator_t1)}",
+    f"  Metric Value: {metric_t1}%",
+    f"  Compliance Status: {status_t1}"
+]
+for line in summary_lines:
+    print(line)
+    terminal_output.append(line)
 
-# --- Display Tier 1 Result ---
-print("\n--- Tier 1 Metric Result ---")
-df_tier1.show(truncate=False)
+# 4. Generate Supporting Evidence (Missing ARNs)
+print("\n--- Step 4: Generating Supporting Evidence (ARNs Missing from Dataset CSV) ---")
+terminal_output.append("\n--- Supporting Evidence (Missing ARNs) ---")
 
-print(f"\nCalculation Summary:")
-print(f"  CloudRadar ARNs (Denominator): {int(denominator_t1)}")
-print(f"  Matched ARNs in Dataset (Numerator): {int(numerator_t1)}")
-print(f"  Metric Value: {metric_t1}%")
-print(f"  Compliance Status: {status_t1}")
+# Find difference (ARNs in CloudRadar but NOT in Dataset CSV)
+missing_arns_set = cloudradar_arns_set.difference(dataset_arns_set)
+missing_count = len(missing_arns_set)
 
-# Keep cached dataframes if needed for Part 2, otherwise unpersist here
-# dataset_arns_df.unpersist()
-# cloudradar_df.unpersist()
+if missing_count > 0:
+    missing_header = f"\nFound {missing_count} ARN(s) in CloudRadar that are MISSING from the dataset CSV ('{DATASET_CSV_FILE}'):"
+    print(missing_header)
+    terminal_output.append(missing_header)
+    count = 0
+    for arn in sorted(list(missing_arns_set)): # Sort for consistent output
+        line = f"  - {arn}"
+        print(line)
+        terminal_output.append(line)
+        count += 1
+        if count >= 200: # Limit printed output if there are too many
+            limit_msg = f"  ... (showing first 200 of {missing_count})"
+            print(limit_msg)
+            terminal_output.append(limit_msg)
+            break
+else:
+    no_missing_msg = f"\nNo missing ARNs found. All CloudRadar ARNs are present in the dataset CSV ('{DATASET_CSV_FILE}')."
+    print(no_missing_msg)
+    terminal_output.append(no_missing_msg)
 
-print("\n--- Tier 1 Code Execution Finished ---")
+# --- Optionally Write to Output File ---
+try:
+    with open(OUTPUT_FILE, 'w') as f:
+        f.write(f"Report generated on: {datetime.datetime.now().isoformat()}\n")
+        f.write(f"Dataset CSV file used: {DATASET_CSV_FILE}\n")
+        f.write("="*40 + "\n")
+        f.write("\n".join(terminal_output))
+        f.write("\n" + "="*40 + "\n")
+    print(f"\nResults also written to file: {OUTPUT_FILE}")
+except Exception as e:
+    print(f"\nWarning: Could not write results to file '{OUTPUT_FILE}': {e}")
+
+print("\n--- Script Execution Finished ---")
