@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "etip_controls_monitoring_metrics",
+  "namespace": "com.capitalone.BAENTERPRISETECHINSIGHTS",
+  "doc": "This dataset is used for analytics and reporting for the Tech Controls Health Monitoring process.", 
+  "fields": [
+    {"name": "DATE", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "UTC timestamp (milliseconds since epoch) when the metric was calculated"},
+    {"name": "CTRL_ID", "type": "string", "doc": "Control Identifier (e.g., CTRL-1077231)"},
+    {"name": "MONITORING_METRIC_NUMBER", "type": "string", "doc": "Specific monitoring metric identifier (e.g., MNTR-1077231-T1)"},
+    {"name": "MONITORING_METRIC", "type": "double", "doc": "Calculated metric value as a percentage (0-100)"},
+    {"name": "COMPLIANCE_STATUS", "type": "string", "doc": "Compliance status based on thresholds (Green, Yellow, Red)"},
+    {"name": "NUMERATOR", "type": "long", "doc": "Numerator value used in the metric calculation"},
+    {"name": "DENOMINATOR", "type": "long", "doc": "Denominator value used in the metric calculation"},
+    {"name": "NON_COMPLIANT_RESOURCES", "type": ["null", {"type": "array", "items": "string"}], "default": null, "doc": "Optional array of JSON strings detailing non-compliant resources, if status is not Green."}
+  ]
+} 
