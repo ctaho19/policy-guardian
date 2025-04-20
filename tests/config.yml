@@ -1,206 +1,45 @@
-pipeline_name: pl_automated_monitoring_CTRL_1077231
+pipeline:
+  name: pl_automated_monitoring_CTRL_1077231
+  use_test_data_on_nonprod: false
+  dq_strict_mode: false
 
-# Global parameters
-global_params:
-  env: ${env} # Assuming framework injects env
-  # Define Snowflake connection details pulled from env
-  # These names must match what Env object provides
-  snowflake_account: ${env.snowflake.account}
-  snowflake_user: ${env.snowflake.user} # Use service account user
-  snowflake_role: ${env.snowflake.role}
-  snowflake_warehouse: ${env.snowflake.warehouse}
-  snowflake_database: ${env.snowflake.database}
-  snowflake_schema: ${env.snowflake.schema}
-  snowflake_password: ${env.snowflake.password} # Use service account password
-
-# --- Configuration for pipeline stages ---
 stages:
   extract:
-    - name: load_monitoring_thresholds
+    thresholds_raw:
       connector: snowflake
       options:
-        # Connection details pulled from global_params
-        sfAccount: ${global_params.snowflake_account}
-        sfUser: ${global_params.snowflake_user}
-        sfPassword: ${global_params.snowflake_password}
-        sfRole: ${global_params.snowflake_role}
-        sfWarehouse: ${global_params.snowflake_warehouse}
-        sfDatabase: ${global_params.snowflake_database}
-        sfSchema: ${global_params.snowflake_schema}
-        # Use the correct, existing SQL file name
-        sql_file: sql/monitoring_thresholds.sql
-        # Parameters for the SQL query (if any, using Jinja style)
-        # sql_params:
-        #   metric_id_pattern: 'MNTR-1077231-%' # Example parameterization
-      outputs:
-        - thresholds_raw # DataFrame name for transform stage
+        sql: "@text:sql/monitoring_thresholds.sql"
 
   transform:
-    - name: calculate_metrics
-      # Use the function registered in transform.py
-      function: calculate_ctrl1077231_metrics # Ensure this matches function name
-      inputs:
-        - thresholds_raw # Input from extract stage
+    monitoring_metrics:
+      function: custom/calculate_ctrl1077231_metrics
       options:
-        # Parameters passed to the transform function
+        thresholds_raw: $thresholds_raw
         resource_type: AWS::EC2::Instance
         config_key: metadataOptions.httpTokens
         config_value: required
         ctrl_id: CTRL-1077231
-        tier1_metric_id: MNTR-1077231-T1
-        tier2_metric_id: MNTR-1077231-T2
-        # Add other context/config if needed by transform
-        # api_timeout: 60
-        # api_max_retries: 3
-      outputs:
-        - monitoring_metrics # Output DataFrame name for load stage
+        tier1_metric_id: 1
+        tier2_metric_id: 2
 
   load:
-    - name: save_metrics_to_snowflake
-      connector: snowflake
-      inputs:
-        - monitoring_metrics # Input from transform stage
+    monitoring_metrics:
+      connector: onestream
       options:
-        # Connection details pulled from global_params
-        sfAccount: ${global_params.snowflake_account}
-        sfUser: ${global_params.snowflake_user}
-        sfPassword: ${global_params.snowflake_password}
-        sfRole: ${global_params.snowflake_role}
-        sfWarehouse: ${global_params.snowflake_warehouse}
-        sfDatabase: ${global_params.snowflake_database}
-        sfSchema: ${global_params.snowflake_schema}
-        # Standard destination table as per docs.txt
-        dest_table: Etip_controls_monitoring_metrics
-        # Load behavior
-        write_mode: append # Or overwrite, based on requirements
-        pre_actions: [] # e.g., truncate table if using overwrite
-        post_actions: []
+        table_name: etip_controls_monitoring_metrics
+        file_type: AVRO
+        avro_schema: "@json:avro_schema.json"
+        business_application: BAENTERPRISETECHINSIGHTS
 
-# Add other top-level pipeline settings from reference if applicable
-# use_test_data_on_nonprod: false 
-# dq_strict_mode: false 
 tags:
   - automated_monitoring
   - controls
   - ctrl_1077231
   - cloud
 
-# Define Ingress Validation (Optional but recommended)
-# Add checks similar to the reference if needed for threshold_df
 ingress_validation:
-  threshold_df:
+  thresholds_raw:
     - type: count_check
       fatal: true
       options:
-        threshold: 1 # Ensure at least one threshold row is loaded
-# Add schema check if dataset_id for thresholds is known
-# - type: schema_check
-#   fatal: true
-#   options:
-#     dataset_id: 'YOUR_THRESHOLD_DATASET_ID' # Replace with actual ID
-
-# Define Test Data Preparation/Export (Optional)
-# prepare_test_data:
-#   threshold_df:
-#     - function: head
-#       options:
-#         n: 10
-# export_test_data:
-#   threshold_df:
-
-connections:
-  # Define the Snowflake connection used for thresholds and potentially the final load
-  # Ensure this alias matches the connection details provided by the ETIP environment
-  snowflake_connection:
-    type: snowflake
-    # Connection details (account, user, password/auth, role, warehouse, database, schema)
-    # should be sourced securely from the ETIP environment/secrets, not hardcoded.
-    # Example placeholders:
-    account: "prod.us-east-1.capitalone.snowflakecomputing.com"
-    user: "${secrets.etip_service_user}" # Example using secret management
-    authenticator: "${secrets.etip_service_auth_type}"
-    role: "ETIP_CONTROLS_MONITORING_ROLE"
-    warehouse: "ETIP_CONTROLS_MONITORING_WH"
-    database: "CYBR_DB_COLLAB" # Database for thresholds
-    schema: "LAB_ESRA_TCRD" # Schema for thresholds
-
-  # Define connection/authentication details for the Cloud Tooling API if needed separately
-  # Often, secrets like API keys are accessed directly within transform functions
-
-extracts:
-  - name: extract_thresholds
-    type: sql
-    connection: snowflake_connection # Use the defined Snowflake connection
-    # Fetch thresholds using the dedicated SQL file
-    file_path: ./sql/monitoring_thresholds.sql
-    # The result of this extract will be available as a DataFrame/object named 'extract_thresholds'
-
-transforms:
-  # Step 1: Fetch all relevant resources from the Cloud Tooling API
-  - name: fetch_ec2_resources
-    type: python
-    # Call the function defined in transform.py
-    function: transform.fetch_all_resources
-    # Define the payload required by the API function
-    kwargs:
-      payload:
-        searchParameters:
-          - resourceType: AWS::EC2::Instance
-      # Optionally pass timeout/retries if they need to differ from defaults in transform.py
-      # timeout: 60
-      # max_retries: 3
-    # The result (List[Dict], int) will be available as 'fetch_ec2_resources'
-
-  # Step 2: Filter resources, calculate metrics, and determine compliance
-  - name: calculate_metrics
-    type: python
-    # Call the main processing function in transform.py
-    function: transform.filter_resources_and_calculate_metrics
-    # Pass the results from the previous steps as arguments
-    kwargs:
-      # The fetch_all_resources function returns a tuple (resources_list, count)
-      # We need the list, which is the first element (index 0)
-      resources:
-        expr: "fetch_ec2_resources[0]" # Access the list of resources
-      # Pass the DataFrame loaded from the thresholds extract step
-      thresholds_df:
-        expr: "extract_thresholds"
-    # The result (monitoring_df, t1_non_compliant_df, t2_non_compliant_df)
-    # will be available as 'calculate_metrics'
-
-loads:
-  - name: load_monitoring_metrics
-    type: snowflake # Specify Snowflake loader type
-    connection: snowflake_connection # Use the defined Snowflake connection
-    input_name:
-      expr: "calculate_metrics[0]" # Access the first element (monitoring_df) from calculate_metrics
-    target_database: CYBR_DB_COLLAB # Database for the target monitoring table
-    target_schema: LAB_ESRA_TCRD # Schema for the target monitoring table
-    target_table: CYBER_CONTROLS_MONITORING
-    target_write_mode: append # Append new metrics to the table
-    avro_schema_path: ./avro_schema.json # Specify the schema file
-    options:
-      # Add any specific Snowflake write options if needed
-      # e.g., privileges: "USAGE on schema LAB_ESRA_TCRD, INSERT on table CYBER_CONTROLS_MONITORING"
-      # Ensure the service account has the necessary permissions
-
-  # Optional: Load non-compliant resource details to a separate table/location if required
-  # - name: load_tier1_non_compliant
-  #   type: snowflake # or other type like s3_csv
-  #   connection: snowflake_connection
-  #   input_name:
-  #     expr: "calculate_metrics[1]" # Access the t1_non_compliant_df
-  #   target_database: ...
-  #   target_schema: ...
-  #   target_table: NON_COMPLIANT_CTRL_1077231_T1
-  #   target_write_mode: overwrite # Or append
-
-  # - name: load_tier2_non_compliant
-  #   type: snowflake
-  #   connection: snowflake_connection
-  #   input_name:
-  #     expr: "calculate_metrics[2]" # Access the t2_non_compliant_df
-  #   target_database: ...
-  #   target_schema: ...
-  #   target_table: NON_COMPLIANT_CTRL_1077231_T2
-  #   target_write_mode: overwrite # Or append 
+        threshold: 1
