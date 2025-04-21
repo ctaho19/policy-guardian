@@ -418,7 +418,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
             pipeline.PLAutomatedMonitoringCtrl1077231(mock_env_bad)
 
     def test_get_api_token_success(self, mocker):
-        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.refresh_oauth_token")
+        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
         mock_refresh.return_value = "mock_token_value"
 
         mock_env = MockEnv()
@@ -432,7 +432,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         )
 
     def test_get_api_token_failure(self, mocker):
-        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.refresh_oauth_token")
+        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
         mock_refresh.side_effect = Exception("Token refresh failed")
 
         mock_env = MockEnv()
@@ -441,7 +441,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
             pipe._get_api_token()
 
     def test_make_api_request_success_no_pagination(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform.requests.post")
+        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
         mock_response = generate_mock_api_response(API_RESPONSE_MIXED)
         mock_post.return_value = mock_response
 
@@ -458,7 +458,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(json.loads(response.content), API_RESPONSE_MIXED)
 
     def test_make_api_request_success_with_pagination(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform.requests.post")
+        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
         mock_post.side_effect = [
             generate_mock_api_response(API_RESPONSE_PAGE_1),
             generate_mock_api_response(API_RESPONSE_PAGE_2)
@@ -478,7 +478,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(json.loads(response.content), API_RESPONSE_PAGE_2)
 
     def test_make_api_request_http_error(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform.requests.post")
+        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
         mock_response = generate_mock_api_response(status_code=500)
         mock_post.return_value = mock_response
 
@@ -493,8 +493,8 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
             )
 
     def test_make_api_request_rate_limit_retry(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform.requests.post")
-        mock_sleep = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform.time.sleep")
+        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
+        mock_sleep = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.time.sleep")
 
         mock_post.side_effect = [
             generate_mock_api_response(status_code=429),
@@ -510,8 +510,8 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         mock_sleep.assert_called_once()
 
     def test_make_api_request_error_retry_fail(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform.requests.post")
-        mock_sleep = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform.time.sleep")
+        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
+        mock_sleep = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.time.sleep")
         max_retries = 2
 
         mock_post.return_value = generate_mock_api_response(status_code=503)
@@ -525,7 +525,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(mock_sleep.call_count, max_retries)
 
     def test_transform_logic_mixed_compliance(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
+        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
         mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
 
         thresholds_df = _mock_threshold_df_spark(spark_session)
@@ -551,7 +551,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(result_list, expected_list)
 
     def test_transform_logic_empty_api_response(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
+        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
         mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_EMPTY)
 
         thresholds_df = _mock_threshold_df_spark(spark_session)
@@ -575,7 +575,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(result_df.collect(), expected_df.collect())
 
     def test_transform_logic_yellow_status(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
+        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
         mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_YELLOW)
         thresholds_df = _mock_threshold_df_spark(spark_session)
         context = {
@@ -602,7 +602,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(result_list[1]["compliance_status"], "Yellow")
 
     def test_transform_logic_api_fetch_fails(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
+        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
         mock_make_api_request.side_effect = RequestException("Simulated API failure")
 
         thresholds_df = _mock_threshold_df_spark(spark_session)
@@ -626,17 +626,17 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
             )
 
     def test_full_run_mixed_compliance(self, mocker, spark_session):
-        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.refresh_oauth_token")
-        mock_read = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.ConfigPipeline.read")
-        mock_write = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.ConfigPipeline.write")
-        mock_make_api_req = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
+        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
+        mock_read = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.ConfigPipeline.read")
+        mock_write = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.ConfigPipeline.write")
+        mock_make_api_req = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
 
         mock_read.return_value = _mock_threshold_df_spark(spark_session)
         mock_make_api_req.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
 
         mock_env = MockEnv()
         pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
-        pipe.configure_from_filename("pl_automated_monitoring_CTRL_1077231/config.yml")
+        pipe.configure_from_filename("pl_automated_monitoring_ctrl_1077231/config.yml")
         pipe.run()
 
         mock_write.assert_called_once()
@@ -647,7 +647,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(written_list, expected_list)
 
     def test_run_entrypoint_defaults(self, mocker, spark_session):
-        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
+        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
         mock_pipeline_instance = mock_pipeline_class.return_value
         mock_pipeline_instance.run.return_value = None
 
@@ -656,7 +656,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         mock_pipeline_instance.run.assert_called_once()
 
     def test_run_entrypoint_no_load_no_dq(self, mocker, spark_session):
-        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
+        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
         mock_pipeline_instance = mock_pipeline_class.return_value
         mock_pipeline_instance.run.return_value = None
 
@@ -665,7 +665,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         mock_pipeline_instance.run.assert_called_once_with(load=False, dq=False)
 
     def test_run_entrypoint_export_test_data(self, mocker, spark_session):
-        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
+        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
         mock_pipeline_instance = mock_pipeline_class.return_value
         mock_pipeline_instance.run.return_value = None
 
@@ -674,7 +674,7 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         mock_pipeline_instance.run.assert_called_once_with(export_test_data=True)
 
     def test_transform_logic_invalid_thresholds(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
+        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
         mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
 
         thresholds_df = _mock_invalid_threshold_df_spark(spark_session)
