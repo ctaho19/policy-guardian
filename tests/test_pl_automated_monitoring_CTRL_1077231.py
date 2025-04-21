@@ -661,3 +661,9 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(result_list[1]["monitoring_metric_id"], 2)
         self.assertEqual(result_list[1]["monitoring_metric_value"], 75.0)
         self.assertEqual(result_list[1]["compliance_status"], "Red")
+
+
+
+   echo 'export JAVA_HOME=$(/usr/libexec/java_home -v 11)' >> ~/.zshrc
+   echo 'export PATH="$JAVA_HOME/bin:$PATH"' >> ~/.zshrc
+   source ~/.zshrc
