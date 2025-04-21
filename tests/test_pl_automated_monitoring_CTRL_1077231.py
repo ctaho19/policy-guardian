@@ -12,8 +12,8 @@ from pyspark.sql.types import (StructType, StructField, StringType, DoubleType,
                              LongType, TimestampType, ArrayType, IntegerType)
 from requests import Response, RequestException
 
-import pipelines.pl_automated_monitoring_CTRL_1077231.pipeline as pipeline
-import pipelines.pl_automated_monitoring_CTRL_1077231.transform as transform
+import pipelines.pl_automated_monitoring_ctrl_1077231.pipeline as pipeline
+import pipelines.pl_automated_monitoring_ctrl_1077231.transform as transform
 
 from etip_env import set_env_vars, EnvType
 from tests.config_pipeline.helpers import ConfigPipelineTestCase
@@ -339,11 +339,66 @@ class MockEnv:
         self.snowflake = snowflake_config if snowflake_config else MockSnowflakeConfig()
         self.env = EnvType.DEV
 
+    def __getattr__(self, name):
+        if name == 'env':
+            return EnvType.DEV
+        raise AttributeError(f"'MockEnv' object has no attribute '{name}'")
+
 @pytest.fixture(scope="session")
 def spark_session():
-    spark = SparkSession.builder.appName("CTRL-1077231-Tests").master("local[*]").getOrCreate()
-    yield spark
-    spark.stop()
+    import os
+    import sys
+    import tempfile
+    import subprocess
+    import re
+    
+    # Check Java installation and version
+    try:
+        java_path = subprocess.check_output(['which', 'java']).decode().strip()
+        java_home = os.path.dirname(os.path.dirname(java_path))
+        os.environ['JAVA_HOME'] = java_home
+        
+        # Get Java version
+        java_version = subprocess.check_output(['java', '-version'], stderr=subprocess.STDOUT).decode()
+        version_match = re.search(r'version "(\d+)', java_version)
+        if version_match:
+            version = int(version_match.group(1))
+            if version not in [8, 11]:
+                raise RuntimeError(f"Java version {version} is not supported. Please use Java 8 or 11.")
+    except subprocess.CalledProcessError:
+        raise RuntimeError("Java is not installed or not in PATH. Please install Java and ensure it's in your PATH.")
+    
+    # Set up Spark environment variables
+    os.environ['PYSPARK_PYTHON'] = sys.executable
+    os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+    
+    # Create a temporary directory for Spark
+    temp_dir = tempfile.mkdtemp()
+    os.environ['SPARK_LOCAL_DIRS'] = temp_dir
+    
+    try:
+        # Configure Spark session
+        spark = SparkSession.builder \
+            .appName("CTRL-1077231-Tests") \
+            .master("local[*]") \
+            .config("spark.driver.memory", "1g") \
+            .config("spark.executor.memory", "1g") \
+            .config("spark.sql.shuffle.partitions", "1") \
+            .config("spark.default.parallelism", "1") \
+            .config("spark.sql.warehouse.dir", temp_dir) \
+            .config("spark.local.dir", temp_dir) \
+            .getOrCreate()
+        
+        yield spark
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to create Spark session: {str(e)}")
+    finally:
+        # Cleanup
+        if 'spark' in locals():
+            spark.stop()
+        import shutil
+        shutil.rmtree(temp_dir)
 
 class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
     def test_pipeline_init_success(self):
@@ -469,7 +524,6 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(mock_post.call_count, max_retries + 1)
         self.assertEqual(mock_sleep.call_count, max_retries)
 
-    @freeze_time("2024-11-05 12:09:00.123456")
     def test_transform_logic_mixed_compliance(self, mocker, spark_session):
         mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
         mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
@@ -496,7 +550,6 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         expected_list = sorted(expected_df.collect(), key=lambda r: r['monitoring_metric_id'])
         self.assertEqual(result_list, expected_list)
 
-    @freeze_time("2024-11-05 12:09:00.123456")
     def test_transform_logic_empty_api_response(self, mocker, spark_session):
         mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
         mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_EMPTY)
@@ -521,7 +574,6 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         expected_df = _expected_output_empty_df(spark_session)
         self.assertEqual(result_df.collect(), expected_df.collect())
 
-    @freeze_time("2024-11-05 12:09:00.123456")
     def test_transform_logic_yellow_status(self, mocker, spark_session):
         mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
         mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_YELLOW)
@@ -549,7 +601,6 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(result_list[0]["compliance_status"], "Green")
         self.assertEqual(result_list[1]["compliance_status"], "Yellow")
 
-    @freeze_time("2024-11-05 12:09:00.123456")
     def test_transform_logic_api_fetch_fails(self, mocker, spark_session):
         mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
         mock_make_api_request.side_effect = RequestException("Simulated API failure")
@@ -574,9 +625,8 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
                 tier2_metric_id="MNTR-1077231-T2"
             )
 
-    @freeze_time("2024-11-05 12:09:00.123456")
     def test_full_run_mixed_compliance(self, mocker, spark_session):
-        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.refresh_oauth_token", return_value="mock_token_value")
+        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.refresh_oauth_token")
         mock_read = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.ConfigPipeline.read")
         mock_write = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.pipeline.ConfigPipeline.write")
         mock_make_api_req = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
@@ -623,7 +673,6 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         mock_pipeline_class.assert_called_once()
         mock_pipeline_instance.run.assert_called_once_with(export_test_data=True)
 
-    @freeze_time("2024-11-05 12:09:00.123456")
     def test_transform_logic_invalid_thresholds(self, mocker, spark_session):
         mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_CTRL_1077231.transform._make_api_request")
         mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
@@ -661,9 +710,3 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
         self.assertEqual(result_list[1]["monitoring_metric_id"], 2)
         self.assertEqual(result_list[1]["monitoring_metric_value"], 75.0)
         self.assertEqual(result_list[1]["compliance_status"], "Red")
-
-
-
-   echo 'export JAVA_HOME=$(/usr/libexec/java_home -v 11)' >> ~/.zshrc
-   echo 'export PATH="$JAVA_HOME/bin:$PATH"' >> ~/.zshrc
-   source ~/.zshrc
