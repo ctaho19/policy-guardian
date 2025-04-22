@@ -8,8 +8,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import col, lit, when, regexp_replace
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, TimestampType, ArrayType
+from pyspark.sql.functions import col, lit, when, regexp_replace, split
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, TimestampType, ArrayType, IntegerType
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,14 @@ API_PARAMS = {
     'accountStatus': 'Active',
     'region': ['us-east-1', 'us-east-2', 'us-west-2', 'eu-west-1', 'eu-west-2', 'ca-central-1']
 }
+
+def extract_metric_number(metric_id: str) -> int:
+    """Extract numeric part from metric ID (e.g., 'MNTR-1074653-T1' -> 1)."""
+    try:
+        return int(metric_id.split('-')[-1][1:])
+    except (IndexError, ValueError):
+        logger.warning(f"Could not extract metric number from {metric_id}, using 0")
+        return 0
 
 def get_approved_accounts(spark: SparkSession) -> DataFrame:
     """Fetch approved AWS accounts from API and create DataFrame."""
@@ -182,7 +190,7 @@ def calculate_metrics(
     schema = StructType([
         StructField("date", TimestampType(), False),
         StructField("control_id", StringType(), False),
-        StructField("monitoring_metric_id", StringType(), False),
+        StructField("monitoring_metric_id", IntegerType(), False),
         StructField("monitoring_metric_value", DoubleType(), False),
         StructField("compliance_status", StringType(), False),
         StructField("numerator", LongType(), False),
@@ -283,11 +291,14 @@ def calculate_metrics(
                 float(threshold["alerting_threshold"])
             )
             
+            # Extract metric number for Avro schema compliance
+            metric_number = extract_metric_number(metric_id)
+            
             # Add result
             results.append({
                 "date": datetime.now(),
                 "control_id": control["ctrl_id"],
-                "monitoring_metric_id": metric_id,
+                "monitoring_metric_id": metric_number,
                 "monitoring_metric_value": metric_value,
                 "compliance_status": status,
                 "numerator": evaluated_count if tier == "tier1" else compliant_count if tier == "tier2" else within_sla_count,
