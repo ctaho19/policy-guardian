@@ -1,432 +1,98 @@
-import requests
-import json
-import os
-import datetime
-import csv
-import time # Import time for delays
-from dotenv import load_dotenv
-from urllib.parse import urlencode
+pipeline:
+  name: pl_automated_monitoring_machine_iam
+  use_test_data_on_nonprod: false
+  dq_strict_mode: false
 
-# --- Configuration & Setup ---
-load_dotenv()
+control_configs:
+  - cloud_control_id: "AC-3.AWS.39.v02"
+    ctrl_id: "CTRL-1074653"
+    metric_ids:
+      tier1: "MNTR-1074653-T1"
+      tier2: "MNTR-1074653-T2"
+      tier3: "MNTR-1074653-T3"
+    requires_tier3: true
+  - cloud_control_id: "AC-6.AWS.13.v01"
+    ctrl_id: "CTRL-1105806"
+    metric_ids:
+      tier1: "MNTR-1105806-T1"
+      tier2: "MNTR-1105806-T2"
+    requires_tier3: false
+  - cloud_control_id: "AC-6.AWS.35.v02"
+    ctrl_id: "CTRL-1077124"
+    metric_ids:
+      tier1: "MNTR-1077124-T1"
+      tier2: "MNTR-1077124-T2"
+    requires_tier3: false
 
-# CloudRadar API Details
-API_TOKEN = os.getenv("CLOUDRADAR_API_TOKEN")
-# Use the same endpoint for both list and detail searches
-API_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
-API_HEADERS = {
-    'Accept': 'application/json;v=1.0',
-    'Authorization': f'Bearer {API_TOKEN}',
-    'Content-Type': 'application/json'
-}
-API_LIST_LIMIT = 10000 # Limit for the initial fetch
-API_DETAIL_TIMEOUT = 60 # Timeout for individual metadata fetches
-API_CALL_DELAY = 0.15 # Seconds to wait between detail fetch calls (adjust if hitting rate limits)
+stages:
+  extract:
+    thresholds_raw:
+      connector: snowflake
+      options:
+        sql: "@text:sql/monitoring_thresholds.sql"
+    iam_roles:
+      connector: snowflake
+      options:
+        sql: "@text:sql/iam_roles.sql"
+    evaluated_roles:
+      connector: snowflake
+      options:
+        sql: "@text:sql/evaluated_roles.sql"
 
-# Input/Output Files
-DATASET_CSV_FILE = "dataset_arns.csv" # Your input CSV
-CSV_ARN_COLUMN_NAME = "CERTIFICATE_ARN"
-OUTPUT_METADATA_CSV = "missing_certs_metadata.csv" # Output for metadata
-OUTPUT_ERRORS_CSV = "missing_certs_errors.csv" # Output for ARNs that failed metadata fetch
+  transform:
+    monitoring_metrics:
+      function: custom/calculate_machine_iam_metrics
+      options:
+        thresholds_raw: $thresholds_raw
+        iam_roles: $iam_roles
+        evaluated_roles: $evaluated_roles
+        control_configs: $control_configs
 
-# Check API Token
-if not API_TOKEN:
-    print("ERROR: Missing CLOUDRADAR_API_TOKEN in .env file or environment variables.")
-    exit(1)
+  load:
+    monitoring_metrics:
+      connector: onestream
+      options:
+        table_name: etip_controls_monitoring_metrics
+        file_type: AVRO
+        avro_schema: "@json:avro_schema.json"
+        business_application: BAENTERPRISETECHINSIGHTS
 
-# --- Helper Function to Fetch CloudRadar ARNs List (Corrected Pagination) ---
-def fetch_cloudradar_arns_list(base_url, headers, limit):
-    print("--- Fetching Full ARN List from CloudRadar ---")
-    all_arns = set()
-    next_key = None
-    page_count = 0
-    current_url = base_url
+ingress_validation:
+  thresholds_raw:
+    - type: count_check
+      fatal: true
+      envs:
+        - qa
+        - prod
+      options:
+        data_location: Snowflake
+        threshold: 1
+        table_name: CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD
+  iam_roles:
+    - type: count_check
+      fatal: true
+      envs:
+        - qa
+        - prod
+      options:
+        data_location: Snowflake
+        threshold: 1
+        table_name: EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_IAM_RESOURCE_V3
+        date_filter: "DATE(SF_LOAD_TIMESTAMP) = CURRENT_DATE"
+  evaluated_roles:
+    - type: count_check
+      fatal: true
+      envs:
+        - qa
+        - prod
+      options:
+        data_location: Snowflake
+        threshold: 1
+        table_name: EIAM_DB.PHDP_CYBR_IAM.IDENTITY_REPORTS_CONTROLS_VIOLATIONS_STREAM_V2
+        date_filter: "DATE(CREATE_DATE) = CURRENT_DATE"
 
-    # Payload for fetching the list of ARNs
-    list_payload = {
-        "responseFields": ["amazonResourceName"], # Only need ARN for the list
-        "searchParameters": [{
-            "resourceType": "AWS::ACM::Certificate",
-            "configurationItems": [{
-                "configurationName": "issuer",
-                "configurationValue": "Amazon"
-            }]
-        }],
-        "limit": limit
-    }
-    list_payload_json = json.dumps(list_payload)
-
-    while True:
-        page_count += 1
-        print(f"Fetching ARN list page {page_count}...")
-        # print(f"URL: {current_url}") # Optional debug
-
-        try:
-            response = requests.post(current_url, headers=headers, data=list_payload_json, timeout=180)
-            response.raise_for_status()
-            data = response.json()
-
-            resources = data.get("resourceConfigurations", [])
-            fetched_count = 0
-            if resources:
-                for config in resources:
-                     if isinstance(config, dict) and "amazonResourceName" in config and config["amazonResourceName"]:
-                        all_arns.add(config["amazonResourceName"])
-                        fetched_count += 1
-
-            next_key = data.get("nextRecordKey")
-            print(f"Page {page_count}: Found {fetched_count} valid items. Next key exists: {bool(next_key)}")
-
-            if next_key:
-                query_params = urlencode({'nextRecordKey': next_key})
-                current_url = f"{base_url}?{query_params}"
-            else:
-                break # Exit loop
-
-        except Exception as e:
-            print(f"ERROR fetching CloudRadar ARN list on page {page_count}: {e}")
-            # Decide whether to continue with partial list or abort
-            print("Aborting due to error during initial ARN list fetch.")
-            return None, False # Indicate failure
-
-    print(f"Finished fetching ARN list. Total distinct ARNs: {len(all_arns)}")
-    return all_arns, True
-
-# --- Helper Function to Load Dataset ARNs from CSV (Same as before) ---
-def load_dataset_arns_from_csv(filepath, arn_column_name):
-    """Loads ARNs from a CSV file, expecting a specific column header."""
-    dataset_arns = set()
-    print(f"\n--- Loading dataset ARNs from CSV: {filepath} ---")
-    try:
-        # Use dynamic path relative to script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        full_filepath = os.path.join(script_dir, filepath)
-        print(f"Looking for CSV at: {full_filepath}")
-
-        if not os.path.exists(full_filepath):
-            print(f"ERROR: Dataset CSV file not found at '{full_filepath}'")
-            return dataset_arns, False
-
-        with open(full_filepath, mode='r', newline='', encoding='utf-8-sig') as csvfile:
-            reader = csv.reader(csvfile)
-            try:
-                header = next(reader)
-            except StopIteration:
-                print(f"ERROR: CSV file '{full_filepath}' is empty.")
-                return dataset_arns, False
-
-            header_processed = [h.strip() for h in header]
-            arn_column_name_stripped = arn_column_name.strip()
-            try:
-                arn_column_index = header_processed.index(arn_column_name_stripped)
-            except ValueError:
-                print(f"ERROR: Column '{arn_column_name_stripped}' not found in CSV header: {header_processed}")
-                return dataset_arns, False
-
-            row_count = 0
-            for row in reader:
-                row_count += 1
-                if len(row) > arn_column_index:
-                    arn = row[arn_column_index].strip()
-                    if arn and arn.startswith("arn:aws:acm"):
-                        dataset_arns.add(arn)
-
-        print(f"Loaded {len(dataset_arns)} distinct ACM ARNs from CSV.")
-        return dataset_arns, True
-    except Exception as e:
-        print(f"ERROR reading dataset CSV file '{full_filepath}': {e}")
-        return dataset_arns, False
-
-# --- Helper Function to Fetch Metadata for a Single ARN ---
-def fetch_metadata_for_arn(url, headers, arn, timeout):
-    """Fetches detailed metadata for a single certificate ARN."""
-    # Payload to fetch all details for a specific ARN
-    payload = {
-        "searchParameters": [{
-             "amazonResourceName": arn
-        }]
-    }
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        data = response.json()
-        # The response is likely a list containing one item for the specific ARN
-        if data and "resourceConfigurations" in data and len(data["resourceConfigurations"]) > 0:
-             # Return the first (and likely only) configuration object
-            return data["resourceConfigurations"][0], None # Data, Error
-        else:
-            # Log if the structure is unexpected or empty
-            print(f"Warning: Unexpected response structure or no data for ARN {arn}: {data}")
-            return None, "No data found in response"
-    except requests.exceptions.Timeout:
-        return None, "Request timed out"
-    except requests.exceptions.RequestException as e:
-        error_msg = f"Request failed: {e}"
-        if hasattr(e, 'response') and e.response is not None:
-             error_msg += f" (Status: {e.response.status_code})"
-             # Try to get text, default to empty string if not available
-             response_text = getattr(e.response, 'text', '')
-             error_msg += f" Response: {response_text[:200]}..."
-        return None, error_msg
-    except json.JSONDecodeError as e:
-         error_msg = f"JSON decode failed: {e}"
-         # 'response' might not be defined if the error happened before getting a response
-         if 'response' in locals() and hasattr(response, 'text'):
-              error_msg += f" Response text: {response.text[:200]}..."
-         return None, error_msg
-    except Exception as e:
-        # Catch any other unexpected errors during the fetch
-        return None, f"Unexpected error: {e}"
-
-# --- Function to Flatten Metadata (Comprehensive) ---
-def flatten_metadata(metadata_dict):
-    """
-    Flattens the potentially nested metadata dictionary based on the comprehensive list provided.
-    Extracts fields if they exist, flattens common lists/objects.
-    Returns a dictionary suitable for a CSV row.
-    """
-    flat = {}
-    if not isinstance(metadata_dict, dict):
-        return {"error": "Invalid metadata format received"}
-
-    # --- Top-Level Fields ---
-    flat['ARN'] = metadata_dict.get('ARN') # Use ARN as primary identifier if available
-    if not flat['ARN']: # Fallback if 'ARN' isn't present
-         flat['ARN'] = metadata_dict.get('amazonResourceName')
-
-    flat['account_resource_id'] = metadata_dict.get('account_resource_id')
-    flat['accountDivision'] = metadata_dict.get('accountDivision')
-    flat['accountEmailAddress'] = metadata_dict.get('accountEmailAddress')
-    flat['accountName'] = metadata_dict.get('accountName')
-    flat['accountPartition'] = metadata_dict.get('accountPartition')
-    flat['accountPaymentCardIndustryCategorization'] = metadata_dict.get('accountPaymentCardIndustryCategorization')
-    flat['accountStatus'] = metadata_dict.get('accountStatus')
-    flat['accountType'] = metadata_dict.get('accountType')
-    flat['accountVersion'] = metadata_dict.get('accountVersion')
-    flat['approvedRegion'] = metadata_dict.get('approvedRegion')
-    flat['assignmentGroupDisplayId'] = metadata_dict.get('assignmentGroupDisplayId')
-    flat['ASV'] = metadata_dict.get('ASV')
-    flat['asvCreationDate'] = metadata_dict.get('asvCreationDate')
-    flat['availabilityZone'] = metadata_dict.get('availabilityZone')
-    flat['awsAccountId'] = metadata_dict.get('awsAccountId')
-    flat['awsRegion'] = metadata_dict.get('awsRegion')
-    flat['awsService'] = metadata_dict.get('awsService')
-    flat['BA'] = metadata_dict.get('BA')
-    flat['businessExecutiveFullName'] = metadata_dict.get('businessExecutiveFullName')
-    flat['cloudProvider'] = metadata_dict.get('cloudProvider')
-    flat['configurationItemCaptureTime'] = metadata_dict.get('configurationItemCaptureTime')
-    flat['configurationItemDiff'] = metadata_dict.get('configurationItemDiff') # Might be complex object
-    flat['configurationItemStatus'] = metadata_dict.get('configurationItemStatus')
-    flat['configurationItemVersion'] = metadata_dict.get('configurationItemVersion')
-    flat['configurationStateId'] = metadata_dict.get('configurationStateId')
-    flat['configurationStatus'] = metadata_dict.get('configurationStatus')
-    flat['doc_type'] = metadata_dict.get('doc_type')
-    flat['engineeringLeadFullName'] = metadata_dict.get('engineeringLeadFullName')
-    flat['enrichedAvailabilityZones'] = metadata_dict.get('enrichedAvailabilityZones') # Likely list
-    flat['Environment'] = metadata_dict.get('Environment')
-    flat['environmentType'] = metadata_dict.get('environmentType')
-    flat['expirationTime'] = metadata_dict.get('expirationTime')
-    flat['firstSeenTime'] = metadata_dict.get('firstSeenTime')
-    flat['hybrid_arn_id'] = metadata_dict.get('hybrid_arn_id')
-    flat['insertionTime'] = metadata_dict.get('insertionTime')
-    flat['lastSeenTime'] = metadata_dict.get('lastSeenTime')
-    flat['LOB'] = metadata_dict.get('LOB')
-    flat['paymentCardIndustryCategorization'] = metadata_dict.get('paymentCardIndustryCategorization')
-    flat['PRIMARY_KEY'] = metadata_dict.get('PRIMARY_KEY')
-    flat['recordName'] = metadata_dict.get('recordName')
-    flat['recordType'] = metadata_dict.get('recordType')
-    flat['recoveryPointObjective'] = metadata_dict.get('recoveryPointObjective')
-    flat['recoveryTimeObjective'] = metadata_dict.get('recoveryTimeObjective')
-    flat['resiliencyTier'] = metadata_dict.get('resiliencyTier')
-    flat['resourceCreationTime'] = metadata_dict.get('resourceCreationTime')
-    flat['resourceId'] = metadata_dict.get('resourceId')
-    flat['resourceType'] = metadata_dict.get('resourceType')
-    flat['Source'] = metadata_dict.get('Source')
-    flat['technologyDivision'] = metadata_dict.get('technologyDivision')
-    flat['technologyExecutiveFullName'] = metadata_dict.get('technologyExecutiveFullName')
-    flat['timestamp'] = metadata_dict.get('timestamp')
-
-    # Flatten Lists/Complex Objects at Top Level if needed (Example: relationships)
-    relationships = metadata_dict.get('relationships', [])
-    flat['relationships_flattened'] = ", ".join(map(str, relationships)) if isinstance(relationships, list) else relationships
-
-    related_events = metadata_dict.get('relatedEvents', [])
-    flat['relatedEvents_flattened'] = ", ".join(map(str, related_events)) if isinstance(related_events, list) else related_events
-
-
-    # --- ConfigurationObject Fields ---
-    # Prioritize direct access, fallback to ConfigurationObject if direct fails
-    config_obj_key = 'ConfigurationObject' # Assume this is the standard key
-    config = metadata_dict.get(config_obj_key, {}) if isinstance(metadata_dict, dict) else {}
-
-    if isinstance(config, dict): # Check if config is a dictionary
-        # Use .get() on the config dictionary
-        flat['config_certificateArn'] = config.get('certificateArn', metadata_dict.get('ConfigurationObject.certificateArn')) # Example fallback
-        flat['config_createdAt'] = config.get('createdAt', config.get('CreatedAt')) # Handle casing variation
-        flat['config_domainName'] = config.get('domainName', config.get('DomainName')) # Handle casing variation
-        flat['config_issuedAt'] = config.get('issuedAt')
-        flat['config_issuer'] = config.get('issuer')
-        flat['config_keyAlgorithm'] = config.get('keyAlgorithm')
-        flat['config_notAfter'] = config.get('notAfter')
-        flat['config_notBefore'] = config.get('notBefore')
-        flat['config_renewalEligibility'] = config.get('renewalEligibility')
-        flat['config_serial'] = config.get('serial')
-        flat['config_signatureAlgorithm'] = config.get('signatureAlgorithm')
-        flat['config_status'] = config.get('status', config.get('Status')) # Handle casing variation
-        flat['config_subject'] = config.get('subject')
-        flat['config_type'] = config.get('type', config.get('Type')) # Handle casing variation
-
-        # Flatten Lists within ConfigurationObject
-        dv_options = config.get('domainValidationOptions', [])
-        if isinstance(dv_options, list):
-             # Flatten list of dicts into string like "domain:status; domain:status"
-             flat['config_domainValidationOptions'] = "; ".join([f"{opt.get('domainName', 'N/A')}:{opt.get('validationStatus', 'N/A')}" for opt in dv_options if isinstance(opt, dict)])
-        else:
-             flat['config_domainValidationOptions'] = str(dv_options) # Convert non-list to string
-
-        ext_key_usages = config.get('extendedKeyUsages', [])
-        flat['config_extendedKeyUsages'] = ", ".join(map(str, ext_key_usages)) if isinstance(ext_key_usages, list) else ext_key_usages
-
-        in_use_by = config.get('inUseBy', [])
-        flat['config_inUseBy'] = ", ".join(map(str, in_use_by)) if isinstance(in_use_by, list) else in_use_by
-
-        key_usages = config.get('keyUsages', [])
-        flat['config_keyUsages'] = ", ".join(map(str, key_usages)) if isinstance(key_usages, list) else key_usages
-
-        sans = config.get('subjectAlternativeNames', [])
-        flat['config_subjectAlternativeNames'] = ", ".join(map(str, sans)) if isinstance(sans, list) else sans
-
-        # Potentially large/complex fields - include as strings
-        flat['config_Certificate'] = config.get('Certificate', metadata_dict.get('ConfigurationObject.Certificate')) # Check both possible keys
-        flat['config_CertificateChain'] = config.get('CertificateChain', metadata_dict.get('ConfigurationObject.CertificateChain'))
-        flat['config_options'] = str(config.get('options')) # Stringify options object
-
-    else:
-         # Handle case where ConfigurationObject is missing or not a dict
-         print(f"Warning: '{config_obj_key}' not found or not a dictionary for ARN {flat.get('ARN')}")
-         # Optionally add placeholder keys
-         flat['config_status'] = "CONFIG_OBJECT_MISSING"
-
-
-    # --- Tags ---
-    # Prioritize 'Tags', fallback to 'SupplementaryConfigurationObject.tags'
-    tags_list = metadata_dict.get('Tags', metadata_dict.get('SupplementaryConfigurationObject.tags', []))
-    if isinstance(tags_list, list):
-        flat['tags_flattened'] = ", ".join([f"{tag.get('key','key?')}={tag.get('value','value?')}" for tag in tags_list if isinstance(tag, dict)])
-    elif isinstance(tags_list, dict): # Handle if tags are a dict instead of list
-        flat['tags_flattened'] = ", ".join([f"{k}={v}" for k, v in tags_list.items()])
-    else:
-        flat['tags_flattened'] = str(tags_list) # Just stringify if unknown format
-
-    # --- TagsObject Fields (Extract specific known tags if needed) ---
-    # This assumes tags are ALSO broken out into a TagsObject structure
-    # If tags are *only* in the 'Tags' list, these will likely be None
-    tags_obj_key = 'TagsObject' # Assuming this is the key
-    tags_obj = metadata_dict.get(tags_obj_key, {}) if isinstance(metadata_dict, dict) else {}
-
-    if isinstance(tags_obj, dict):
-        flat['tagsObject_ASV'] = tags_obj.get('ASV', tags_obj.get('asv')) # Handle casing
-        flat['tagsObject_BA'] = tags_obj.get('BA')
-        flat['tagsObject_NAME'] = tags_obj.get('NAME', tags_obj.get('Name', tags_obj.get('name'))) # Handle casing
-        flat['tagsObject_OwnerContact'] = tags_obj.get('OwnerContact', tags_obj.get('ownercontact')) # Handle casing
-    # else: # Optional: log if TagsObject format is unexpected
-    #    if tags_obj: # Only log if it exists but isn't a dict
-    #        print(f"Warning: '{tags_obj_key}' is not a dictionary for ARN {flat.get('ARN')}")
-
-
-    # Clean up None values to empty strings for CSV consistency
-    for key, value in flat.items():
-        if value is None:
-            flat[key] = ""
-
-    return flat
-
-# --- Main Execution ---
-
-# 1. Fetch Full List from CloudRadar
-cloudradar_arns_set, fetch_list_success = fetch_cloudradar_arns_list(API_URL, API_HEADERS, API_LIST_LIMIT)
-if not fetch_list_success:
-    exit(1) # Error message already printed in function
-
-# 2. Load Dataset ARNs from CSV
-dataset_arns_set, load_csv_success = load_dataset_arns_from_csv(DATASET_CSV_FILE, CSV_ARN_COLUMN_NAME)
-if not load_csv_success:
-    exit(1) # Error message already printed in function
-
-# 3. Identify Missing ARNs
-print("\n--- Identifying Missing ARNs ---")
-missing_arns_set = cloudradar_arns_set.difference(dataset_arns_set)
-missing_count = len(missing_arns_set)
-print(f"Found {missing_count} ARNs in CloudRadar but not in the dataset CSV.")
-
-if missing_count == 0:
-    print("No missing ARNs to fetch metadata for. Exiting.")
-    exit(0)
-
-# 4. Fetch Metadata for Missing ARNs
-print(f"\n--- Fetching Metadata for {missing_count} Missing ARNs (Delay: {API_CALL_DELAY}s/call) ---")
-all_metadata = []
-fetch_errors = []
-processed_count = 0
-
-# Prepare list of missing ARNs to iterate over
-missing_arns_list = sorted(list(missing_arns_set))
-
-for arn in missing_arns_list:
-    processed_count += 1
-    print(f"Processing ARN {processed_count}/{missing_count}: {arn}")
-
-    metadata, error_msg = fetch_metadata_for_arn(API_URL, API_HEADERS, arn, API_DETAIL_TIMEOUT)
-
-    if metadata:
-        flat_metadata = flatten_metadata(metadata)
-        all_metadata.append(flat_metadata)
-    else:
-        print(f"  -> Failed to fetch metadata for {arn}: {error_msg}")
-        fetch_errors.append({"arn": arn, "error": error_msg})
-
-    # --- Rate Limiting Delay ---
-    time.sleep(API_CALL_DELAY)
-
-print(f"\nFinished fetching metadata. Successful: {len(all_metadata)}, Failed: {len(fetch_errors)}")
-
-# 5. Write Metadata to CSV
-if all_metadata:
-    print(f"\n--- Writing Metadata to {OUTPUT_METADATA_CSV} ---")
-    try:
-        # Dynamically determine headers from all collected data
-        headers = set()
-        for row in all_metadata:
-            headers.update(row.keys())
-        # Ensure a consistent order, placing common keys first
-        ordered_headers = sorted(list(headers), key=lambda x: ('amazonResourceName' not in x, 'config_' not in x, 'tags' not in x, x))
-
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        output_filepath = os.path.join(script_dir, OUTPUT_METADATA_CSV)
-
-        with open(output_filepath, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=ordered_headers, extrasaction='ignore') # Ignore extra fields not in headers
-            writer.writeheader()
-            writer.writerows(all_metadata)
-        print(f"Successfully wrote {len(all_metadata)} records to {output_filepath}")
-    except Exception as e:
-        print(f"ERROR writing metadata CSV: {e}")
-else:
-    print("\nNo successful metadata records to write.")
-
-# 6. Write Errors to CSV
-if fetch_errors:
-    print(f"\n--- Writing Fetch Errors to {OUTPUT_ERRORS_CSV} ---")
-    try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        errors_filepath = os.path.join(script_dir, OUTPUT_ERRORS_CSV)
-        error_headers = ["arn", "error"]
-        with open(errors_filepath, 'w', newline='', encoding='utf-8') as csvfile:
-             writer = csv.DictWriter(csvfile, fieldnames=error_headers)
-             writer.writeheader()
-             writer.writerows(fetch_errors)
-        print(f"Successfully wrote {len(fetch_errors)} error records to {errors_filepath}")
-    except Exception as e:
-        print(f"ERROR writing errors CSV: {e}")
-
-print("\n--- Script Execution Finished ---")
+tags:
+  - automated_monitoring
+  - controls
+  - machine_iam
+  - cloud 
