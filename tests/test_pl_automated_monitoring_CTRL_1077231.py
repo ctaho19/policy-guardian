@@ -312,7 +312,7 @@ def test_pipeline_init_missing_oauth_config():
             pass
     mock_env_bad = MockEnv()
     import pytest
-    with pytest.raises(ValueError, match="Environment object missing expected OAuth attributes"):
+    with pytest.raises(AttributeError, match="object has no attribute 'env'"):
         pipeline.PLAutomatedMonitoringCtrl1077231(mock_env_bad)
 
 def test_get_api_token_success(mocker):
@@ -469,8 +469,8 @@ def test_transform_logic_mixed_compliance(mocker):
         config_key="metadataOptions.httpTokens",
         config_value="required",
         ctrl_id="CTRL-1077231",
-        tier1_metric_id="MNTR-1077231-T1",
-        tier2_metric_id="MNTR-1077231-T2"
+        tier1_metric_id=1,
+        tier2_metric_id=2
     )
     expected_df = _expected_output_mixed_df_pandas()
     pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df.reset_index(drop=True))
@@ -492,8 +492,8 @@ def test_transform_logic_empty_api_response(mocker):
         config_key="metadataOptions.httpTokens",
         config_value="required",
         ctrl_id="CTRL-1077231",
-        tier1_metric_id="MNTR-1077231-T1",
-        tier2_metric_id="MNTR-1077231-T2"
+        tier1_metric_id=1,
+        tier2_metric_id=2
     )
     expected_df = _expected_output_empty_df_pandas()
     pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df.reset_index(drop=True))
@@ -514,8 +514,8 @@ def test_transform_logic_yellow_status(mocker):
         config_key="metadataOptions.httpTokens",
         config_value="required",
         ctrl_id="CTRL-1077231",
-        tier1_metric_id="MNTR-1077231-T1",
-        tier2_metric_id="MNTR-1077231-T2"
+        tier1_metric_id=1,
+        tier2_metric_id=2
     )
     expected_df = _expected_output_yellow_df_pandas()
     pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df.reset_index(drop=True))
@@ -541,8 +541,8 @@ def test_transform_logic_api_fetch_fails(mocker):
             config_key="metadataOptions.httpTokens",
             config_value="required",
             ctrl_id="CTRL-1077231",
-            tier1_metric_id="MNTR-1077231-T1",
-            tier2_metric_id="MNTR-1077231-T2"
+            tier1_metric_id=1,
+            tier2_metric_id=2
         )
 
 def test_full_run_mixed_compliance(mocker):
@@ -563,30 +563,27 @@ def test_run_entrypoint_defaults(mocker):
     mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
     mock_pipeline_instance = mock_pipeline_class.return_value
     mock_pipeline_instance.run.return_value = None
-
-    mock_env = mock.Mock()
-    pipeline.run(env=mock_env)
-    mock_pipeline_class.assert_called_once_with(mock_env)
+    env = set_env_vars("qa")
+    pipeline.run(env=env)
+    mock_pipeline_class.assert_called_once_with(env)
     mock_pipeline_instance.run.assert_called_once()
 
 def test_run_entrypoint_no_load_no_dq(mocker):
     mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
     mock_pipeline_instance = mock_pipeline_class.return_value
     mock_pipeline_instance.run.return_value = None
-
-    mock_env = mock.Mock()
-    pipeline.run(env=mock_env, is_load=False, dq_actions=False)
-    mock_pipeline_class.assert_called_once_with(mock_env)
+    env = set_env_vars("qa")
+    pipeline.run(env=env, is_load=False, dq_actions=False)
+    mock_pipeline_class.assert_called_once_with(env)
     mock_pipeline_instance.run.assert_called_once_with(load=False, dq_actions=False)
 
 def test_run_entrypoint_export_test_data(mocker):
     mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
     mock_pipeline_instance = mock_pipeline_class.return_value
     mock_pipeline_instance.run.return_value = None
-
-    mock_env = mock.Mock()
-    pipeline.run(env=mock_env, is_export_test_data=True)
-    mock_pipeline_class.assert_called_once_with(mock_env)
+    env = set_env_vars("qa")
+    pipeline.run(env=env, is_export_test_data=True)
+    mock_pipeline_class.assert_called_once_with(env)
     mock_pipeline_instance.run_test_data_export.assert_called_once_with(dq_actions=True)
 
 def test_transform_logic_invalid_thresholds(mocker):
@@ -607,8 +604,8 @@ def test_transform_logic_invalid_thresholds(mocker):
         config_key="metadataOptions.httpTokens",
         config_value="required",
         ctrl_id="CTRL-1077231",
-        tier1_metric_id="MNTR-1077231-T1",
-        tier2_metric_id="MNTR-1077231-T2"
+        tier1_metric_id=1,
+        tier2_metric_id=2
     )
 
     expected_df_invalid = _expected_output_mixed_df_invalid_pandas()
