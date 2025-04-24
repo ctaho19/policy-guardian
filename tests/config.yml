@@ -1,5 +1,5 @@
 pipeline:
-  name: pl_automated_monitoring_CTRL_1077231
+  name: pl_automated_monitoring_ctrl_1077231
   use_test_data_on_nonprod: false
   dq_strict_mode: false
 
@@ -10,7 +10,7 @@ stages:
       options:
         sql: "@text:sql/monitoring_thresholds.sql"
 
-  transform:
+  load:
     monitoring_metrics:
       function: custom/calculate_ctrl1077231_metrics
       options:
@@ -21,21 +21,12 @@ stages:
         ctrl_id: CTRL-1077231
         tier1_metric_id: 1
         tier2_metric_id: 2
-
-  load:
-    monitoring_metrics:
       connector: onestream
       options:
         table_name: etip_controls_monitoring_metrics
         file_type: AVRO
         avro_schema: "@json:avro_schema.json"
         business_application: BAENTERPRISETECHINSIGHTS
-
-tags:
-  - automated_monitoring
-  - controls
-  - ctrl_1077231
-  - cloud
 
 ingress_validation:
   thresholds_raw:
