@@ -125,9 +125,19 @@ def fetch_all_resources(api_url: str, search_payload: Dict, auth_token: str, ver
 
 def get_compliance_status(metric: float, alert_threshold: float, warning_threshold: Optional[float] = None) -> str:
     metric_percentage = metric * 100
-    if metric_percentage >= alert_threshold:
+    try:
+        alert_threshold_f = float(alert_threshold)
+    except (TypeError, ValueError):
+        return "Red"
+    warning_threshold_f = None
+    if warning_threshold is not None:
+        try:
+            warning_threshold_f = float(warning_threshold)
+        except (TypeError, ValueError):
+            warning_threshold_f = None
+    if metric_percentage >= alert_threshold_f:
         return "Green"
-    elif warning_threshold is not None and metric_percentage >= warning_threshold:
+    elif warning_threshold_f is not None and metric_percentage >= warning_threshold_f:
         return "Yellow"
     else:
         return "Red"
