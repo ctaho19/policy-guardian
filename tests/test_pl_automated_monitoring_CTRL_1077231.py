@@ -2,21 +2,26 @@ import datetime
 import json
 import unittest.mock as mock
 from typing import Optional, List, Dict, Any
-import time # Import time for mocking sleep
-
+import time
 import pandas as pd
 import pytest
 from freezegun import freeze_time
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.types import (StructType, StructField, StringType, DoubleType,
-                             LongType, TimestampType, ArrayType, IntegerType)
 from requests import Response, RequestException
-
 import pipelines.pl_automated_monitoring_ctrl_1077231.pipeline as pipeline
-import pipelines.pl_automated_monitoring_ctrl_1077231.transform as transform
-
 from etip_env import set_env_vars, EnvType
 from tests.config_pipeline.helpers import ConfigPipelineTestCase
+
+# Avro schema fields for output DataFrame
+AVRO_SCHEMA_FIELDS = [
+    "date",
+    "control_id",
+    "monitoring_metric_id",
+    "monitoring_metric_value",
+    "compliance_status",
+    "numerator",
+    "denominator",
+    "non_compliant_resources"
+]
 
 def _mock_threshold_df_pandas() -> pd.DataFrame:
     return pd.DataFrame({
@@ -27,24 +32,11 @@ def _mock_threshold_df_pandas() -> pd.DataFrame:
         "alerting_threshold": [95.0, 50.0],
         "control_executor": ["Individual_1", "Individual_1"],
         "metric_threshold_start_date": [
-            datetime.datetime(2024, 11, 5, 12, 9, 00, 21180),
-            datetime.datetime(2024, 11, 5, 12, 9, 00, 21180)
+            datetime.datetime(2024, 11, 5, 12, 9, 0, 21180),
+            datetime.datetime(2024, 11, 5, 12, 9, 0, 21180)
         ],
         "metric_threshold_end_date": [None, None]
     })
-
-def _mock_threshold_df_spark(spark: SparkSession) -> DataFrame:
-    schema = StructType([
-        StructField("monitoring_metric_id", IntegerType(), True),
-        StructField("control_id", StringType(), True),
-        StructField("monitoring_metric_tier", StringType(), True),
-        StructField("warning_threshold", DoubleType(), True),
-        StructField("alerting_threshold", DoubleType(), True),
-        StructField("control_executor", StringType(), True),
-        StructField("metric_threshold_start_date", TimestampType(), True),
-        StructField("metric_threshold_end_date", TimestampType(), True)
-    ])
-    return spark.createDataFrame(_mock_threshold_df_pandas(), schema=schema)
 
 def _mock_invalid_threshold_df_pandas() -> pd.DataFrame:
     return pd.DataFrame({
@@ -55,27 +47,11 @@ def _mock_invalid_threshold_df_pandas() -> pd.DataFrame:
         "alerting_threshold": ["not_a_number", 50.0],
         "control_executor": ["Individual_1", "Individual_1"],
         "metric_threshold_start_date": [
-            datetime.datetime(2024, 11, 5, 12, 9, 00, 21180),
-            datetime.datetime(2024, 11, 5, 12, 9, 00, 21180)
+            datetime.datetime(2024, 11, 5, 12, 9, 0, 21180),
+            datetime.datetime(2024, 11, 5, 12, 9, 0, 21180)
         ],
         "metric_threshold_end_date": [None, None]
     })
-
-def _mock_invalid_threshold_df_spark(spark: SparkSession) -> DataFrame:
-    schema = StructType([
-        StructField("monitoring_metric_id", IntegerType(), True),
-        StructField("control_id", StringType(), True),
-        StructField("monitoring_metric_tier", StringType(), True),
-        StructField("warning_threshold", StringType(), True),
-        StructField("alerting_threshold", StringType(), True),
-        StructField("control_executor", StringType(), True),
-        StructField("metric_threshold_start_date", TimestampType(), True),
-        StructField("metric_threshold_end_date", TimestampType(), True)
-    ])
-    pdf = _mock_invalid_threshold_df_pandas()
-    pdf['warning_threshold'] = pdf['warning_threshold'].astype(str)
-    pdf['alerting_threshold'] = pdf['alerting_threshold'].astype(str)
-    return spark.createDataFrame(pdf, schema=schema)
 
 API_RESPONSE_MIXED = {
     "resourceConfigurations": [
@@ -236,456 +212,341 @@ def generate_mock_api_response(content: Optional[dict] = None, status_code: int 
     mock_response.request.method = "POST"
     return mock_response
 
-@freeze_time("2024-11-05 12:09:00.123456")
-def _expected_output_mixed_df(spark: SparkSession) -> DataFrame:
-    current_timestamp = datetime.datetime.now(timezone.utc)
-
-    fields_to_keep = [
-        "resourceId", "amazonResourceName", "resourceType", "awsRegion",
-        "accountName", "awsAccountId", "configuration.metadataOptions.httpTokens"
+def _expected_output_mixed_df_pandas() -> pd.DataFrame:
+    current_timestamp = pd.Timestamp("2024-11-05 12:09:00.123456", tz="UTC")
+    t1_non_compliant_json = [json.dumps({
+        "resourceId": "i-empty",
+        "amazonResourceName": "arn:aws:ec2:us-east-1:123456789012:instance/i-001b58d139a6192c9",
+        "resourceType": "AWS::EC2::Instance",
+        "awsRegion": "us-east-1",
+        "accountName": "prod-cyber-opsrstrd-da-baueba",
+        "awsAccountId": "123456789012",
+        "configuration.metadataOptions.httpTokens": ""
+    })]
+    t2_non_compliant_json = [json.dumps({
+        "resourceId": "i-optional",
+        "amazonResourceName": "arn:aws:ec2:us-east-1:123456789012:instance/i-00167f125dbdaca3b",
+        "resourceType": "AWS::EC2::Instance",
+        "awsRegion": "us-east-1",
+        "accountName": "prod-cyber-opsrstrd-da-baueba",
+        "awsAccountId": "123456789012",
+        "configuration.metadataOptions.httpTokens": "optional"
+    })]
+    data = [
+        [current_timestamp, "CTRL-1077231", 1, 80.0, "Red", 4, 5, t1_non_compliant_json],
+        [current_timestamp, "CTRL-1077231", 2, 75.0, "Green", 3, 4, t2_non_compliant_json],
     ]
+    return pd.DataFrame(data, columns=AVRO_SCHEMA_FIELDS)
 
-    t1_non_compliant_details = {
-        f: API_RESPONSE_MIXED["resourceConfigurations"][1].get(f, "N/A") for f in fields_to_keep
-        if f != "configuration.metadataOptions.httpTokens"
-    }
-    t1_non_compliant_details["configuration.metadataOptions.httpTokens"] = ""
-    t1_non_compliant_json = [json.dumps(t1_non_compliant_details)]
+def _expected_output_empty_df_pandas() -> pd.DataFrame:
+    return pd.DataFrame([], columns=AVRO_SCHEMA_FIELDS)
 
-    t2_non_compliant_details = {
-        f: API_RESPONSE_MIXED["resourceConfigurations"][0].get(f, "N/A") for f in fields_to_keep
-        if f != "configuration.metadataOptions.httpTokens"
-    }
-    t2_non_compliant_details["configuration.metadataOptions.httpTokens"] = "optional"
-    t2_non_compliant_json = [json.dumps(t2_non_compliant_details)]
-
-    output_data = [
-        (current_timestamp, "CTRL-1077231", 1, 80.0, "Red", 4, 5, t1_non_compliant_json),
-        (current_timestamp, "CTRL-1077231", 2, 75.0, "Green", 3, 4, t2_non_compliant_json),
+def _expected_output_yellow_df_pandas() -> pd.DataFrame:
+    current_timestamp = pd.Timestamp("2024-11-05 12:09:00.123456", tz="UTC")
+    t2_non_compliant_json = [json.dumps({
+        "resourceId": "i-optional",
+        "amazonResourceName": "arn:aws:ec2:us-east-1:123456789012:instance/i-00167f125dbdaca3b",
+        "resourceType": "AWS::EC2::Instance",
+        "awsRegion": "us-east-1",
+        "accountName": "prod-cyber-opsrstrd-da-baueba",
+        "awsAccountId": "123456789012",
+        "configuration.metadataOptions.httpTokens": "optional"
+    })]
+    data = [
+        [current_timestamp, "CTRL-1077231", 1, 100.0, "Green", 5, 5, None],
+        [current_timestamp, "CTRL-1077231", 2, 80.0, "Yellow", 4, 5, t2_non_compliant_json],
     ]
-    return spark.createDataFrame(output_data, schema=transform.OUTPUT_SCHEMA)
+    return pd.DataFrame(data, columns=AVRO_SCHEMA_FIELDS)
 
-def _expected_output_empty_df(spark: SparkSession) -> DataFrame:
-    return spark.createDataFrame([], schema=transform.OUTPUT_SCHEMA)
-
-@freeze_time("2024-11-05 12:09:00.123456")
-def _expected_output_yellow_df(spark: SparkSession) -> DataFrame:
-    current_timestamp = datetime.datetime.now(timezone.utc)
-    fields_to_keep = [
-        "resourceId", "amazonResourceName", "resourceType", "awsRegion",
-        "accountName", "awsAccountId", "configuration.metadataOptions.httpTokens"
+def _expected_output_mixed_df_invalid_pandas() -> pd.DataFrame:
+    current_timestamp = pd.Timestamp("2024-11-05 12:09:00.123456", tz="UTC")
+    t1_non_compliant_json = [json.dumps({
+        "resourceId": "i-empty",
+        "amazonResourceName": "arn:aws:ec2:us-east-1:123456789012:instance/i-001b58d139a6192c9",
+        "resourceType": "AWS::EC2::Instance",
+        "awsRegion": "us-east-1",
+        "accountName": "prod-cyber-opsrstrd-da-baueba",
+        "awsAccountId": "123456789012",
+        "configuration.metadataOptions.httpTokens": ""
+    })]
+    t2_non_compliant_json = [json.dumps({
+        "resourceId": "i-optional",
+        "amazonResourceName": "arn:aws:ec2:us-east-1:123456789012:instance/i-00167f125dbdaca3b",
+        "resourceType": "AWS::EC2::Instance",
+        "awsRegion": "us-east-1",
+        "accountName": "prod-cyber-opsrstrd-da-baueba",
+        "awsAccountId": "123456789012",
+        "configuration.metadataOptions.httpTokens": "optional"
+    })]
+    data = [
+        [current_timestamp, "CTRL-1077231", 1, 80.0, "Red", 4, 5, t1_non_compliant_json],
+        [current_timestamp, "CTRL-1077231", 2, 75.0, "Red", 3, 4, t2_non_compliant_json],
     ]
-    t1_non_compliant_json = None
+    return pd.DataFrame(data, columns=AVRO_SCHEMA_FIELDS)
 
-    t2_non_compliant_details = {
-        f: API_RESPONSE_YELLOW["resourceConfigurations"][0].get(f, "N/A") for f in fields_to_keep
-        if f != "configuration.metadataOptions.httpTokens"
-    }
-    t2_non_compliant_details["configuration.metadataOptions.httpTokens"] = "optional"
-    t2_non_compliant_json = [json.dumps(t2_non_compliant_details)]
+def test_pipeline_init_success():
+    class MockExchangeConfig:
+        def __init__(self, client_id="etip-client-id", client_secret="etip-client-secret", exchange_url="https://api.cloud.capitalone.com/exchange"):
+            self.client_id = client_id
+            self.client_secret = client_secret
+            self.exchange_url = exchange_url
+    class MockSnowflakeConfig:
+        def __init__(self):
+            self.account = "capitalone"
+            self.user = "etip_user"
+            self.password = "etip_password"
+            self.role = "etip_role"
+            self.warehouse = "etip_wh"
+            self.database = "etip_db"
+            self.schema = "etip_schema"
+    class MockEnv:
+        def __init__(self, exchange_config=None, snowflake_config=None):
+            self.exchange = exchange_config if exchange_config else MockExchangeConfig()
+            self.snowflake = snowflake_config if snowflake_config else MockSnowflakeConfig()
+            self.env = "DEV"
+        def __getattr__(self, name):
+            if name == 'env':
+                return "DEV"
+            raise AttributeError(f"'MockEnv' object has no attribute '{name}'")
+    mock_env = MockEnv()
+    pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
+    assert pipe.client_id == "etip-client-id"
+    assert pipe.client_secret == "etip-client-secret"
+    assert pipe.exchange_url == "https://api.cloud.capitalone.com/exchange"
 
-    output_data = [
-        (current_timestamp, "CTRL-1077231", 1, 100.0, "Green", 5, 5, t1_non_compliant_json),
-        (current_timestamp, "CTRL-1077231", 2, 80.0, "Yellow", 4, 5, t2_non_compliant_json),
-    ]
-    return spark.createDataFrame(output_data, schema=transform.OUTPUT_SCHEMA)
+def test_pipeline_init_missing_oauth_config():
+    class MockEnv:
+        def __init__(self):
+            pass
+    mock_env_bad = MockEnv()
+    import pytest
+    with pytest.raises(ValueError, match="Environment object missing expected OAuth attributes"):
+        pipeline.PLAutomatedMonitoringCtrl1077231(mock_env_bad)
 
-@freeze_time("2024-11-05 12:09:00.123456")
-def _expected_output_mixed_df_invalid(spark: SparkSession) -> DataFrame:
-    current_timestamp = datetime.datetime.now(timezone.utc)
+def test_get_api_token_success(mocker):
+    mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
+    mock_refresh.return_value = "mock_token_value"
+    class MockExchangeConfig:
+        def __init__(self, client_id="etip-client-id", client_secret="etip-client-secret", exchange_url="https://api.cloud.capitalone.com/exchange"):
+            self.client_id = client_id
+            self.client_secret = client_secret
+            self.exchange_url = exchange_url
+    class MockEnv:
+        def __init__(self):
+            self.exchange = MockExchangeConfig()
+    mock_env = MockEnv()
+    pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
+    token = pipe._get_api_token()
+    assert token == "Bearer mock_token_value"
+    mock_refresh.assert_called_once_with(
+        client_id="etip-client-id",
+        client_secret="etip-client-secret",
+        exchange_url="https://api.cloud.capitalone.com/exchange"
+    )
 
-    fields_to_keep = [
-        "resourceId", "amazonResourceName", "resourceType", "awsRegion",
-        "accountName", "awsAccountId", "configuration.metadataOptions.httpTokens"
-    ]
-    t1_non_compliant_details = {
-        f: API_RESPONSE_MIXED["resourceConfigurations"][1].get(f, "N/A") for f in fields_to_keep
-        if f != "configuration.metadataOptions.httpTokens"
-    }
-    t1_non_compliant_details["configuration.metadataOptions.httpTokens"] = ""
-    t1_non_compliant_json = [json.dumps(t1_non_compliant_details)]
-    t2_non_compliant_details = {
-        f: API_RESPONSE_MIXED["resourceConfigurations"][0].get(f, "N/A") for f in fields_to_keep
-        if f != "configuration.metadataOptions.httpTokens"
-    }
-    t2_non_compliant_details["configuration.metadataOptions.httpTokens"] = "optional"
-    t2_non_compliant_json = [json.dumps(t2_non_compliant_details)]
+def test_get_api_token_failure(mocker):
+    mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
+    mock_refresh.side_effect = Exception("Token refresh failed")
+    class MockExchangeConfig:
+        def __init__(self, client_id="etip-client-id", client_secret="etip-client-secret", exchange_url="https://api.cloud.capitalone.com/exchange"):
+            self.client_id = client_id
+            self.client_secret = client_secret
+            self.exchange_url = exchange_url
+    class MockEnv:
+        def __init__(self):
+            self.exchange = MockExchangeConfig()
+    mock_env = MockEnv()
+    pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
+    import pytest
+    with pytest.raises(RuntimeError, match="API token refresh failed"):
+        pipe._get_api_token()
 
-    output_data = [
-        (current_timestamp, "CTRL-1077231", 1, 80.0, "Red", 4, 5, t1_non_compliant_json),
-        (current_timestamp, "CTRL-1077231", 2, 75.0, "Red", 3, 4, t2_non_compliant_json),
-    ]
-    return spark.createDataFrame(output_data, schema=transform.OUTPUT_SCHEMA)
+def test_make_api_request_success_no_pagination(mocker):
+    mock_post = mocker.patch("requests.request")
+    mock_response = mock.Mock()
+    mock_response.status_code = 200
+    mock_response.ok = True
+    mock_response.json.return_value = {"resourceConfigurations": [1, 2, 3], "nextRecordKey": ""}
+    mock_post.return_value = mock_response
+    response = pipeline._make_api_request(
+        url="https://mock.api.url/search-resource-configurations",
+        method="POST",
+        auth_token="mock_token",
+        verify_ssl=True,
+        timeout=60,
+        max_retries=3,
+        payload={"searchParameters": [{"resourceType": "AWS::EC2::Instance"}]}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"resourceConfigurations": [1, 2, 3], "nextRecordKey": ""}
 
-class MockExchangeConfig:
-    def __init__(self, client_id="etip-client-id", client_secret="etip-client-secret", exchange_url="https://api.cloud.capitalone.com/exchange"):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.exchange_url = exchange_url
+def test_make_api_request_success_with_pagination(mocker):
+    mock_post = mocker.patch("requests.request")
+    mock_response1 = mock.Mock()
+    mock_response1.status_code = 200
+    mock_response1.ok = True
+    mock_response1.json.return_value = {"resourceConfigurations": [1], "nextRecordKey": "page2_key"}
+    mock_response2 = mock.Mock()
+    mock_response2.status_code = 200
+    mock_response2.ok = True
+    mock_response2.json.return_value = {"resourceConfigurations": [2, 3], "nextRecordKey": ""}
+    mock_post.side_effect = [mock_response1, mock_response2]
+    responses = []
+    def _side_effect(*args, **kwargs):
+        resp = mock_post.side_effect.pop(0)
+        responses.append(resp)
+        return resp
+    mock_post.side_effect = [mock_response1, mock_response2]
+    result = pipeline.fetch_all_resources(
+        api_url="https://mock.api.url/search-resource-configurations",
+        search_payload={"searchParameters": [{"resourceType": "AWS::EC2::Instance"}]},
+        auth_token="mock_token",
+        verify_ssl=True,
+        config_key_full="configuration.metadataOptions.httpTokens"
+    )
+    assert result == [1, 2, 3]
 
-class MockSnowflakeConfig:
-     def __init__(self):
-        self.account = "capitalone"
-        self.user = "etip_user"
-        self.password = "etip_password"
-        self.role = "etip_role"
-        self.warehouse = "etip_wh"
-        self.database = "etip_db"
-        self.schema = "etip_schema"
-
-class MockEnv:
-    def __init__(self, exchange_config=None, snowflake_config=None):
-        self.exchange = exchange_config if exchange_config else MockExchangeConfig()
-        self.snowflake = snowflake_config if snowflake_config else MockSnowflakeConfig()
-        self.env = EnvType.DEV
-
-    def __getattr__(self, name):
-        if name == 'env':
-            return EnvType.DEV
-        raise AttributeError(f"'MockEnv' object has no attribute '{name}'")
-
-@pytest.fixture(scope="session")
-def spark_session():
-    import os
-    import sys
-    import tempfile
-    import subprocess
-    import re
-    
-    # Check Java installation and version
-    try:
-        java_path = subprocess.check_output(['which', 'java']).decode().strip()
-        java_home = os.path.dirname(os.path.dirname(java_path))
-        os.environ['JAVA_HOME'] = java_home
-        
-        # Get Java version
-        java_version = subprocess.check_output(['java', '-version'], stderr=subprocess.STDOUT).decode()
-        version_match = re.search(r'version "(\d+)', java_version)
-        if version_match:
-            version = int(version_match.group(1))
-            if version not in [8, 11]:
-                raise RuntimeError(f"Java version {version} is not supported. Please use Java 8 or 11.")
-    except subprocess.CalledProcessError:
-        raise RuntimeError("Java is not installed or not in PATH. Please install Java and ensure it's in your PATH.")
-    
-    # Set up Spark environment variables
-    os.environ['PYSPARK_PYTHON'] = sys.executable
-    os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
-    
-    # Create a temporary directory for Spark
-    temp_dir = tempfile.mkdtemp()
-    os.environ['SPARK_LOCAL_DIRS'] = temp_dir
-    
-    try:
-        # Configure Spark session
-        spark = SparkSession.builder \
-            .appName("CTRL-1077231-Tests") \
-            .master("local[*]") \
-            .config("spark.driver.memory", "1g") \
-            .config("spark.executor.memory", "1g") \
-            .config("spark.sql.shuffle.partitions", "1") \
-            .config("spark.default.parallelism", "1") \
-            .config("spark.sql.warehouse.dir", temp_dir) \
-            .config("spark.local.dir", temp_dir) \
-            .getOrCreate()
-        
-        yield spark
-        
-    except Exception as e:
-        raise RuntimeError(f"Failed to create Spark session: {str(e)}")
-    finally:
-        # Cleanup
-        if 'spark' in locals():
-            spark.stop()
-        import shutil
-        shutil.rmtree(temp_dir)
-
-class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
-    def test_pipeline_init_success(self):
-        mock_env = MockEnv()
-        try:
-            pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
-            self.assertEqual(pipe.client_id, "etip-client-id")
-            self.assertEqual(pipe.client_secret, "etip-client-secret")
-            self.assertEqual(pipe.exchange_url, "https://api.cloud.capitalone.com/exchange")
-        except Exception as e:
-            pytest.fail(f"Pipeline initialization failed unexpectedly: {e}")
-
-    def test_pipeline_init_missing_oauth_config(self):
-        mock_env_bad = MockEnv(exchange_config=None)
-
-        with pytest.raises(ValueError, match="Environment object missing expected OAuth attributes"):
-            pipeline.PLAutomatedMonitoringCtrl1077231(mock_env_bad)
-
-    def test_get_api_token_success(self, mocker):
-        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
-        mock_refresh.return_value = "mock_token_value"
-
-        mock_env = MockEnv()
-        pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
-        token = pipe._get_api_token()
-        self.assertEqual(token, "mock_token_value")
-        mock_refresh.assert_called_once_with(
-            client_id="etip-client-id",
-            client_secret="etip-client-secret",
-            exchange_url="https://api.cloud.capitalone.com/exchange"
-        )
-
-    def test_get_api_token_failure(self, mocker):
-        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
-        mock_refresh.side_effect = Exception("Token refresh failed")
-
-        mock_env = MockEnv()
-        pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
-        with pytest.raises(Exception, match="Token refresh failed"):
-            pipe._get_api_token()
-
-    def test_make_api_request_success_no_pagination(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
-        mock_response = generate_mock_api_response(API_RESPONSE_MIXED)
-        mock_post.return_value = mock_response
-
-        response = transform._make_api_request(
+def test_make_api_request_http_error(mocker):
+    mock_post = mocker.patch("requests.request")
+    mock_response = mock.Mock()
+    mock_response.status_code = 500
+    mock_response.ok = False
+    mock_post.return_value = mock_response
+    import pytest
+    with pytest.raises(Exception):
+        pipeline._make_api_request(
             url="https://mock.api.url/search-resource-configurations",
             method="POST",
             auth_token="mock_token",
             verify_ssl=True,
             timeout=60,
-            max_retries=3,
-            payload={"searchParameters": [{"resourceType": "AWS::EC2::Instance"}]}
+            max_retries=1
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.content), API_RESPONSE_MIXED)
 
-    def test_make_api_request_success_with_pagination(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
-        mock_post.side_effect = [
-            generate_mock_api_response(API_RESPONSE_PAGE_1),
-            generate_mock_api_response(API_RESPONSE_PAGE_2)
-        ]
+def test_make_api_request_rate_limit_retry(mocker):
+    mock_post = mocker.patch("requests.request")
+    mock_sleep = mocker.patch("time.sleep")
+    mock_response_429 = mock.Mock()
+    mock_response_429.status_code = 429
+    mock_response_429.ok = False
+    mock_response_200 = mock.Mock()
+    mock_response_200.status_code = 200
+    mock_response_200.ok = True
+    mock_response_200.json.return_value = {"resourceConfigurations": [1], "nextRecordKey": ""}
+    mock_post.side_effect = [mock_response_429, mock_response_200]
+    response = pipeline._make_api_request(
+        url="https://mock.api.url/search-resource-configurations",
+        method="POST",
+        auth_token="mock_token",
+        verify_ssl=True,
+        timeout=60,
+        max_retries=2
+    )
+    assert response.status_code == 200
+    assert mock_sleep.called
 
-        response = transform._make_api_request(
+def test_make_api_request_error_retry_fail(mocker):
+    mock_post = mocker.patch("requests.request")
+    mock_sleep = mocker.patch("time.sleep")
+    mock_response = mock.Mock()
+    mock_response.status_code = 503
+    mock_response.ok = False
+    mock_post.return_value = mock_response
+    import pytest
+    with pytest.raises(Exception):
+        pipeline._make_api_request(
             url="https://mock.api.url/search-resource-configurations",
             method="POST",
             auth_token="mock_token",
             verify_ssl=True,
             timeout=60,
-            max_retries=3,
-            payload={"searchParameters": [{"resourceType": "AWS::EC2::Instance"}]},
-            params={"limit": 1}
+            max_retries=2
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.content), API_RESPONSE_PAGE_2)
+    assert mock_sleep.call_count == 2
 
-    def test_make_api_request_http_error(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
-        mock_response = generate_mock_api_response(status_code=500)
-        mock_post.return_value = mock_response
+def test_transform_logic_mixed_compliance(mocker):
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
 
-        with pytest.raises(RequestException):
-            transform._make_api_request(
-                url="https://mock.api.url/search-resource-configurations",
-                method="POST",
-                auth_token="mock_token",
-                verify_ssl=True,
-                timeout=60,
-                max_retries=3
-            )
+    thresholds_df = _mock_threshold_df_pandas()
+    context = {
+        "api_auth_token": "mock_token",
+        "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
+        "api_verify_ssl": True
+    }
+    result_df = pipeline.calculate_ctrl1077231_metrics(
+        thresholds_raw=thresholds_df,
+        context=context,
+        resource_type="AWS::EC2::Instance",
+        config_key="metadataOptions.httpTokens",
+        config_value="required",
+        ctrl_id="CTRL-1077231",
+        tier1_metric_id="MNTR-1077231-T1",
+        tier2_metric_id="MNTR-1077231-T2"
+    )
+    expected_df = _expected_output_mixed_df_pandas()
+    pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df.reset_index(drop=True))
 
-    def test_make_api_request_rate_limit_retry(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
-        mock_sleep = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.time.sleep")
+def test_transform_logic_empty_api_response(mocker):
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_EMPTY)
 
-        mock_post.side_effect = [
-            generate_mock_api_response(status_code=429),
-            generate_mock_api_response(API_RESPONSE_MIXED, status_code=200)
-        ]
+    thresholds_df = _mock_threshold_df_pandas()
+    context = {
+        "api_auth_token": "mock_token",
+        "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
+        "api_verify_ssl": True
+    }
+    result_df = pipeline.calculate_ctrl1077231_metrics(
+        thresholds_raw=thresholds_df,
+        context=context,
+        resource_type="AWS::EC2::Instance",
+        config_key="metadataOptions.httpTokens",
+        config_value="required",
+        ctrl_id="CTRL-1077231",
+        tier1_metric_id="MNTR-1077231-T1",
+        tier2_metric_id="MNTR-1077231-T2"
+    )
+    expected_df = _expected_output_empty_df_pandas()
+    pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df.reset_index(drop=True))
 
-        response = transform._make_api_request(
-            url="https://mock.url", method="POST", auth_token="t", verify_ssl=True, timeout=5, max_retries=3
-        )
+def test_transform_logic_yellow_status(mocker):
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_YELLOW)
+    thresholds_df = _mock_threshold_df_pandas()
+    context = {
+        "api_auth_token": "mock_token",
+        "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
+        "api_verify_ssl": True
+    }
+    result_df = pipeline.calculate_ctrl1077231_metrics(
+        thresholds_raw=thresholds_df,
+        context=context,
+        resource_type="AWS::EC2::Instance",
+        config_key="metadataOptions.httpTokens",
+        config_value="required",
+        ctrl_id="CTRL-1077231",
+        tier1_metric_id="MNTR-1077231-T1",
+        tier2_metric_id="MNTR-1077231-T2"
+    )
+    expected_df = _expected_output_yellow_df_pandas()
+    pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df.reset_index(drop=True))
+    assert result_df.iloc[0]["compliance_status"] == "Green"
+    assert result_df.iloc[1]["compliance_status"] == "Yellow"
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(mock_post.call_count, 2)
-        mock_sleep.assert_called_once()
+def test_transform_logic_api_fetch_fails(mocker):
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request.side_effect = RequestException("Simulated API failure")
 
-    def test_make_api_request_error_retry_fail(self, mocker):
-        mock_post = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.requests.post")
-        mock_sleep = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform.time.sleep")
-        max_retries = 2
+    thresholds_df = _mock_threshold_df_pandas()
+    context = {
+        "api_auth_token": "mock_token",
+        "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
+        "api_verify_ssl": True
+    }
 
-        mock_post.return_value = generate_mock_api_response(status_code=503)
-
-        with pytest.raises(RequestException):
-            transform._make_api_request(
-                url="https://mock.url", method="POST", auth_token="t", verify_ssl=True, timeout=5, max_retries=max_retries
-            )
-
-        self.assertEqual(mock_post.call_count, max_retries + 1)
-        self.assertEqual(mock_sleep.call_count, max_retries)
-
-    def test_transform_logic_mixed_compliance(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
-        mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
-
-        thresholds_df = _mock_threshold_df_spark(spark_session)
-        context = {
-            "api_auth_token": "mock_token",
-            "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
-            "api_verify_ssl": True
-        }
-        result_df = transform.calculate_ctrl1077231_metrics(
-            spark=spark_session,
-            thresholds_raw=thresholds_df,
-            context=context,
-            resource_type="AWS::EC2::Instance",
-            config_key="metadataOptions.httpTokens",
-            config_value="required",
-            ctrl_id="CTRL-1077231",
-            tier1_metric_id="MNTR-1077231-T1",
-            tier2_metric_id="MNTR-1077231-T2"
-        )
-        expected_df = _expected_output_mixed_df(spark_session)
-        result_list = sorted(result_df.collect(), key=lambda r: r['monitoring_metric_id'])
-        expected_list = sorted(expected_df.collect(), key=lambda r: r['monitoring_metric_id'])
-        self.assertEqual(result_list, expected_list)
-
-    def test_transform_logic_empty_api_response(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
-        mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_EMPTY)
-
-        thresholds_df = _mock_threshold_df_spark(spark_session)
-        context = {
-            "api_auth_token": "mock_token",
-            "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
-            "api_verify_ssl": True
-        }
-        result_df = transform.calculate_ctrl1077231_metrics(
-            spark=spark_session,
-            thresholds_raw=thresholds_df,
-            context=context,
-            resource_type="AWS::EC2::Instance",
-            config_key="metadataOptions.httpTokens",
-            config_value="required",
-            ctrl_id="CTRL-1077231",
-            tier1_metric_id="MNTR-1077231-T1",
-            tier2_metric_id="MNTR-1077231-T2"
-        )
-        expected_df = _expected_output_empty_df(spark_session)
-        self.assertEqual(result_df.collect(), expected_df.collect())
-
-    def test_transform_logic_yellow_status(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
-        mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_YELLOW)
-        thresholds_df = _mock_threshold_df_spark(spark_session)
-        context = {
-            "api_auth_token": "mock_token",
-            "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
-            "api_verify_ssl": True
-        }
-        result_df = transform.calculate_ctrl1077231_metrics(
-            spark=spark_session,
-            thresholds_raw=thresholds_df,
-            context=context,
-            resource_type="AWS::EC2::Instance",
-            config_key="metadataOptions.httpTokens",
-            config_value="required",
-            ctrl_id="CTRL-1077231",
-            tier1_metric_id="MNTR-1077231-T1",
-            tier2_metric_id="MNTR-1077231-T2"
-        )
-        expected_df = _expected_output_yellow_df(spark_session)
-        result_list = sorted(result_df.collect(), key=lambda r: r['monitoring_metric_id'])
-        expected_list = sorted(expected_df.collect(), key=lambda r: r['monitoring_metric_id'])
-        self.assertEqual(result_list, expected_list)
-        self.assertEqual(result_list[0]["compliance_status"], "Green")
-        self.assertEqual(result_list[1]["compliance_status"], "Yellow")
-
-    def test_transform_logic_api_fetch_fails(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
-        mock_make_api_request.side_effect = RequestException("Simulated API failure")
-
-        thresholds_df = _mock_threshold_df_spark(spark_session)
-        context = {
-            "api_auth_token": "mock_token",
-            "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
-            "api_verify_ssl": True
-        }
-
-        with pytest.raises(RuntimeError, match="Critical API fetch failure"):
-            transform.calculate_ctrl1077231_metrics(
-                spark=spark_session,
-                thresholds_raw=thresholds_df,
-                context=context,
-                resource_type="AWS::EC2::Instance",
-                config_key="metadataOptions.httpTokens",
-                config_value="required",
-                ctrl_id="CTRL-1077231",
-                tier1_metric_id="MNTR-1077231-T1",
-                tier2_metric_id="MNTR-1077231-T2"
-            )
-
-    def test_full_run_mixed_compliance(self, mocker, spark_session):
-        mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
-        mock_read = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.ConfigPipeline.read")
-        mock_write = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.ConfigPipeline.write")
-        mock_make_api_req = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
-
-        mock_read.return_value = _mock_threshold_df_spark(spark_session)
-        mock_make_api_req.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
-
-        mock_env = MockEnv()
-        pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
-        pipe.configure_from_filename("pl_automated_monitoring_ctrl_1077231/config.yml")
-        pipe.run()
-
-        mock_write.assert_called_once()
-        written_df = mock_write.call_args[0][0]
-        expected_df = _expected_output_mixed_df(spark_session)
-        written_list = sorted(written_df.collect(), key=lambda r: r['monitoring_metric_id'])
-        expected_list = sorted(expected_df.collect(), key=lambda r: r['monitoring_metric_id'])
-        self.assertEqual(written_list, expected_list)
-
-    def test_run_entrypoint_defaults(self, mocker, spark_session):
-        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
-        mock_pipeline_instance = mock_pipeline_class.return_value
-        mock_pipeline_instance.run.return_value = None
-
-        pipeline.run()
-        mock_pipeline_class.assert_called_once()
-        mock_pipeline_instance.run.assert_called_once()
-
-    def test_run_entrypoint_no_load_no_dq(self, mocker, spark_session):
-        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
-        mock_pipeline_instance = mock_pipeline_class.return_value
-        mock_pipeline_instance.run.return_value = None
-
-        pipeline.run(load=False, dq=False)
-        mock_pipeline_class.assert_called_once()
-        mock_pipeline_instance.run.assert_called_once_with(load=False, dq=False)
-
-    def test_run_entrypoint_export_test_data(self, mocker, spark_session):
-        mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
-        mock_pipeline_instance = mock_pipeline_class.return_value
-        mock_pipeline_instance.run.return_value = None
-
-        pipeline.run(export_test_data=True)
-        mock_pipeline_class.assert_called_once()
-        mock_pipeline_instance.run.assert_called_once_with(export_test_data=True)
-
-    def test_transform_logic_invalid_thresholds(self, mocker, spark_session):
-        mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
-        mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
-
-        thresholds_df = _mock_invalid_threshold_df_spark(spark_session)
-        context = {
-            "api_auth_token": "mock_token",
-            "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
-            "api_verify_ssl": True
-        }
-
-        result_df = transform.calculate_ctrl1077231_metrics(
-            spark=spark_session,
+    with pytest.raises(RuntimeError, match="Critical API fetch failure"):
+        pipeline.calculate_ctrl1077231_metrics(
             thresholds_raw=thresholds_df,
             context=context,
             resource_type="AWS::EC2::Instance",
@@ -696,17 +557,82 @@ class TestAutomatedMonitoringCtrl1077231(ConfigPipelineTestCase):
             tier2_metric_id="MNTR-1077231-T2"
         )
 
-        expected_df_invalid = _expected_output_mixed_df_invalid(spark_session)
+def test_full_run_mixed_compliance(mocker):
+    mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
+    mock_read = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.ConfigPipeline.read")
+    mock_write = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.ConfigPipeline.write")
+    mock_make_api_req = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
 
-        result_list = sorted(result_df.collect(), key=lambda r: r['monitoring_metric_id'])
-        expected_list = sorted(expected_df_invalid.collect(), key=lambda r: r['monitoring_metric_id'])
+    mock_read.return_value = _mock_threshold_df_pandas()
+    mock_make_api_req.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
 
-        self.assertEqual(result_list, expected_list)
+    mock_env = MockEnv()
+    pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
+    pipe.configure_from_filename("pl_automated_monitoring_ctrl_1077231/config.yml")
+    pipe.run()
 
-        self.assertEqual(len(result_list), 2)
-        self.assertEqual(result_list[0]["monitoring_metric_id"], 1)
-        self.assertEqual(result_list[0]["monitoring_metric_value"], 80.0)
-        self.assertEqual(result_list[0]["compliance_status"], "Red")
-        self.assertEqual(result_list[1]["monitoring_metric_id"], 2)
-        self.assertEqual(result_list[1]["monitoring_metric_value"], 75.0)
-        self.assertEqual(result_list[1]["compliance_status"], "Red")
+    mock_write.assert_called_once()
+    written_df = mock_write.call_args[0][0]
+    expected_df = _expected_output_mixed_df_pandas()
+    pd.testing.assert_frame_equal(written_df.reset_index(drop=True), expected_df.reset_index(drop=True))
+
+def test_run_entrypoint_defaults(mocker):
+    mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
+    mock_pipeline_instance = mock_pipeline_class.return_value
+    mock_pipeline_instance.run.return_value = None
+
+    pipeline.run()
+    mock_pipeline_class.assert_called_once()
+    mock_pipeline_instance.run.assert_called_once()
+
+def test_run_entrypoint_no_load_no_dq(mocker):
+    mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
+    mock_pipeline_instance = mock_pipeline_class.return_value
+    mock_pipeline_instance.run.return_value = None
+
+    pipeline.run(load=False, dq=False)
+    mock_pipeline_class.assert_called_once()
+    mock_pipeline_instance.run.assert_called_once_with(load=False, dq=False)
+
+def test_run_entrypoint_export_test_data(mocker):
+    mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
+    mock_pipeline_instance = mock_pipeline_class.return_value
+    mock_pipeline_instance.run.return_value = None
+
+    pipeline.run(export_test_data=True)
+    mock_pipeline_class.assert_called_once()
+    mock_pipeline_instance.run.assert_called_once_with(export_test_data=True)
+
+def test_transform_logic_invalid_thresholds(mocker):
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
+
+    thresholds_df = _mock_invalid_threshold_df_pandas()
+    context = {
+        "api_auth_token": "mock_token",
+        "cloud_tooling_api_url": "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations",
+        "api_verify_ssl": True
+    }
+
+    result_df = pipeline.calculate_ctrl1077231_metrics(
+        thresholds_raw=thresholds_df,
+        context=context,
+        resource_type="AWS::EC2::Instance",
+        config_key="metadataOptions.httpTokens",
+        config_value="required",
+        ctrl_id="CTRL-1077231",
+        tier1_metric_id="MNTR-1077231-T1",
+        tier2_metric_id="MNTR-1077231-T2"
+    )
+
+    expected_df_invalid = _expected_output_mixed_df_invalid_pandas()
+
+    pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df_invalid.reset_index(drop=True))
+
+    assert len(result_df) == 2
+    assert result_df.iloc[0]["monitoring_metric_id"] == 1
+    assert result_df.iloc[0]["monitoring_metric_value"] == 80.0
+    assert result_df.iloc[0]["compliance_status"] == "Red"
+    assert result_df.iloc[1]["monitoring_metric_id"] == 2
+    assert result_df.iloc[1]["monitoring_metric_value"] == 75.0
+    assert result_df.iloc[1]["compliance_status"] == "Red"
