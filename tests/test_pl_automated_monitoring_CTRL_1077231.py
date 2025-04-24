@@ -9,7 +9,6 @@ from freezegun import freeze_time
 from requests import Response, RequestException
 import pipelines.pl_automated_monitoring_ctrl_1077231.pipeline as pipeline
 from etip_env import set_env_vars, EnvType
-from tests.config_pipeline.helpers import ConfigPipelineTestCase
 
 # Avro schema fields for output DataFrame
 AVRO_SCHEMA_FIELDS = [
@@ -465,7 +464,7 @@ def test_make_api_request_error_retry_fail(mocker):
     assert mock_sleep.call_count == 2
 
 def test_transform_logic_mixed_compliance(mocker):
-    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline._make_api_request")
     mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
 
     thresholds_df = _mock_threshold_df_pandas()
@@ -488,7 +487,7 @@ def test_transform_logic_mixed_compliance(mocker):
     pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df.reset_index(drop=True))
 
 def test_transform_logic_empty_api_response(mocker):
-    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline._make_api_request")
     mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_EMPTY)
 
     thresholds_df = _mock_threshold_df_pandas()
@@ -511,7 +510,7 @@ def test_transform_logic_empty_api_response(mocker):
     pd.testing.assert_frame_equal(result_df.reset_index(drop=True), expected_df.reset_index(drop=True))
 
 def test_transform_logic_yellow_status(mocker):
-    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline._make_api_request")
     mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_YELLOW)
     thresholds_df = _mock_threshold_df_pandas()
     context = {
@@ -535,7 +534,7 @@ def test_transform_logic_yellow_status(mocker):
     assert result_df.iloc[1]["compliance_status"] == "Yellow"
 
 def test_transform_logic_api_fetch_fails(mocker):
-    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline._make_api_request")
     mock_make_api_request.side_effect = RequestException("Simulated API failure")
 
     thresholds_df = _mock_threshold_df_pandas()
@@ -559,14 +558,12 @@ def test_transform_logic_api_fetch_fails(mocker):
 
 def test_full_run_mixed_compliance(mocker):
     mock_refresh = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.refresh_oauth_token")
-    mock_read = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.ConfigPipeline.read")
-    mock_write = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.ConfigPipeline.write")
-    mock_make_api_req = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_write = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231.write")
+    mock_make_api_req = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline._make_api_request")
 
-    mock_read.return_value = _mock_threshold_df_pandas()
     mock_make_api_req.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
 
-    mock_env = MockEnv()
+    mock_env = mock.Mock()
     pipe = pipeline.PLAutomatedMonitoringCtrl1077231(mock_env)
     pipe.configure_from_filename("pl_automated_monitoring_ctrl_1077231/config.yml")
     pipe.run()
@@ -581,8 +578,9 @@ def test_run_entrypoint_defaults(mocker):
     mock_pipeline_instance = mock_pipeline_class.return_value
     mock_pipeline_instance.run.return_value = None
 
-    pipeline.run()
-    mock_pipeline_class.assert_called_once()
+    mock_env = mock.Mock()
+    pipeline.run(env=mock_env)
+    mock_pipeline_class.assert_called_once_with(mock_env)
     mock_pipeline_instance.run.assert_called_once()
 
 def test_run_entrypoint_no_load_no_dq(mocker):
@@ -590,21 +588,23 @@ def test_run_entrypoint_no_load_no_dq(mocker):
     mock_pipeline_instance = mock_pipeline_class.return_value
     mock_pipeline_instance.run.return_value = None
 
-    pipeline.run(load=False, dq=False)
-    mock_pipeline_class.assert_called_once()
-    mock_pipeline_instance.run.assert_called_once_with(load=False, dq=False)
+    mock_env = mock.Mock()
+    pipeline.run(env=mock_env, is_load=False, dq_actions=False)
+    mock_pipeline_class.assert_called_once_with(mock_env)
+    mock_pipeline_instance.run.assert_called_once_with(load=False, dq_actions=False)
 
 def test_run_entrypoint_export_test_data(mocker):
     mock_pipeline_class = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline.PLAutomatedMonitoringCtrl1077231")
     mock_pipeline_instance = mock_pipeline_class.return_value
     mock_pipeline_instance.run.return_value = None
 
-    pipeline.run(export_test_data=True)
-    mock_pipeline_class.assert_called_once()
-    mock_pipeline_instance.run.assert_called_once_with(export_test_data=True)
+    mock_env = mock.Mock()
+    pipeline.run(env=mock_env, is_export_test_data=True)
+    mock_pipeline_class.assert_called_once_with(mock_env)
+    mock_pipeline_instance.run_test_data_export.assert_called_once_with(dq_actions=True)
 
 def test_transform_logic_invalid_thresholds(mocker):
-    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.transform._make_api_request")
+    mock_make_api_request = mocker.patch("pipelines.pl_automated_monitoring_ctrl_1077231.pipeline._make_api_request")
     mock_make_api_request.return_value = generate_mock_api_response(API_RESPONSE_MIXED)
 
     thresholds_df = _mock_invalid_threshold_df_pandas()
