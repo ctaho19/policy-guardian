@@ -126,10 +126,11 @@ def fetch_certificates_from_api(payload: Dict) -> List[Dict]:
 
 def create_flattened_cert_df(api_certificates: List[Dict]):
     """
-    Convert API certificates list to a pandas DataFrame with flattened structure,
-    then convert to a Spark DataFrame. This approach avoids complex SQL expressions.
+    Convert API certificates list to a flattened structure,
+    then create a Spark DataFrame. This approach avoids complex SQL expressions.
     """
     if not api_certificates:
+        logger.warning("No certificates provided to flatten")
         return spark.createDataFrame([], StructType([
             StructField("amazonresourcename", StringType(), True)
         ]))
@@ -137,39 +138,57 @@ def create_flattened_cert_df(api_certificates: List[Dict]):
     # Extract and flatten the certificate data
     flattened_certs = []
     
-    for cert in api_certificates:
-        # Start with top-level attributes
-        flat_cert = {
-            "amazonresourcename": cert.get("amazonResourceName", ""),
-            "resourceid": cert.get("resourceId", ""),
-            "awsaccountid": cert.get("awsAccountId", ""),
-            "awsregion": cert.get("awsRegion", ""),
-            "businessapplicationname": cert.get("businessApplicationName", ""),
-            "environment": cert.get("environment", ""),
-            "source": cert.get("source", "")
-        }
+    try:
+        for cert in api_certificates:
+            # Start with top-level attributes
+            flat_cert = {
+                "amazonresourcename": cert.get("amazonResourceName", ""),
+                "resourceid": cert.get("resourceId", ""),
+                "awsaccountid": cert.get("awsAccountId", ""),
+                "awsregion": cert.get("awsRegion", ""),
+                "businessapplicationname": cert.get("businessApplicationName", ""),
+                "environment": cert.get("environment", ""),
+                "source": cert.get("source", "")
+            }
+            
+            # Extract configuration values
+            if "configurationList" in cert and isinstance(cert["configurationList"], list):
+                for config in cert["configurationList"]:
+                    if isinstance(config, dict) and "configurationName" in config and "configurationValue" in config:
+                        # Use the configuration name as the column name
+                        # Convert to lowercase and replace dots with underscores for valid column names
+                        col_name = config["configurationName"].lower().replace(".", "_")
+                        flat_cert[col_name] = config["configurationValue"]
+            
+            # Extract supplementary configuration values
+            if "supplementaryConfiguration" in cert and isinstance(cert["supplementaryConfiguration"], list):
+                for config in cert["supplementaryConfiguration"]:
+                    if isinstance(config, dict) and "supplementaryConfigurationName" in config and "supplementaryConfigurationValue" in config:
+                        # Use the configuration name as the column name
+                        # Convert to lowercase and replace dots with underscores for valid column names
+                        col_name = ("supp_" + config["supplementaryConfigurationName"]).lower().replace(".", "_")
+                        flat_cert[col_name] = config["supplementaryConfigurationValue"]
+            
+            flattened_certs.append(flat_cert)
         
-        # Extract configuration values
-        for config in cert.get("configurationList", []):
-            if "configurationName" in config and "configurationValue" in config:
-                # Use the configuration name as the column name
-                # Convert to lowercase and replace dots with underscores for valid column names
-                col_name = config["configurationName"].lower().replace(".", "_")
-                flat_cert[col_name] = config["configurationValue"]
+        # Create a Spark DataFrame directly from the flattened dictionaries
+        if not flattened_certs:
+            logger.warning("No certificates were flattened successfully")
+            return spark.createDataFrame([], StructType([
+                StructField("amazonresourcename", StringType(), True)
+            ]))
+            
+        # This will infer the schema automatically from the data
+        df = spark.createDataFrame(flattened_certs)
+        logger.info(f"Successfully created DataFrame with {df.count()} rows and {len(df.columns)} columns")
+        return df
         
-        # Extract supplementary configuration values
-        for config in cert.get("supplementaryConfiguration", []):
-            if "supplementaryConfigurationName" in config and "supplementaryConfigurationValue" in config:
-                # Use the configuration name as the column name
-                # Convert to lowercase and replace dots with underscores for valid column names
-                col_name = ("supp_" + config["supplementaryConfigurationName"]).lower().replace(".", "_")
-                flat_cert[col_name] = config["supplementaryConfigurationValue"]
-        
-        flattened_certs.append(flat_cert)
-    
-    # Create a Spark DataFrame directly from the flattened dictionaries
-    # This will infer the schema automatically from the data
-    return spark.createDataFrame(flattened_certs)
+    except Exception as e:
+        logger.error(f"Error flattening certificates: {e}")
+        # Return empty DataFrame on error
+        return spark.createDataFrame([], StructType([
+            StructField("amazonresourcename", StringType(), True)
+        ]))
 
 def identify_common_attributes_spark(df_snowflake, df_api):
     """Identify common attributes between dataset and API certificates using Spark."""
@@ -415,63 +434,98 @@ def main():
         ]))
     
     # 3. Compare and analyze certificates
-    if not df_snowflake.isEmpty() and not df_api.isEmpty():
-        analysis_results = identify_common_attributes_spark(df_snowflake, df_api)
+    try:
+        snowflake_count = df_snowflake.count()
+        api_count = df_api.count()
         
-        # 4. Suggest improved API payload
-        suggested_payload = suggest_api_payload(analysis_results)
+        logger.info(f"Certificate counts - Snowflake: {snowflake_count}, API: {api_count}")
         
-        # 5. Print results
-        print("\n=== Analysis Results ===")
-        print(f"Matching certificates: {analysis_results['matching_count']}")
-        print(f"API-only certificates: {analysis_results['api_only_count']}")
-        print(f"Snowflake-only certificates: {analysis_results['snowflake_only_count']}")
-        
-        print("\n=== Common Configurations ===")
-        for config, value in analysis_results['common_configurations'].items():
-            print(f"{config}: {value}")
-        
-        print("\n=== Suggested API Payload ===")
-        print(json.dumps(suggested_payload, indent=2))
-        
-        # 6. Save results to tables for better viewing in Databricks
-        # Convert the analysis results to a Spark DataFrame
-        diff_rows = []
-        for col_name, diff in analysis_results['differences'].items():
-            diff_rows.append({
-                "column_name": col_name,
-                "matching_values": str(diff["matching_values"]),
-                "non_matching_values": str(diff["non_matching_values"]),
-                "distinctive_values": str(diff["distinctive_values"])
-            })
-        
-        if diff_rows:
-            diff_df = spark.createDataFrame(diff_rows)
-            print("\n=== Differences Analysis ===")
-            display(diff_df)
-        
-        # Save the suggested payload for reference
-        try:
-            with open("/tmp/suggested_payload.json", "w") as f:
-                json.dump(suggested_payload, indent=2, fp=f)
-            print(f"\nResults saved to /tmp/suggested_payload.json")
-        except Exception as e:
-            print(f"Could not save payload to file: {str(e)}")
-            print("Suggested payload (copy from here):")
+        if snowflake_count > 0 and api_count > 0:
+            analysis_results = identify_common_attributes_spark(df_snowflake, df_api)
+            
+            # 4. Suggest improved API payload
+            suggested_payload = suggest_api_payload(analysis_results)
+            
+            # 5. Print results
+            print("\n=== Analysis Results ===")
+            print(f"Matching certificates: {analysis_results['matching_count']}")
+            print(f"API-only certificates: {analysis_results['api_only_count']}")
+            print(f"Snowflake-only certificates: {analysis_results['snowflake_only_count']}")
+            
+            print("\n=== Common Configurations ===")
+            for config, value in analysis_results['common_configurations'].items():
+                print(f"{config}: {value}")
+            
+            print("\n=== Suggested API Payload ===")
             print(json.dumps(suggested_payload, indent=2))
-        
-        # Cache dataframes for faster access without creating temporary views
-        df_snowflake.cache()
-        df_api.cache()
-        
-        return {
-            "snowflake_df": df_snowflake,
-            "api_df": df_api,
-            "analysis_results": analysis_results,
-            "suggested_payload": suggested_payload
-        }
-    else:
-        logger.error("Cannot perform analysis because one or both datasets are empty")
+            
+            # 6. Save results to tables for better viewing in Databricks
+            try:
+                # Convert the analysis results to a Spark DataFrame
+                diff_rows = []
+                for col_name, diff in analysis_results['differences'].items():
+                    diff_rows.append({
+                        "column_name": col_name,
+                        "matching_values": str(diff["matching_values"]),
+                        "non_matching_values": str(diff["non_matching_values"]),
+                        "distinctive_values": str(diff["distinctive_values"])
+                    })
+                
+                if diff_rows:
+                    diff_df = spark.createDataFrame(diff_rows)
+                    print("\n=== Differences Analysis ===")
+                    display(diff_df)
+            except Exception as e:
+                logger.error(f"Error creating differences DataFrame: {e}")
+            
+            # Save the suggested payload for reference
+            try:
+                with open("/tmp/suggested_payload.json", "w") as f:
+                    json.dump(suggested_payload, indent=2, fp=f)
+                print(f"\nResults saved to /tmp/suggested_payload.json")
+            except Exception as e:
+                print(f"Could not save payload to file: {str(e)}")
+                print("Suggested payload (copy from here):")
+                print(json.dumps(suggested_payload, indent=2))
+            
+            # Cache dataframes for faster access without creating temporary views
+            df_snowflake.cache()
+            df_api.cache()
+            
+            return {
+                "snowflake_df": df_snowflake,
+                "api_df": df_api,
+                "analysis_results": analysis_results,
+                "suggested_payload": suggested_payload
+            }
+        else:
+            logger.error(f"Cannot perform analysis because one or both datasets are empty. Snowflake count: {snowflake_count}, API count: {api_count}")
+            return {
+                "snowflake_df": df_snowflake,
+                "api_df": df_api,
+                "analysis_results": {
+                    "matching_count": 0,
+                    "api_only_count": 0,
+                    "snowflake_only_count": 0,
+                    "differences": {},
+                    "common_configurations": {}
+                },
+                "suggested_payload": {
+                    "searchParameters": [
+                        {
+                            "resourceType": "AWS::ACM::Certificate",
+                            "configurationItems": [
+                                {
+                                    "configurationName": "issuer",
+                                    "configurationValue": "Amazon"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+    except Exception as e:
+        logger.error(f"Error during analysis stage: {e}")
         return None
 
 # Run the main function if this is executed directly
