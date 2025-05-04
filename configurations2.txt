@@ -17,13 +17,36 @@ API_HEADERS = {
 API_CALL_DELAY = 0.15  # Delay between API calls to avoid rate limits
 API_TIMEOUT = 60  # Timeout for API calls
 
-# Snowflake connection parameters (using environment variables or placeholders)
-SNOWFLAKE_USER = os.environ.get("SNOWFLAKE_USER", "YOUR_USERNAME")
-SNOWFLAKE_PASSWORD = os.environ.get("SNOWFLAKE_PASSWORD", "YOUR_PASSWORD")
-SNOWFLAKE_ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "cptlone-sfprod")
-SNOWFLAKE_DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "CYBR_DB")
-SNOWFLAKE_SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA", "PHDP_CYBR")
-SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE", "CYBR_Q_DI_WH")
+# Snowflake connection parameters using dbutils.secrets
+# Connecting to snowflake, necessary for querying metric thresholds
+try:
+    # Try to use databricks secrets if running in Databricks
+    import dbutils
+    username = dbutils.secrets.get(scope="sdd802_scope", key="eid") #NOTE: Using Aditya's scope
+    password = dbutils.secrets.get(scope="sdd802_scope", key="password")
+except:
+    # Fall back to environment variables if not in Databricks
+    username = os.environ.get("SNOWFLAKE_USER", "YOUR_USERNAME")
+    password = os.environ.get("SNOWFLAKE_PASSWORD", "YOUR_PASSWORD")
+
+# Define Snowflake connection options
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+SNOWFLAKE_USER = username
+SNOWFLAKE_PASSWORD = password
+SNOWFLAKE_ACCOUNT = "cptlone-sfprod"
+SNOWFLAKE_DATABASE = "SB"
+SNOWFLAKE_SCHEMA = "USER_SDD802"  # Using Aditya's credentials
+SNOWFLAKE_WAREHOUSE = "CYBR_Q_DI_WH"
+
+# Define Snowflake options dict for PySpark
+sfOptions = dict(
+    sfUrl= SNOWFLAKE_ACCOUNT, #REGION-SPECIFIC CONNECTION: prod.us-east-1.capitalone.snowflakecomputing.com",
+    sfUser=username,
+    sfPassword=password,
+    sfDatabase=SNOWFLAKE_DATABASE,
+    sfSchema=SNOWFLAKE_SCHEMA,
+    sfWarehouse=SNOWFLAKE_WAREHOUSE
+)
 
 # Configure logging
 import logging
@@ -44,6 +67,7 @@ def get_snowflake_connection():
             database=SNOWFLAKE_DATABASE,
             schema=SNOWFLAKE_SCHEMA
         )
+        logger.info(f"Successfully connected to Snowflake: {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}")
         return conn
     except Exception as e:
         logger.error(f"Failed to connect to Snowflake: {e}")
@@ -57,7 +81,7 @@ def fetch_certificates_from_snowflake() -> pd.DataFrame:
         SELECT DISTINCT certificate_arn, certificate_id, nominal_issuer, 
                not_valid_before_utc_timestamp, not_valid_after_utc_timestamp,
                last_usage_observation_utc_timestamp
-        FROM certificate_catalog_certificate_usage 
+        FROM CYBR_DB.PHDP_CYBR.certificate_catalog_certificate_usage 
         WHERE certificate_arn LIKE '%arn:aws:acm%' 
           AND nominal_issuer = 'Amazon' 
           AND not_valid_after_utc_timestamp >= DATEADD('DAY', -365, CURRENT_TIMESTAMP)
