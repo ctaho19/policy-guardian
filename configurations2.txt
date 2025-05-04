@@ -1,410 +1,355 @@
-import pandas as pd
-import pytest
-from datetime import datetime
-from pl_automated_monitoring_machine_iam import pipeline
-from unittest.mock import patch, MagicMock
+import os
+import time
 import json
+import pandas as pd
+import requests
+import snowflake.connector
+from datetime import datetime
+from typing import Dict, List, Set, Tuple, Optional, Any
 
-# --- Test Setup ---
+# API details
+API_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
+API_HEADERS = {
+    'Accept': 'application/json;v=1.0',
+    'Authorization': 'Bearer YOUR_API_TOKEN',  # Replace with actual token
+    'Content-Type': 'application/json'
+}
+API_CALL_DELAY = 0.15  # Delay between API calls to avoid rate limits
+API_TIMEOUT = 60  # Timeout for API calls
 
-# Use the same control configs as the pipeline for consistency in tests
-CONTROL_CONFIGS = pipeline.CONTROL_CONFIGS
+# Snowflake connection parameters (using environment variables or placeholders)
+SNOWFLAKE_USER = os.environ.get("SNOWFLAKE_USER", "YOUR_USERNAME")
+SNOWFLAKE_PASSWORD = os.environ.get("SNOWFLAKE_PASSWORD", "YOUR_PASSWORD")
+SNOWFLAKE_ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "cptlone-sfprod")
+SNOWFLAKE_DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "CYBR_DB")
+SNOWFLAKE_SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA", "PHDP_CYBR")
+SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE", "CYBR_Q_DI_WH")
 
-# Expected fields in the output DataFrame based on the Avro schema
-AVRO_FIELDS = [
-    "date",
-    "control_id",
-    "monitoring_metric_id",
-    "monitoring_metric_value",
-    "compliance_status",
-    "numerator",
-    "denominator",
-    "non_compliant_resources",
-]
+# Configure logging
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# --- Mock Data Helper Functions ---
+def get_snowflake_connection():
+    """Establish a connection to Snowflake."""
+    try:
+        conn = snowflake.connector.connect(
+            user=SNOWFLAKE_USER,
+            password=SNOWFLAKE_PASSWORD,
+            account=SNOWFLAKE_ACCOUNT,
+            warehouse=SNOWFLAKE_WAREHOUSE,
+            database=SNOWFLAKE_DATABASE,
+            schema=SNOWFLAKE_SCHEMA
+        )
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to connect to Snowflake: {e}")
+        raise
 
-def _mock_thresholds_df():
-    """Creates a mock DataFrame with monitoring thresholds for different metrics."""
-    return pd.DataFrame([
-        {"monitoring_metric_id": "T1", "alerting_threshold": 95.0, "warning_threshold": 97.0},
-        {"monitoring_metric_id": "T2", "alerting_threshold": 90.0, "warning_threshold": 95.0},
-        {"monitoring_metric_id": "T3", "alerting_threshold": 80.0, "warning_threshold": 90.0},
-    ])
+def fetch_certificates_from_snowflake() -> pd.DataFrame:
+    """Fetch certificates from Snowflake based on the provided query."""
+    conn = get_snowflake_connection()
+    try:
+        query = """
+        SELECT DISTINCT certificate_arn, certificate_id, nominal_issuer, 
+               not_valid_before_utc_timestamp, not_valid_after_utc_timestamp,
+               last_usage_observation_utc_timestamp
+        FROM certificate_catalog_certificate_usage 
+        WHERE certificate_arn LIKE '%arn:aws:acm%' 
+          AND nominal_issuer = 'Amazon' 
+          AND not_valid_after_utc_timestamp >= DATEADD('DAY', -365, CURRENT_TIMESTAMP)
+        """
+        logger.info("Fetching certificates from Snowflake...")
+        df = pd.read_sql(query, conn)
+        logger.info(f"Retrieved {len(df)} certificates from Snowflake")
+        return df
+    except Exception as e:
+        logger.error(f"Error fetching certificates from Snowflake: {e}")
+        raise
+    finally:
+        conn.close()
 
-def _mock_all_iam_roles():
-    """Creates a mock DataFrame representing IAM roles, including machine and human roles."""
-    return pd.DataFrame([
-        {"RESOURCE_ID": "r1", "AMAZON_RESOURCE_NAME": "arn:1", "ROLE_TYPE": "MACHINE"},
-        {"RESOURCE_ID": "r2", "AMAZON_RESOURCE_NAME": "arn:2", "ROLE_TYPE": "MACHINE"},
-        {"RESOURCE_ID": "r3", "AMAZON_RESOURCE_NAME": "arn:3", "ROLE_TYPE": "MACHINE"},
-        {"RESOURCE_ID": "r4", "AMAZON_RESOURCE_NAME": "arn:4", "ROLE_TYPE": "HUMAN"},
-    ])
+def fetch_certificates_from_api(payload: Dict) -> List[Dict]:
+    """Fetch certificates from the AWS Tooling API with pagination."""
+    all_certificates = []
+    next_record_key = None
+    page_count = 0
+    
+    logger.info(f"Fetching certificates from API with payload: {json.dumps(payload, indent=2)}")
+    
+    while True:
+        page_count += 1
+        current_url = API_URL
+        params = {'limit': 10000}
+        
+        if next_record_key:
+            params['nextRecordKey'] = next_record_key
+        
+        try:
+            logger.info(f"Fetching page {page_count} from API...")
+            response = requests.post(
+                current_url, 
+                headers=API_HEADERS, 
+                json=payload,
+                params=params,
+                timeout=API_TIMEOUT, 
+                verify=False
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            certificates = data.get('resourceConfigurations', [])
+            logger.info(f"Retrieved {len(certificates)} certificates from page {page_count}")
+            all_certificates.extend(certificates)
+            
+            next_record_key = data.get('nextRecordKey')
+            if not next_record_key:
+                logger.info("No more pages to fetch")
+                break
+                
+            # Sleep to avoid rate limits
+            time.sleep(API_CALL_DELAY)
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed on page {page_count}: {e}")
+            # Continue with certificates fetched so far
+            break
+    
+    logger.info(f"Total certificates fetched from API: {len(all_certificates)}")
+    return all_certificates
 
-def _mock_evaluated_roles_all():
-    """Creates a mock DataFrame representing evaluated roles, all compliant."""
-    return pd.DataFrame([
-        {"RESOURCE_NAME": "arn:1", "COMPLIANCE_STATUS": "Compliant"},
-        {"RESOURCE_NAME": "arn:2", "COMPLIANCE_STATUS": "Compliant"},
-        {"RESOURCE_NAME": "arn:3", "COMPLIANCE_STATUS": "Compliant"},
-    ])
+def extract_certificate_data(certificates: List[Dict]) -> pd.DataFrame:
+    """Extract relevant data from the certificate configurations."""
+    extracted_data = []
+    
+    for cert in certificates:
+        cert_data = {
+            'amazonResourceName': cert.get('amazonResourceName', ''),
+            'resourceId': cert.get('resourceId', ''),
+            'awsAccountId': cert.get('awsAccountId', ''),
+            'awsRegion': cert.get('awsRegion', ''),
+            'businessApplicationName': cert.get('businessApplicationName', ''),
+            'environment': cert.get('environment', ''),
+            'source': cert.get('source', '')
+        }
+        
+        # Extract values from configuration lists
+        config_list = cert.get('configurationList', [])
+        for config in config_list:
+            name = config.get('configurationName', '')
+            value = config.get('configurationValue', '')
+            # Create a flattened column for each configuration
+            cert_data[name] = value
+            
+        # Extract values from supplementary configuration lists
+        supp_config = cert.get('supplementaryConfiguration', [])
+        for config in supp_config:
+            name = config.get('supplementaryConfigurationName', '')
+            value = config.get('supplementaryConfigurationValue', '')
+            # Create a flattened column for each supplementary configuration
+            cert_data[name] = value
+            
+        extracted_data.append(cert_data)
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(extracted_data)
+    return df
 
-def _mock_evaluated_roles_some():
-    """Creates a mock DataFrame representing evaluated roles, with some non-compliant."""
-    return pd.DataFrame([
-        {"RESOURCE_NAME": "arn:1", "COMPLIANCE_STATUS": "Compliant"},
-        {"RESOURCE_NAME": "arn:2", "COMPLIANCE_STATUS": "NonCompliant"},
-    ])
+def identify_common_attributes(df_snowflake: pd.DataFrame, df_api: pd.DataFrame) -> Dict:
+    """Identify common attributes between dataset and API certificates."""
+    # Extract just the ARNs for comparison
+    snowflake_arns = set(df_snowflake['certificate_arn'].str.lower())
+    api_arns = set(df_api['amazonResourceName'].str.lower())
+    
+    # Find matching and non-matching ARNs
+    matching_arns = snowflake_arns.intersection(api_arns)
+    api_only_arns = api_arns - matching_arns
+    snowflake_only_arns = snowflake_arns - matching_arns
+    
+    logger.info(f"Matching ARNs: {len(matching_arns)}")
+    logger.info(f"API-only ARNs: {len(api_only_arns)}")
+    logger.info(f"Snowflake-only ARNs: {len(snowflake_only_arns)}")
+    
+    # Filter DataFrames to get only matching and non-matching records
+    df_api_matching = df_api[df_api['amazonResourceName'].str.lower().isin(matching_arns)]
+    df_api_non_matching = df_api[df_api['amazonResourceName'].str.lower().isin(api_only_arns)]
+    
+    # Analyze configurations that might differentiate between matching and non-matching
+    differences = {}
+    common_configurations = {}
+    
+    # Only look at columns that have more than 5% non-null values
+    relevant_columns = [col for col in df_api.columns if df_api[col].notna().mean() > 0.05]
+    
+    for col in relevant_columns:
+        if col in ['amazonResourceName', 'resourceId']:  # Skip identifier columns
+            continue
+            
+        # Get unique values for matching certificates
+        if len(df_api_matching) > 0:
+            matching_values = set(df_api_matching[col].dropna().unique())
+        else:
+            matching_values = set()
+            
+        # Get unique values for non-matching certificates
+        if len(df_api_non_matching) > 0:
+            non_matching_values = set(df_api_non_matching[col].dropna().unique())
+        else:
+            non_matching_values = set()
+            
+        # Check if there are differences in values
+        if matching_values and (matching_values != non_matching_values):
+            # Find values that are common in the matching set but rare in the non-matching set
+            distinctive_values = [v for v in matching_values if v and 
+                                 ((v not in non_matching_values) or 
+                                  (df_api_matching[col] == v).mean() > (df_api_non_matching[col] == v).mean() * 3)]
+            
+            if distinctive_values:
+                differences[col] = {
+                    "matching_values": list(matching_values),
+                    "non_matching_values": list(non_matching_values),
+                    "distinctive_values": distinctive_values
+                }
+                
+                # Look for common values in the matching set
+                common_value = None
+                if len(set(df_api_matching[col].dropna())) == 1:
+                    common_value = df_api_matching[col].dropna().iloc[0]
+                elif df_api_matching[col].dropna().value_counts().index[0] == df_api_matching[col].dropna().value_counts().index[0]:
+                    # If most common value appears in >80% of matching records
+                    most_common = df_api_matching[col].value_counts(normalize=True).index[0]
+                    if df_api_matching[col].value_counts(normalize=True).iloc[0] > 0.8:
+                        common_value = most_common
+                
+                if common_value:
+                    common_configurations[col] = common_value
+    
+    return {
+        "matching_count": len(matching_arns),
+        "api_only_count": len(api_only_arns),
+        "snowflake_only_count": len(snowflake_only_arns),
+        "differences": differences,
+        "common_configurations": common_configurations
+    }
 
-def _mock_evaluated_roles_none():
-    """Creates an empty mock DataFrame representing no evaluated roles."""
-    return pd.DataFrame([])
+def suggest_api_payload(analysis_results: Dict) -> Dict:
+    """Suggest an improved API payload based on analysis results."""
+    # Start with the basic payload
+    suggested_payload = {
+        "searchParameters": [
+            {
+                "resourceType": "AWS::ACM::Certificate",
+                "configurationItems": [
+                    {
+                        "configurationName": "issuer",
+                        "configurationValue": "Amazon"
+                    }
+                ]
+            }
+        ]
+    }
+    
+    # Add additional configurations that seem to be common across dataset certificates
+    common_configs = analysis_results.get("common_configurations", {})
+    for config_name, config_value in common_configs.items():
+        # Skip if already present
+        if config_name in ['issuer']:
+            continue
+            
+        # Check if it's a configuration item or a top-level attribute
+        if config_name.startswith("configuration."):
+            # Add as a configuration item
+            suggested_payload["searchParameters"][0]["configurationItems"].append({
+                "configurationName": config_name,
+                "configurationValue": config_value
+            })
+        elif config_name.startswith("supplementaryConfiguration."):
+            # Add as a supplementary configuration item
+            if "supplementaryConfigurationItems" not in suggested_payload["searchParameters"][0]:
+                suggested_payload["searchParameters"][0]["supplementaryConfigurationItems"] = []
+            
+            suggested_payload["searchParameters"][0]["supplementaryConfigurationItems"].append({
+                "supplementaryConfigurationName": config_name,
+                "supplementaryConfigurationValue": config_value
+            })
+        else:
+            # Add as a top-level attribute (like businessApplicationName)
+            suggested_payload["searchParameters"][0][config_name] = config_value
+    
+    return suggested_payload
 
-def _mock_evaluated_roles_with_compliance():
-    """Creates a mock DataFrame representing evaluated roles with compliance status for tier 3 metrics."""
-    return pd.DataFrame([
-        {"RESOURCE_ID": "r1", "AMAZON_RESOURCE_NAME": "arn:1", "COMPLIANCE_STATUS": "NonCompliant"},
-        {"RESOURCE_ID": "r2", "AMAZON_RESOURCE_NAME": "arn:2", "COMPLIANCE_STATUS": "Compliant"},
-        {"RESOURCE_ID": "r3", "AMAZON_RESOURCE_NAME": "arn:3", "COMPLIANCE_STATUS": "NonCompliant"},
-    ])
+def main():
+    # 1. Fetch certificates from Snowflake
+    try:
+        df_snowflake = fetch_certificates_from_snowflake()
+    except Exception as e:
+        logger.error(f"Failed to fetch Snowflake data: {e}")
+        df_snowflake = pd.DataFrame()
+    
+    # 2. Fetch certificates from API with initial payload
+    initial_payload = {
+        "searchParameters": [
+            {
+                "resourceType": "AWS::ACM::Certificate",
+                "configurationItems": [
+                    {
+                        "configurationName": "issuer",
+                        "configurationValue": "Amazon"
+                    }
+                ]
+            }
+        ]
+    }
+    
+    try:
+        api_certificates = fetch_certificates_from_api(initial_payload)
+        df_api = extract_certificate_data(api_certificates)
+    except Exception as e:
+        logger.error(f"Failed to fetch API data: {e}")
+        df_api = pd.DataFrame()
+    
+    # 3. Compare and analyze certificates
+    if not df_snowflake.empty and not df_api.empty:
+        analysis_results = identify_common_attributes(df_snowflake, df_api)
+        
+        # 4. Suggest improved API payload
+        suggested_payload = suggest_api_payload(analysis_results)
+        
+        # 5. Print results
+        logger.info("\n=== Analysis Results ===")
+        logger.info(f"Matching certificates: {analysis_results['matching_count']}")
+        logger.info(f"API-only certificates: {analysis_results['api_only_count']}")
+        logger.info(f"Snowflake-only certificates: {analysis_results['snowflake_only_count']}")
+        
+        logger.info("\n=== Common Configurations ===")
+        for config, value in analysis_results['common_configurations'].items():
+            logger.info(f"{config}: {value}")
+        
+        logger.info("\n=== Suggested API Payload ===")
+        logger.info(json.dumps(suggested_payload, indent=2))
+        
+        # 6. Save results to files
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save suggested payload
+        with open(f"suggested_payload_{timestamp}.json", "w") as f:
+            json.dump(suggested_payload, indent=2, fp=f)
+            
+        # Save analysis results
+        with open(f"analysis_results_{timestamp}.json", "w") as f:
+            # Convert sets to lists for JSON serialization
+            serializable_results = {
+                k: v if not isinstance(v, set) else list(v) 
+                for k, v in analysis_results.items()
+            }
+            json.dump(serializable_results, indent=2, fp=f)
+        
+        logger.info(f"\nResults saved to suggested_payload_{timestamp}.json and analysis_results_{timestamp}.json")
+    else:
+        logger.error("Cannot perform analysis because one or both datasets are empty")
 
-def _mock_sla_data():
-    """Creates a mock DataFrame representing SLA data for non-compliant resources."""
-    now = pd.Timestamp.utcnow()
-    return pd.DataFrame([
-        {"RESOURCE_ID": "r1", "CONTROL_RISK": "High", "OPEN_DATE_UTC_TIMESTAMP": now - pd.Timedelta(days=10)},
-        {"RESOURCE_ID": "r3", "CONTROL_RISK": "High", "OPEN_DATE_UTC_TIMESTAMP": now - pd.Timedelta(days=40)},
-    ])
-
-def _mock_thresholds(ctrl_id, metric_ids):
-    """Creates a mock DataFrame with monitoring thresholds for specified control and metric IDs."""
-    rows = []
-    for tier, metric_id in metric_ids.items():
-        rows.append({
-            "monitoring_metric_id": metric_id,
-            "control_id": ctrl_id,
-            "monitoring_metric_tier": f"Tier {tier[-1]}",
-            "warning_threshold": 97.0 if tier == "tier1" else 95.0,
-            "alerting_threshold": 95.0 if tier == "tier1" else 90.0,
-        })
-    return pd.DataFrame(rows)
-
-def _mock_iam_roles(n=3):
-    """Creates a mock DataFrame with n machine IAM roles and one human role."""
-    return pd.DataFrame([
-        {"RESOURCE_ID": f"r{i+1}", "AMAZON_RESOURCE_NAME": f"arn:{i+1}", "ROLE_TYPE": "MACHINE"} for i in range(n)
-    ] + [{"RESOURCE_ID": "rH", "AMAZON_RESOURCE_NAME": "arn:H", "ROLE_TYPE": "HUMAN"}])
-
-def _mock_evaluated_roles(ctrl_id, compliant=2, noncompliant=1):
-    """Creates a mock DataFrame with evaluated roles, specifying compliant and non-compliant counts."""
-    rows = []
-    for i in range(compliant):
-        rows.append({"resource_name": f"arn:{i+1}", "compliance_status": "Compliant", "control_id": ctrl_id})
-    for i in range(noncompliant):
-        rows.append({"resource_name": f"arn:{compliant+i+1}", "compliance_status": "NonCompliant", "control_id": ctrl_id})
-    return pd.DataFrame(rows)
-
-def _mock_sla_data(resource_ids, days_open_list, risk_list):
-    """Creates a mock DataFrame with SLA data for non-compliant resources, specifying days open and risk."""
-    now = pd.Timestamp.utcnow()
-    rows = []
-    for rid, days_open, risk in zip(resource_ids, days_open_list, risk_list):
-        rows.append({
-            "RESOURCE_ID": rid,
-            "CONTROL_RISK": risk,
-            "OPEN_DATE_UTC_TIMESTAMP": now - pd.Timedelta(days=days_open),
-        })
-    return pd.DataFrame(rows)
-
-def _mock_empty_df(cols):
-    """Creates an empty DataFrame with specified columns."""
-    return pd.DataFrame(columns=cols)
-
-# --- Validation Helper ---
-
-def _validate_avro_schema(df):
-    """Validates that a DataFrame conforms to the expected Avro schema structure and data types."""
-    assert list(df.columns) == AVRO_FIELDS
-    assert df["date"].dtype in ["int64", "int32"]
-    assert df["control_id"].dtype == object
-    assert df["monitoring_metric_id"].dtype in ["int64", "int32"]
-    assert df["monitoring_metric_value"].dtype in ["float64", "float32"]
-    assert df["compliance_status"].dtype == object
-    assert df["numerator"].dtype in ["int64", "int32"]
-    assert df["denominator"].dtype in ["int64", "int32"]
-    assert all(isinstance(x, (type(None), list)) for x in df["non_compliant_resources"])
-
-# --- Test Cases ---
-
-def test_tier1_all_evaluated():
-    """Tests Tier 1 metric calculation when all roles are evaluated and compliant."""
-    df = pipeline.calculate_tier1_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        all_iam_roles=_mock_all_iam_roles(),
-        evaluated_roles=_mock_evaluated_roles_all(),
-        ctrl_id="CTRL-1074653",
-        tier1_metric_id="T1",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 100.0
-    assert df.iloc[0]["compliance_status"] == "Green"
-    assert df.iloc[0]["numerator"] == 3
-    assert df.iloc[0]["denominator"] == 3
-
-def test_tier1_some_evaluated():
-    """Tests Tier 1 metric calculation when some roles are evaluated, with mixed compliance."""
-    df = pipeline.calculate_tier1_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        all_iam_roles=_mock_all_iam_roles(),
-        evaluated_roles=_mock_evaluated_roles_some(),
-        ctrl_id="CTRL-1074653",
-        tier1_metric_id="T1",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 66.67
-    assert df.iloc[0]["compliance_status"] == "Red"
-    assert df.iloc[0]["numerator"] == 2
-    assert df.iloc[0]["denominator"] == 3
-
-def test_tier1_none_evaluated():
-    """Tests Tier 1 metric calculation when no roles are evaluated."""
-    df = pipeline.calculate_tier1_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        all_iam_roles=_mock_all_iam_roles(),
-        evaluated_roles=_mock_evaluated_roles_none(),
-        ctrl_id="CTRL-1074653",
-        tier1_metric_id="T1",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 0.0
-    assert df.iloc[0]["compliance_status"] == "Red"
-    assert df.iloc[0]["numerator"] == 0
-    assert df.iloc[0]["denominator"] == 3
-
-def test_tier2_all_compliant():
-    """Tests Tier 2 metric calculation when all evaluated roles are compliant."""
-    df = pipeline.calculate_tier2_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        all_iam_roles=_mock_all_iam_roles(),
-        evaluated_roles=_mock_evaluated_roles_all(),
-        ctrl_id="CTRL-1074653",
-        tier2_metric_id="T2",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 100.0
-    assert df.iloc[0]["compliance_status"] == "Green"
-    assert df.iloc[0]["numerator"] == 3
-    assert df.iloc[0]["denominator"] == 3
-
-def test_tier2_some_compliant():
-    """Tests Tier 2 metric calculation with a mix of compliant and non-compliant roles."""
-    df = pipeline.calculate_tier2_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        all_iam_roles=_mock_all_iam_roles(),
-        evaluated_roles=_mock_evaluated_roles_some(),
-        ctrl_id="CTRL-1074653",
-        tier2_metric_id="T2",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 33.33
-    assert df.iloc[0]["compliance_status"] == "Red"
-    assert df.iloc[0]["numerator"] == 1
-    assert df.iloc[0]["denominator"] == 3
-
-def test_tier2_none_compliant():
-    """Tests Tier 2 metric calculation when no roles are compliant."""
-    df = pipeline.calculate_tier2_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        all_iam_roles=_mock_all_iam_roles(),
-        evaluated_roles=_mock_evaluated_roles_none(),
-        ctrl_id="CTRL-1074653",
-        tier2_metric_id="T2",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 0.0
-    assert df.iloc[0]["compliance_status"] == "Red"
-    assert df.iloc[0]["numerator"] == 0
-    assert df.iloc[0]["denominator"] == 3
-
-def test_tier3_within_and_past_sla():
-    """Tests Tier 3 metric calculation with non-compliant roles both within and past SLA."""
-    df = pipeline.calculate_tier3_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        evaluated_roles_with_compliance=_mock_evaluated_roles_with_compliance(),
-        sla_data=_mock_sla_data(),
-        ctrl_id="CTRL-1074653",
-        tier3_metric_id="T3",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 50.0
-    assert df.iloc[0]["compliance_status"] == "Red"
-    assert df.iloc[0]["numerator"] == 1
-    assert df.iloc[0]["denominator"] == 2
-
-def test_tier3_all_within_sla():
-    """Tests Tier 3 metric calculation when all non-compliant roles are within SLA."""
-    sla_data = _mock_sla_data().copy()
-    sla_data.loc[0, "OPEN_DATE_UTC_TIMESTAMP"] = pd.Timestamp.utcnow() - pd.Timedelta(days=5)
-    sla_data.loc[1, "OPEN_DATE_UTC_TIMESTAMP"] = pd.Timestamp.utcnow() - pd.Timedelta(days=5)
-    df = pipeline.calculate_tier3_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        evaluated_roles_with_compliance=_mock_evaluated_roles_with_compliance(),
-        sla_data=sla_data,
-        ctrl_id="CTRL-1074653",
-        tier3_metric_id="T3",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 100.0
-    assert df.iloc[0]["compliance_status"] == "Green"
-    assert df.iloc[0]["numerator"] == 2
-    assert df.iloc[0]["denominator"] == 2
-
-def test_tier3_none_noncompliant():
-    """Tests Tier 3 metric calculation when there are no non-compliant roles."""
-    df = pipeline.calculate_tier3_metrics(
-        thresholds_raw=_mock_thresholds_df(),
-        evaluated_roles_with_compliance=pd.DataFrame([
-            {"RESOURCE_ID": "r2", "AMAZON_RESOURCE_NAME": "arn:2", "COMPLIANCE_STATUS": "Compliant"},
-        ]),
-        sla_data=_mock_sla_data(),
-        ctrl_id="CTRL-1074653",
-        tier3_metric_id="T3",
-    )
-    assert df.iloc[0]["monitoring_metric_value"] == 100.0
-    assert df.iloc[0]["compliance_status"] == "Green"
-    assert df.iloc[0]["numerator"] == 0
-    assert df.iloc[0]["denominator"] == 0
-
-def test_tier1_tier2_all_compliant():
-    """Tests combined Tier 1 and Tier 2 calculations when all evaluated roles are compliant."""
-    ctrl = CONTROL_CONFIGS[0]
-    thresholds = _mock_thresholds(ctrl["ctrl_id"], ctrl["metric_ids"])
-    iam_roles = _mock_iam_roles(3)
-    evaluated_roles = _mock_evaluated_roles(ctrl["cloud_control_id"], compliant=3, noncompliant=0)
-    df = pipeline.calculate_machine_iam_metrics(
-        thresholds_raw=thresholds,
-        iam_roles=iam_roles,
-        evaluated_roles=evaluated_roles,
-        ctrl_id=ctrl["ctrl_id"],
-        metric_ids=ctrl["metric_ids"],
-        requires_tier3=ctrl["requires_tier3"],
-        sla_data=_mock_empty_df(["RESOURCE_ID", "CONTROL_RISK", "OPEN_DATE_UTC_TIMESTAMP"]),
-    )
-    _validate_avro_schema(df)
-    assert all(df["compliance_status"] == "Green")
-    assert all(df["monitoring_metric_value"] == 100.0)
-    assert all(x is None for x in df["non_compliant_resources"])
-
-def test_tier1_tier2_some_noncompliant():
-    """Tests combined Tier 1 and Tier 2 calculations with a mix of compliant and non-compliant roles."""
-    ctrl = CONTROL_CONFIGS[0]
-    thresholds = _mock_thresholds(ctrl["ctrl_id"], ctrl["metric_ids"])
-    iam_roles = _mock_iam_roles(3)
-    evaluated_roles = _mock_evaluated_roles(ctrl["cloud_control_id"], compliant=2, noncompliant=1)
-    df = pipeline.calculate_machine_iam_metrics(
-        thresholds_raw=thresholds,
-        iam_roles=iam_roles,
-        evaluated_roles=evaluated_roles,
-        ctrl_id=ctrl["ctrl_id"],
-        metric_ids=ctrl["metric_ids"],
-        requires_tier3=ctrl["requires_tier3"],
-        sla_data=_mock_empty_df(["RESOURCE_ID", "CONTROL_RISK", "OPEN_DATE_UTC_TIMESTAMP"]),
-    )
-    _validate_avro_schema(df)
-    assert df.iloc[0]["compliance_status"] == "Red"  # Tier 1 (all roles evaluated)
-    assert df.iloc[1]["compliance_status"] == "Red"  # Tier 2 (some non-compliant)
-    assert isinstance(df.iloc[0]["non_compliant_resources"], list)
-    assert isinstance(df.iloc[1]["non_compliant_resources"], list)
-
-def test_tier3_within_and_past_sla():
-    """Tests Tier 3 calculation with non-compliant roles both within and past SLA in a full pipeline run."""
-    ctrl = CONTROL_CONFIGS[0]
-    thresholds = _mock_thresholds(ctrl["ctrl_id"], ctrl["metric_ids"])
-    iam_roles = _mock_iam_roles(3)
-    evaluated_roles = _mock_evaluated_roles(ctrl["cloud_control_id"], compliant=1, noncompliant=2)
-    sla_data = _mock_sla_data(["r2", "r3"], [10, 40], ["High", "High"])
-    df = pipeline.calculate_machine_iam_metrics(
-        thresholds_raw=thresholds,
-        iam_roles=iam_roles,
-        evaluated_roles=evaluated_roles,
-        ctrl_id=ctrl["ctrl_id"],
-        metric_ids=ctrl["metric_ids"],
-        requires_tier3=ctrl["requires_tier3"],
-        sla_data=sla_data,
-    )
-    _validate_avro_schema(df)
-    assert df.iloc[2]["monitoring_metric_value"] == 50.0
-    assert df.iloc[2]["compliance_status"] == "Red"
-    assert isinstance(df.iloc[2]["non_compliant_resources"], list)
-    for ev in df.iloc[2]["non_compliant_resources"]:
-        ev_dict = json.loads(ev)
-        assert "SLA_STATUS" in ev_dict
-
-def test_tier3_all_within_sla():
-    """Tests Tier 3 calculation when all non-compliant roles are within SLA in a full pipeline run."""
-    ctrl = CONTROL_CONFIGS[0]
-    thresholds = _mock_thresholds(ctrl["ctrl_id"], ctrl["metric_ids"])
-    iam_roles = _mock_iam_roles(3)
-    evaluated_roles = _mock_evaluated_roles(ctrl["cloud_control_id"], compliant=1, noncompliant=2)
-    sla_data = _mock_sla_data(["r2", "r3"], [5, 5], ["High", "High"])
-    df = pipeline.calculate_machine_iam_metrics(
-        thresholds_raw=thresholds,
-        iam_roles=iam_roles,
-        evaluated_roles=evaluated_roles,
-        ctrl_id=ctrl["ctrl_id"],
-        metric_ids=ctrl["metric_ids"],
-        requires_tier3=ctrl["requires_tier3"],
-        sla_data=sla_data,
-    )
-    _validate_avro_schema(df)
-    assert df.iloc[2]["monitoring_metric_value"] == 100.0
-    assert df.iloc[2]["compliance_status"] == "Green"
-    assert df.iloc[2]["non_compliant_resources"] is None
-
-def test_tier3_none_noncompliant():
-    """Tests Tier 3 calculation when there are no non-compliant roles in a full pipeline run."""
-    ctrl = CONTROL_CONFIGS[0]
-    thresholds = _mock_thresholds(ctrl["ctrl_id"], ctrl["metric_ids"])
-    iam_roles = _mock_iam_roles(3)
-    evaluated_roles = _mock_evaluated_roles(ctrl["cloud_control_id"], compliant=3, noncompliant=0)
-    sla_data = _mock_empty_df(["RESOURCE_ID", "CONTROL_RISK", "OPEN_DATE_UTC_TIMESTAMP"])
-    df = pipeline.calculate_machine_iam_metrics(
-        thresholds_raw=thresholds,
-        iam_roles=iam_roles,
-        evaluated_roles=evaluated_roles,
-        ctrl_id=ctrl["ctrl_id"],
-        metric_ids=ctrl["metric_ids"],
-        requires_tier3=ctrl["requires_tier3"],
-        sla_data=sla_data,
-    )
-    _validate_avro_schema(df)
-    assert df.iloc[2]["monitoring_metric_value"] == 100.0
-    assert df.iloc[2]["compliance_status"] == "Green"
-    assert df.iloc[2]["non_compliant_resources"] is None
-
-def test_pipeline_run_entrypoint(monkeypatch):
-    """Tests the main pipeline transform stage by mocking database calls to simulate a full run."""
-    class MockSnowflake:
-        """Mocks the Snowflake connector query method to return mock data based on query type."""
-        def query(self, sql):
-            if "monitoring_thresholds" in sql:
-                return _mock_thresholds("CTRL-1074653", {"tier1": 1, "tier2": 2, "tier3": 3})
-            elif "iam_roles" in sql:
-                return _mock_iam_roles(3)
-            elif "evaluated_roles" in sql:
-                return _mock_evaluated_roles("AC-3.AWS.39.v02", compliant=2, noncompliant=1)
-            elif "sla_data" in sql or "OZONE_NON_COMPLIANT_RESOURCES_TCRD_VIEW_V01" in sql:
-                return _mock_sla_data(["r3"], [10], ["High"])
-            return pd.DataFrame()
-
-    class MockEnv:
-        """Mocks the environment object with a Snowflake connector and exchange configuration."""
-        def __init__(self):
-            self.snowflake = MockSnowflake()
-            self.exchange = MagicMock()
-            self.exchange.client_id = "id"
-            self.exchange.client_secret = "secret"
-            self.exchange.exchange_url = "url"
-
-    monkeypatch.setattr(pipeline, "CONTROL_CONFIGS", [CONTROL_CONFIGS[0]])
-    env = MockEnv()
-    with patch.object(pipeline.PLAutomatedMonitoringMachineIAM, "_execute_sql", side_effect=MockSnowflake().query) as mock_sql:
-        pipe = pipeline.PLAutomatedMonitoringMachineIAM(env)
-        pipe.transform()
-        assert mock_sql.call_count >= 3
-        df = pipe.context["monitoring_metrics"]
-        _validate_avro_schema(df)
-        assert not df.empty
-        assert len(df) == 3
+if __name__ == "__main__":
+    main()
