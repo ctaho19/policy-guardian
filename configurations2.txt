@@ -457,9 +457,9 @@ def main():
         
         print(f"\nResults saved to /tmp/suggested_payload.json")
         
-        # Create a temporary view for easier SQL access
-        df_snowflake.createOrReplaceTempView("snowflake_certificates")
-        df_api.createOrReplaceTempView("api_certificates")
+        # Cache dataframes for faster access without creating temporary views
+        df_snowflake.cache()
+        df_api.cache()
         
         return {
             "snowflake_df": df_snowflake,
