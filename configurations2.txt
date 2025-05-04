@@ -1,11 +1,11 @@
 import os
 import time
 import json
-import pandas as pd
 import requests
 from datetime import datetime
 from typing import Dict, List, Set, Tuple, Optional, Any
-from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType
 
 # API details
 API_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
@@ -18,34 +18,18 @@ API_CALL_DELAY = 0.15  # Delay between API calls to avoid rate limits
 API_TIMEOUT = 60  # Timeout for API calls
 
 # Snowflake connection parameters using dbutils.secrets
-# Connecting to snowflake, necessary for querying metric thresholds
-try:
-    # Try to use databricks secrets if running in Databricks
-    import dbutils
-    username = dbutils.secrets.get(scope="sdd802_scope", key="eid") #NOTE: Using Aditya's scope
-    password = dbutils.secrets.get(scope="sdd802_scope", key="password")
-except:
-    # Fall back to environment variables if not in Databricks
-    username = os.environ.get("SNOWFLAKE_USER", "YOUR_USERNAME")
-    password = os.environ.get("SNOWFLAKE_PASSWORD", "YOUR_PASSWORD")
+username = dbutils.secrets.get(scope="uno201_scope", key="eid")
+password = dbutils.secrets.get(scope="uno201_scope", key="password")
 
 # Define Snowflake connection options
 SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
-SNOWFLAKE_USER = username
-SNOWFLAKE_PASSWORD = password
-SNOWFLAKE_ACCOUNT = "cptlone-sfprod"
-SNOWFLAKE_DATABASE = "SB"
-SNOWFLAKE_SCHEMA = "USER_SDD802"  # Using Aditya's credentials
-SNOWFLAKE_WAREHOUSE = "CYBR_Q_DI_WH"
-
-# Define Snowflake options dict for PySpark
 sfOptions = dict(
-    sfUrl= SNOWFLAKE_ACCOUNT, #REGION-SPECIFIC CONNECTION: prod.us-east-1.capitalone.snowflakecomputing.com",
+    sfUrl="prod.us-east-1.capitalone.snowflakecomputing.com",
     sfUser=username,
     sfPassword=password,
-    sfDatabase=SNOWFLAKE_DATABASE,
-    sfSchema=SNOWFLAKE_SCHEMA,
-    sfWarehouse=SNOWFLAKE_WAREHOUSE
+    sfDatabase="SB",
+    sfSchema="USER_UNO201",
+    sfWarehouse="CYBR_Q_DI_WH",
 )
 
 # Configure logging
@@ -56,28 +40,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def get_spark_session():
-    """Initialize or get an existing Spark session."""
-    try:
-        spark = SparkSession.builder.appName("CTRL-1077188-Analyzer").getOrCreate()
-        logger.info("Successfully initialized Spark session")
-        return spark
-    except Exception as e:
-        logger.error(f"Failed to initialize Spark session: {e}")
-        raise
-
-def fetch_certificates_from_snowflake() -> pd.DataFrame:
+def fetch_certificates_from_snowflake():
     """Fetch certificates from Snowflake using Spark."""
-    spark = get_spark_session()
     try:
         query = """
-        SELECT DISTINCT certificate_arn, certificate_id, nominal_issuer, 
-               not_valid_before_utc_timestamp, not_valid_after_utc_timestamp,
-               last_usage_observation_utc_timestamp
-        FROM CYBR_DB.PHDP_CYBR.certificate_catalog_certificate_usage 
-        WHERE certificate_arn LIKE '%arn:aws:acm%' 
-          AND nominal_issuer = 'Amazon' 
-          AND not_valid_after_utc_timestamp >= DATEADD('DAY', -365, CURRENT_TIMESTAMP)
+        SELECT DISTINCT 
+            CERTIFICATE_ARN, 
+            CERTIFICATE_ID, 
+            NOMINAL_ISSUER, 
+            NOT_VALID_BEFORE_UTC_TIMESTAMP, 
+            NOT_VALID_AFTER_UTC_TIMESTAMP, 
+            LAST_USAGE_OBSERVATION_UTC_TIMESTAMP
+        FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE 
+        WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%' 
+          AND NOMINAL_ISSUER = 'Amazon' 
+          AND NOT_VALID_AFTER_UTC_TIMESTAMP >= DATEADD('DAY', -365, CURRENT_TIMESTAMP)
         """
         logger.info("Fetching certificates from Snowflake using Spark...")
         
@@ -89,10 +66,11 @@ def fetch_certificates_from_snowflake() -> pd.DataFrame:
             .load()
         )
         
-        # Convert to Pandas DataFrame for ease of processing
-        df = snowflake_df.toPandas()
-        logger.info(f"Retrieved {len(df)} certificates from Snowflake")
-        return df
+        # Convert all column names to lowercase for consistency
+        snowflake_df = snowflake_df.toDF(*[c.lower() for c in snowflake_df.columns])
+        
+        logger.info(f"Retrieved {snowflake_df.count()} certificates from Snowflake")
+        return snowflake_df
     except Exception as e:
         logger.error(f"Error fetching certificates from Snowflake: {e}")
         raise
@@ -146,121 +124,206 @@ def fetch_certificates_from_api(payload: Dict) -> List[Dict]:
     logger.info(f"Total certificates fetched from API: {len(all_certificates)}")
     return all_certificates
 
-def extract_certificate_data(certificates: List[Dict]) -> pd.DataFrame:
-    """Extract relevant data from the certificate configurations."""
-    extracted_data = []
+def flatten_api_certificates(api_certificates: List[Dict]):
+    """
+    Convert API certificates list to a flattened Spark DataFrame
+    with a separate column for each configuration item.
+    """
+    if not api_certificates:
+        return spark.createDataFrame([], StructType([]))
     
-    for cert in certificates:
-        cert_data = {
-            'amazonResourceName': cert.get('amazonResourceName', ''),
-            'resourceId': cert.get('resourceId', ''),
-            'awsAccountId': cert.get('awsAccountId', ''),
-            'awsRegion': cert.get('awsRegion', ''),
-            'businessApplicationName': cert.get('businessApplicationName', ''),
-            'environment': cert.get('environment', ''),
-            'source': cert.get('source', '')
-        }
-        
-        # Extract values from configuration lists
-        config_list = cert.get('configurationList', [])
-        for config in config_list:
-            name = config.get('configurationName', '')
-            value = config.get('configurationValue', '')
-            # Create a flattened column for each configuration
-            cert_data[name] = value
-            
-        # Extract values from supplementary configuration lists
-        supp_config = cert.get('supplementaryConfiguration', [])
-        for config in supp_config:
-            name = config.get('supplementaryConfigurationName', '')
-            value = config.get('supplementaryConfigurationValue', '')
-            # Create a flattened column for each supplementary configuration
-            cert_data[name] = value
-            
-        extracted_data.append(cert_data)
+    # First, create a DataFrame from the top-level attributes
+    top_level_schema = StructType([
+        StructField("amazonResourceName", StringType(), True),
+        StructField("resourceId", StringType(), True),
+        StructField("awsAccountId", StringType(), True),
+        StructField("awsRegion", StringType(), True),
+        StructField("businessApplicationName", StringType(), True),
+        StructField("environment", StringType(), True),
+        StructField("source", StringType(), True),
+        StructField("configurationList", ArrayType(
+            StructType([
+                StructField("configurationName", StringType(), True),
+                StructField("configurationValue", StringType(), True)
+            ])
+        ), True),
+        StructField("supplementaryConfiguration", ArrayType(
+            StructType([
+                StructField("supplementaryConfigurationName", StringType(), True),
+                StructField("supplementaryConfigurationValue", StringType(), True)
+            ])
+        ), True)
+    ])
     
-    # Convert to DataFrame
-    df = pd.DataFrame(extracted_data)
-    return df
+    # Create a DataFrame from the API certificates
+    api_df = spark.createDataFrame(api_certificates, schema=top_level_schema)
+    
+    # Create a mapping of configurationName to column names, collecting all unique configuration names
+    config_names = set()
+    supp_config_names = set()
+    
+    for cert in api_certificates:
+        for config in cert.get("configurationList", []):
+            if "configurationName" in config:
+                config_names.add(config["configurationName"])
+        for config in cert.get("supplementaryConfiguration", []):
+            if "supplementaryConfigurationName" in config:
+                supp_config_names.add(config["supplementaryConfigurationName"])
+    
+    # Now, for each unique configuration name, create a new column in the DataFrame
+    flattened_df = api_df
+    
+    for config_name in config_names:
+        # Create a UDF to extract the configuration value for this configuration name
+        flattened_df = flattened_df.withColumn(
+            config_name,
+            F.expr(f"""
+                CASE
+                    WHEN configurationList IS NOT NULL THEN
+                        (SELECT configurationValue FROM (SELECT explode(configurationList) as config) 
+                         WHERE config.configurationName = '{config_name}' LIMIT 1)
+                    ELSE NULL
+                END
+            """)
+        )
+    
+    for config_name in supp_config_names:
+        # Create a UDF to extract the supplementary configuration value for this configuration name
+        flattened_df = flattened_df.withColumn(
+            config_name,
+            F.expr(f"""
+                CASE
+                    WHEN supplementaryConfiguration IS NOT NULL THEN
+                        (SELECT supplementaryConfigurationValue FROM (SELECT explode(supplementaryConfiguration) as config) 
+                         WHERE config.supplementaryConfigurationName = '{config_name}' LIMIT 1)
+                    ELSE NULL
+                END
+            """)
+        )
+    
+    # Drop the arrays since we've extracted the values
+    flattened_df = flattened_df.drop("configurationList", "supplementaryConfiguration")
+    
+    # Convert all column names to lowercase for consistency
+    flattened_df = flattened_df.toDF(*[c.lower() for c in flattened_df.columns])
+    
+    return flattened_df
 
-def identify_common_attributes(df_snowflake: pd.DataFrame, df_api: pd.DataFrame) -> Dict:
-    """Identify common attributes between dataset and API certificates."""
-    # Extract just the ARNs for comparison
-    snowflake_arns = set(df_snowflake['certificate_arn'].str.lower())
-    api_arns = set(df_api['amazonResourceName'].str.lower())
+def identify_common_attributes_spark(df_snowflake, df_api):
+    """Identify common attributes between dataset and API certificates using Spark."""
+    # Convert ARN columns to lowercase for consistency
+    df_snowflake = df_snowflake.withColumn("certificate_arn", F.lower(F.col("certificate_arn")))
+    df_api = df_api.withColumn("amazonresourcename", F.lower(F.col("amazonresourcename")))
     
-    # Find matching and non-matching ARNs
-    matching_arns = snowflake_arns.intersection(api_arns)
-    api_only_arns = api_arns - matching_arns
-    snowflake_only_arns = snowflake_arns - matching_arns
+    # Get counts for analysis
+    snowflake_count = df_snowflake.count()
+    api_count = df_api.count()
     
-    logger.info(f"Matching ARNs: {len(matching_arns)}")
-    logger.info(f"API-only ARNs: {len(api_only_arns)}")
-    logger.info(f"Snowflake-only ARNs: {len(snowflake_only_arns)}")
+    # Find matching certificates using a join
+    df_matching = df_api.join(
+        df_snowflake,
+        df_api.amazonresourcename == df_snowflake.certificate_arn,
+        "inner"
+    )
+    matching_count = df_matching.count()
     
-    # Filter DataFrames to get only matching and non-matching records
-    df_api_matching = df_api[df_api['amazonResourceName'].str.lower().isin(matching_arns)]
-    df_api_non_matching = df_api[df_api['amazonResourceName'].str.lower().isin(api_only_arns)]
+    # Find API-only and Snowflake-only certificates
+    df_api_only = df_api.join(
+        df_snowflake,
+        df_api.amazonresourcename == df_snowflake.certificate_arn,
+        "left_anti"  # Equivalent to NOT IN subquery
+    )
+    api_only_count = df_api_only.count()
+    
+    df_snowflake_only = df_snowflake.join(
+        df_api,
+        df_snowflake.certificate_arn == df_api.amazonresourcename,
+        "left_anti"  # Equivalent to NOT IN subquery
+    )
+    snowflake_only_count = df_snowflake_only.count()
+    
+    logger.info(f"Matching certificates: {matching_count}")
+    logger.info(f"API-only certificates: {api_only_count}")
+    logger.info(f"Snowflake-only certificates: {snowflake_only_count}")
     
     # Analyze configurations that might differentiate between matching and non-matching
     differences = {}
     common_configurations = {}
     
-    # Only look at columns that have more than 5% non-null values
-    relevant_columns = [col for col in df_api.columns if df_api[col].notna().mean() > 0.05]
+    # Only analyze columns that have reasonable, non-null values
+    # Skip identifier columns
+    skip_columns = ["amazonresourcename", "resourceid", "certificate_arn", "certificate_id"]
     
-    for col in relevant_columns:
-        if col in ['amazonResourceName', 'resourceId']:  # Skip identifier columns
+    # Get a list of all columns in the API DataFrame, excluding identifiers
+    api_columns = [col for col in df_api.columns if col not in skip_columns]
+    
+    for col in api_columns:
+        # Check if the column has a significant number of non-null values
+        non_null_count = df_api.filter(F.col(col).isNotNull()).count()
+        if non_null_count / api_count < 0.05:  # Skip columns with less than 5% non-null values
             continue
-            
+        
         # Get unique values for matching certificates
-        if len(df_api_matching) > 0:
-            matching_values = set(df_api_matching[col].dropna().unique())
+        if matching_count > 0:
+            matching_values = [row[col] for row in df_matching.select(col).distinct().filter(F.col(col).isNotNull()).collect()]
         else:
-            matching_values = set()
+            matching_values = []
             
         # Get unique values for non-matching certificates
-        if len(df_api_non_matching) > 0:
-            non_matching_values = set(df_api_non_matching[col].dropna().unique())
+        if api_only_count > 0:
+            non_matching_values = [row[col] for row in df_api_only.select(col).distinct().filter(F.col(col).isNotNull()).collect()]
         else:
-            non_matching_values = set()
-            
+            non_matching_values = []
+        
         # Check if there are differences in values
-        if matching_values and (matching_values != non_matching_values):
+        if matching_values and set(matching_values) != set(non_matching_values):
             # Find values that are common in the matching set but rare in the non-matching set
-            distinctive_values = [v for v in matching_values if v and 
-                                 ((v not in non_matching_values) or 
-                                  (df_api_matching[col] == v).mean() > (df_api_non_matching[col] == v).mean() * 3)]
+            distinctive_values = []
+            
+            for val in matching_values:
+                if val and (val not in non_matching_values or 
+                           (df_matching.filter(F.col(col) == val).count() / matching_count) > 
+                           (df_api_only.filter(F.col(col) == val).count() / api_only_count) * 3):
+                    distinctive_values.append(val)
             
             if distinctive_values:
                 differences[col] = {
-                    "matching_values": list(matching_values),
-                    "non_matching_values": list(non_matching_values),
+                    "matching_values": matching_values,
+                    "non_matching_values": non_matching_values,
                     "distinctive_values": distinctive_values
                 }
                 
                 # Look for common values in the matching set
                 common_value = None
-                if len(set(df_api_matching[col].dropna())) == 1:
-                    common_value = df_api_matching[col].dropna().iloc[0]
-                elif df_api_matching[col].dropna().value_counts().index[0] == df_api_matching[col].dropna().value_counts().index[0]:
-                    # If most common value appears in >80% of matching records
-                    most_common = df_api_matching[col].value_counts(normalize=True).index[0]
-                    if df_api_matching[col].value_counts(normalize=True).iloc[0] > 0.8:
-                        common_value = most_common
+                
+                # If there's only one unique value in matching certificates
+                if len(matching_values) == 1:
+                    common_value = matching_values[0]
+                else:
+                    # Get value counts to find the most common value
+                    value_counts = df_matching.groupBy(col).count().orderBy(F.desc("count"))
+                    
+                    if value_counts.count() > 0:
+                        top_row = value_counts.first()
+                        top_value = top_row[col]
+                        top_count = top_row["count"]
+                        
+                        # If the most common value appears in >80% of matching records
+                        if top_count / matching_count > 0.8:
+                            common_value = top_value
                 
                 if common_value:
                     common_configurations[col] = common_value
     
     return {
-        "matching_count": len(matching_arns),
-        "api_only_count": len(api_only_arns),
-        "snowflake_only_count": len(snowflake_only_arns),
+        "matching_count": matching_count,
+        "api_only_count": api_only_count,
+        "snowflake_only_count": snowflake_only_count,
         "differences": differences,
         "common_configurations": common_configurations
     }
 
-def suggest_api_payload(analysis_results: Dict) -> Dict:
+def suggest_api_payload(analysis_results):
     """Suggest an improved API payload based on analysis results."""
     # Start with the basic payload
     suggested_payload = {
@@ -291,7 +354,7 @@ def suggest_api_payload(analysis_results: Dict) -> Dict:
                 "configurationName": config_name,
                 "configurationValue": config_value
             })
-        elif config_name.startswith("supplementaryConfiguration."):
+        elif config_name.startswith("supplementaryconfiguration."):
             # Add as a supplementary configuration item
             if "supplementaryConfigurationItems" not in suggested_payload["searchParameters"][0]:
                 suggested_payload["searchParameters"][0]["supplementaryConfigurationItems"] = []
@@ -307,20 +370,24 @@ def suggest_api_payload(analysis_results: Dict) -> Dict:
     return suggested_payload
 
 def main():
-    # Initialize Spark session for Snowflake access
-    try:
-        spark = get_spark_session()
-        logger.info("Spark session initialized")
-    except Exception as e:
-        logger.error(f"Failed to initialize Spark session: {e}")
-        return
-    
     # 1. Fetch certificates from Snowflake
     try:
         df_snowflake = fetch_certificates_from_snowflake()
+        # Cache the DataFrame for faster performance
+        df_snowflake.cache()
+        print("Snowflake certificates:")
+        display(df_snowflake.limit(10))
     except Exception as e:
         logger.error(f"Failed to fetch Snowflake data: {e}")
-        df_snowflake = pd.DataFrame()
+        # Create an empty DataFrame with the expected schema
+        df_snowflake = spark.createDataFrame([], StructType([
+            StructField("certificate_arn", StringType(), True),
+            StructField("certificate_id", StringType(), True),
+            StructField("nominal_issuer", StringType(), True),
+            StructField("not_valid_before_utc_timestamp", StringType(), True),
+            StructField("not_valid_after_utc_timestamp", StringType(), True),
+            StructField("last_usage_observation_utc_timestamp", StringType(), True)
+        ]))
     
     # 2. Fetch certificates from API with initial payload
     initial_payload = {
@@ -339,50 +406,71 @@ def main():
     
     try:
         api_certificates = fetch_certificates_from_api(initial_payload)
-        df_api = extract_certificate_data(api_certificates)
+        df_api = flatten_api_certificates(api_certificates)
+        # Cache the DataFrame for faster performance
+        df_api.cache()
+        print("API certificates:")
+        display(df_api.limit(10))
     except Exception as e:
         logger.error(f"Failed to fetch API data: {e}")
-        df_api = pd.DataFrame()
+        df_api = spark.createDataFrame([], StructType([]))
     
     # 3. Compare and analyze certificates
-    if not df_snowflake.empty and not df_api.empty:
-        analysis_results = identify_common_attributes(df_snowflake, df_api)
+    if not df_snowflake.isEmpty() and not df_api.isEmpty():
+        analysis_results = identify_common_attributes_spark(df_snowflake, df_api)
         
         # 4. Suggest improved API payload
         suggested_payload = suggest_api_payload(analysis_results)
         
         # 5. Print results
-        logger.info("\n=== Analysis Results ===")
-        logger.info(f"Matching certificates: {analysis_results['matching_count']}")
-        logger.info(f"API-only certificates: {analysis_results['api_only_count']}")
-        logger.info(f"Snowflake-only certificates: {analysis_results['snowflake_only_count']}")
+        print("\n=== Analysis Results ===")
+        print(f"Matching certificates: {analysis_results['matching_count']}")
+        print(f"API-only certificates: {analysis_results['api_only_count']}")
+        print(f"Snowflake-only certificates: {analysis_results['snowflake_only_count']}")
         
-        logger.info("\n=== Common Configurations ===")
+        print("\n=== Common Configurations ===")
         for config, value in analysis_results['common_configurations'].items():
-            logger.info(f"{config}: {value}")
+            print(f"{config}: {value}")
         
-        logger.info("\n=== Suggested API Payload ===")
-        logger.info(json.dumps(suggested_payload, indent=2))
+        print("\n=== Suggested API Payload ===")
+        print(json.dumps(suggested_payload, indent=2))
         
-        # 6. Save results to files
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 6. Save results to tables for better viewing in Databricks
+        # Convert the analysis results to a Spark DataFrame
+        diff_rows = []
+        for col_name, diff in analysis_results['differences'].items():
+            diff_rows.append({
+                "column_name": col_name,
+                "matching_values": str(diff["matching_values"]),
+                "non_matching_values": str(diff["non_matching_values"]),
+                "distinctive_values": str(diff["distinctive_values"])
+            })
         
-        # Save suggested payload
-        with open(f"suggested_payload_{timestamp}.json", "w") as f:
+        if diff_rows:
+            diff_df = spark.createDataFrame(diff_rows)
+            print("\n=== Differences Analysis ===")
+            display(diff_df)
+        
+        # Save the suggested payload for reference
+        with open("/tmp/suggested_payload.json", "w") as f:
             json.dump(suggested_payload, indent=2, fp=f)
-            
-        # Save analysis results
-        with open(f"analysis_results_{timestamp}.json", "w") as f:
-            # Convert sets to lists for JSON serialization
-            serializable_results = {
-                k: v if not isinstance(v, set) else list(v) 
-                for k, v in analysis_results.items()
-            }
-            json.dump(serializable_results, indent=2, fp=f)
         
-        logger.info(f"\nResults saved to suggested_payload_{timestamp}.json and analysis_results_{timestamp}.json")
+        print(f"\nResults saved to /tmp/suggested_payload.json")
+        
+        # Create a temporary view for easier SQL access
+        df_snowflake.createOrReplaceTempView("snowflake_certificates")
+        df_api.createOrReplaceTempView("api_certificates")
+        
+        return {
+            "snowflake_df": df_snowflake,
+            "api_df": df_api,
+            "analysis_results": analysis_results,
+            "suggested_payload": suggested_payload
+        }
     else:
         logger.error("Cannot perform analysis because one or both datasets are empty")
+        return None
 
+# Run the main function if this is executed directly
 if __name__ == "__main__":
-    main()
+    results = main()
