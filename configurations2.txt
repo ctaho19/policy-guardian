@@ -1,533 +1,533 @@
-import os
-import time
-import json
-import requests
-from datetime import datetime
-from typing import Dict, List, Set, Tuple, Optional, Any
-import pyspark.sql.functions as F
-from pyspark.sql.types import StructType, StructField, StringType, ArrayType, MapType
+  import json
+  import requests
+  import time
+  from datetime import datetime
+  import pyspark.sql.functions as F
+  from pyspark.sql.types import StructType, StructField, StringType,
+  TimestampType, LongType, DoubleType
 
-# API details
-API_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-service/aws-tooling/search-resource-configurations"
-API_HEADERS = {
-    'Accept': 'application/json;v=1.0',
-    'Authorization': 'Bearer YOUR_API_TOKEN',  # Replace with actual token
-    'Content-Type': 'application/json'
-}
-API_CALL_DELAY = 0.15  # Delay between API calls to avoid rate limits
-API_TIMEOUT = 60  # Timeout for API calls
+  # Constants
+  CONTROL_ID = "CTRL-1077188"
+  TIER0_METRIC_ID = "MNTR-1077188-T0"  # Tier 0: Verify control execution
+  TIER1_METRIC_ID = "MNTR-1077188-T1"  # Tier 1: Certificate in-scope 
+  coverage
+  TIER2_METRIC_ID = "MNTR-1077188-T2"  # Tier 2: Certificate rotation 
+  compliance
+  CERTIFICATE_MAX_AGE_DAYS = 395  # ~13 months
 
-# Snowflake connection parameters using dbutils.secrets
-username = dbutils.secrets.get(scope="uno201_scope", key="eid")
-password = dbutils.secrets.get(scope="uno201_scope", key="password")
+  # API details
+  API_URL = "https://api.cloud.capitalone.com/internal-operations/cloud-ser
+  vice/aws-tooling/search-resource-configurations"
+  BEARER_TOKEN = "YOUR_BEARER_TOKEN"  # Replace this with your token
+  API_HEADERS = {
+      'Accept': 'application/json;v=1.0',
+      'Authorization': f'Bearer {BEARER_TOKEN}',
+      'Content-Type': 'application/json'
+  }
+  API_CALL_DELAY = 0.15  # Delay between API calls to avoid rate limits
+  API_TIMEOUT = 60  # Timeout for API calls
 
-# Define Snowflake connection options
-SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
-sfOptions = dict(
-    sfUrl="prod.us-east-1.capitalone.snowflakecomputing.com",
-    sfUser=username,
-    sfPassword=password,
-    sfDatabase="SB",
-    sfSchema="USER_UNO201",
-    sfWarehouse="CYBR_Q_DI_WH",
-)
-
-# Configure logging
-import logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-def fetch_certificates_from_snowflake():
-    """Fetch certificates from Snowflake using Spark."""
-    try:
-        query = """
-        SELECT DISTINCT 
-            CERTIFICATE_ARN, 
-            CERTIFICATE_ID, 
-            NOMINAL_ISSUER, 
-            NOT_VALID_BEFORE_UTC_TIMESTAMP, 
-            NOT_VALID_AFTER_UTC_TIMESTAMP, 
-            LAST_USAGE_OBSERVATION_UTC_TIMESTAMP
-        FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE 
-        WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%' 
-          AND NOMINAL_ISSUER = 'Amazon' 
-          AND NOT_VALID_AFTER_UTC_TIMESTAMP >= DATEADD('DAY', -365, CURRENT_TIMESTAMP)
-        """
-        logger.info("Fetching certificates from Snowflake using Spark...")
-        
-        # Use Spark to query Snowflake
-        snowflake_df = (
-            spark.read.format(SNOWFLAKE_SOURCE_NAME)
-            .options(**sfOptions)
-            .option("query", query)
-            .load()
-        )
-        
-        # Convert all column names to lowercase for consistency
-        snowflake_df = snowflake_df.toDF(*[c.lower() for c in snowflake_df.columns])
-        
-        logger.info(f"Retrieved {snowflake_df.count()} certificates from Snowflake")
-        return snowflake_df
-    except Exception as e:
-        logger.error(f"Error fetching certificates from Snowflake: {e}")
-        raise
-
-def fetch_certificates_from_api(payload: Dict) -> List[Dict]:
-    """Fetch certificates from the AWS Tooling API with pagination."""
-    all_certificates = []
-    next_record_key = None
-    page_count = 0
-    
-    logger.info(f"Fetching certificates from API with payload: {json.dumps(payload, indent=2)}")
-    
-    while True:
-        page_count += 1
-        current_url = API_URL
-        params = {'limit': 10000}
-        
-        if next_record_key:
-            params['nextRecordKey'] = next_record_key
-        
-        try:
-            logger.info(f"Fetching page {page_count} from API...")
-            response = requests.post(
-                current_url, 
-                headers=headers, 
-                json=payload,
-                params=params,
-                timeout=API_TIMEOUT, 
-                verify=False
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            certificates = data.get('resourceConfigurations', [])
-            logger.info(f"Retrieved {len(certificates)} certificates from page {page_count}")
-            all_certificates.extend(certificates)
-            
-            next_record_key = data.get('nextRecordKey')
-            if not next_record_key:
-                logger.info("No more pages to fetch")
-                break
-                
-            # Sleep to avoid rate limits
-            time.sleep(API_CALL_DELAY)
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed on page {page_count}: {e}")
-            # Continue with certificates fetched so far
-            break
-    
-    logger.info(f"Total certificates fetched from API: {len(all_certificates)}")
-    return all_certificates
-
-def create_flattened_cert_df(api_certificates: List[Dict]):
-    """
-    Convert API certificates list to a flattened structure,
-    then create a Spark DataFrame. This approach avoids complex SQL expressions.
-    """
-    if not api_certificates:
-        logger.warning("No certificates provided to flatten")
-        return spark.createDataFrame([], StructType([
-            StructField("amazonresourcename", StringType(), True)
-        ]))
-    
-    # Extract and flatten the certificate data
-    flattened_certs = []
-    
-    try:
-        for cert in api_certificates:
-            # Start with top-level attributes
-            flat_cert = {
-                "amazonresourcename": cert.get("amazonResourceName", ""),
-                "resourceid": cert.get("resourceId", ""),
-                "awsaccountid": cert.get("awsAccountId", ""),
-                "awsregion": cert.get("awsRegion", ""),
-                "businessapplicationname": cert.get("businessApplicationName", ""),
-                "environment": cert.get("environment", ""),
-                "source": cert.get("source", "")
-            }
-            
-            # Extract configuration values
-            if "configurationList" in cert and isinstance(cert["configurationList"], list):
-                for config in cert["configurationList"]:
-                    if isinstance(config, dict) and "configurationName" in config and "configurationValue" in config:
-                        # Use the configuration name as the column name
-                        # Convert to lowercase and replace dots with underscores for valid column names
-                        col_name = config["configurationName"].lower().replace(".", "_")
-                        flat_cert[col_name] = config["configurationValue"]
-            
-            # Extract supplementary configuration values
-            if "supplementaryConfiguration" in cert and isinstance(cert["supplementaryConfiguration"], list):
-                for config in cert["supplementaryConfiguration"]:
-                    if isinstance(config, dict) and "supplementaryConfigurationName" in config and "supplementaryConfigurationValue" in config:
-                        # Use the configuration name as the column name
-                        # Convert to lowercase and replace dots with underscores for valid column names
-                        col_name = ("supp_" + config["supplementaryConfigurationName"]).lower().replace(".", "_")
-                        flat_cert[col_name] = config["supplementaryConfigurationValue"]
-            
-            flattened_certs.append(flat_cert)
-        
-        # Create a Spark DataFrame directly from the flattened dictionaries
-        if not flattened_certs:
-            logger.warning("No certificates were flattened successfully")
-            return spark.createDataFrame([], StructType([
-                StructField("amazonresourcename", StringType(), True)
-            ]))
-            
-        # This will infer the schema automatically from the data
-        df = spark.createDataFrame(flattened_certs)
-        logger.info(f"Successfully created DataFrame with {df.count()} rows and {len(df.columns)} columns")
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error flattening certificates: {e}")
-        # Return empty DataFrame on error
-        return spark.createDataFrame([], StructType([
-            StructField("amazonresourcename", StringType(), True)
-        ]))
-
-def identify_common_attributes_spark(df_snowflake, df_api):
-    """Identify common attributes between dataset and API certificates using Spark."""
-    # Convert ARN columns to lowercase for consistency
-    df_snowflake = df_snowflake.withColumn("certificate_arn", F.lower(F.col("certificate_arn")))
-    df_api = df_api.withColumn("amazonresourcename", F.lower(F.col("amazonresourcename")))
-    
-    # Get counts for analysis
-    snowflake_count = df_snowflake.count()
-    api_count = df_api.count()
-    
-    if snowflake_count == 0 or api_count == 0:
-        logger.warning("One or both DataFrames are empty, cannot compare attributes")
-        return {
-            "matching_count": 0,
-            "api_only_count": 0,
-            "snowflake_only_count": 0,
-            "differences": {},
-            "common_configurations": {}
-        }
-    
-    # Find matching certificates using a join
-    df_matching = df_api.join(
-        df_snowflake,
-        df_api.amazonresourcename == df_snowflake.certificate_arn,
-        "inner"
-    )
-    matching_count = df_matching.count()
-    
-    # Find API-only and Snowflake-only certificates
-    df_api_only = df_api.join(
-        df_snowflake,
-        df_api.amazonresourcename == df_snowflake.certificate_arn,
-        "left_anti"  # Equivalent to NOT IN subquery
-    )
-    api_only_count = df_api_only.count()
-    
-    df_snowflake_only = df_snowflake.join(
-        df_api,
-        df_snowflake.certificate_arn == df_api.amazonresourcename,
-        "left_anti"  # Equivalent to NOT IN subquery
-    )
-    snowflake_only_count = df_snowflake_only.count()
-    
-    logger.info(f"Matching certificates: {matching_count}")
-    logger.info(f"API-only certificates: {api_only_count}")
-    logger.info(f"Snowflake-only certificates: {snowflake_only_count}")
-    
-    # Analyze configurations that might differentiate between matching and non-matching
-    differences = {}
-    common_configurations = {}
-    
-    # Only analyze columns that have reasonable, non-null values
-    # Skip identifier columns
-    skip_columns = ["amazonresourcename", "resourceid", "certificate_arn", "certificate_id"]
-    
-    # Get a list of all columns in the API DataFrame, excluding identifiers
-    api_columns = [col for col in df_api.columns if col not in skip_columns]
-    
-    for col in api_columns:
-        # Check if the column has a significant number of non-null values
-        non_null_count = df_api.filter(F.col(col).isNotNull()).count()
-        if non_null_count / api_count < 0.05:  # Skip columns with less than 5% non-null values
-            continue
-        
-        # Get unique values for matching certificates
-        if matching_count > 0:
-            matching_values = [row[col] for row in df_matching.select(col).distinct().filter(F.col(col).isNotNull()).collect()]
-        else:
-            matching_values = []
-            
-        # Get unique values for non-matching certificates
-        if api_only_count > 0:
-            non_matching_values = [row[col] for row in df_api_only.select(col).distinct().filter(F.col(col).isNotNull()).collect()]
-        else:
-            non_matching_values = []
-        
-        # Check if there are differences in values
-        if matching_values and set(matching_values) != set(non_matching_values):
-            # Find values that are common in the matching set but rare in the non-matching set
-            distinctive_values = []
-            
-            for val in matching_values:
-                if val is None:
-                    continue
-                    
-                if val not in non_matching_values:
-                    distinctive_values.append(val)
-                elif api_only_count > 0:
-                    # Compare frequency of the value in matching vs non-matching
-                    matching_freq = df_matching.filter(F.col(col) == val).count() / matching_count
-                    non_matching_freq = df_api_only.filter(F.col(col) == val).count() / api_only_count
-                    
-                    # If the value is 3x more common in matching certs, consider it distinctive
-                    if matching_freq > non_matching_freq * 3:
-                        distinctive_values.append(val)
-            
-            if distinctive_values:
-                differences[col] = {
-                    "matching_values": matching_values,
-                    "non_matching_values": non_matching_values,
-                    "distinctive_values": distinctive_values
-                }
-                
-                # Look for common values in the matching set
-                common_value = None
-                
-                # If there's only one unique value in matching certificates
-                if len(matching_values) == 1:
-                    common_value = matching_values[0]
-                else:
-                    # Get value counts to find the most common value
-                    value_counts = df_matching.groupBy(col).count().orderBy(F.desc("count"))
-                    
-                    if value_counts.count() > 0:
-                        top_row = value_counts.first()
-                        top_value = top_row[col]
-                        top_count = top_row["count"]
-                        
-                        # If the most common value appears in >80% of matching records
-                        if top_count / matching_count > 0.8:
-                            common_value = top_value
-                
-                if common_value:
-                    common_configurations[col] = common_value
-    
-    # Map column names back to original API field names for the API payload
-    mapped_common_configs = {}
-    for col_name, value in common_configurations.items():
-        # Map the flattened column names back to the original API field names
-        if col_name.startswith("configuration_"):
-            api_field = "configuration." + col_name[13:].replace("_", ".")
-            mapped_common_configs[api_field] = value
-        elif col_name.startswith("supp_"):
-            api_field = "supplementaryConfiguration." + col_name[5:].replace("_", ".")
-            mapped_common_configs[api_field] = value
-        else:
-            # For top-level fields, keep as is
-            mapped_common_configs[col_name] = value
-    
-    return {
-        "matching_count": matching_count,
-        "api_only_count": api_only_count,
-        "snowflake_only_count": snowflake_only_count,
-        "differences": differences,
-        "common_configurations": mapped_common_configs
-    }
-
-def suggest_api_payload(analysis_results):
-    """Suggest an improved API payload based on analysis results."""
-    # Start with the basic payload
-    suggested_payload = {
-        "searchParameters": [
-            {
-                "resourceType": "AWS::ACM::Certificate",
-                "configurationItems": [
-                    {
-                        "configurationName": "issuer",
-                        "configurationValue": "Amazon"
-                    }
-                ]
-            }
+  # API payload for in-scope certificates
+  API_PAYLOAD = {
+    "searchParameters": [
+      {
+        "resourceType": "AWS::ACM::Certificate",
+        "source": "ChangeNotification",
+        "configurationItems": [
+          {
+            "configurationName": "issuer",
+            "configurationValue": "Amazon"
+          },
+          {
+            "configurationName": "renewalSummary.renewalStatus",
+            "configurationValue": "SUCCESS"
+          }
+        ],
+        "supplementaryConfigurationItems": [
+          {
+            "supplementaryConfigurationName": "Tags",
+            "supplementaryConfigurationValue": "\"[{'key': 'ASV', 'value': 
+  'ASVACMAUTOMATION'}, {'key': 'OwnerContact', 'value': 
+  'informationsecurityencryption@capitalone.com'}, {'key': 'UseCase', 
+  'value': 'Use this certificate for internal facing sites'}, {'key': 'BA',
+   'value': 'BAACMAUTOMATION'}, {'key': 'Name', 'value': 
+  'DEFAULT_INTERNAL_FACING_CERT'}]\""
+          }
         ]
-    }
-    
-    # Add additional configurations that seem to be common across dataset certificates
-    common_configs = analysis_results.get("common_configurations", {})
-    for config_name, config_value in common_configs.items():
-        # Skip if already present
-        if config_name in ['issuer']:
-            continue
-            
-        # Check if it's a configuration item or a top-level attribute
-        if config_name.startswith("configuration."):
-            # Add as a configuration item
-            suggested_payload["searchParameters"][0]["configurationItems"].append({
-                "configurationName": config_name,
-                "configurationValue": config_value
-            })
-        elif config_name.startswith("supplementaryConfiguration."):
-            # Add as a supplementary configuration item
-            if "supplementaryConfigurationItems" not in suggested_payload["searchParameters"][0]:
-                suggested_payload["searchParameters"][0]["supplementaryConfigurationItems"] = []
-            
-            suggested_payload["searchParameters"][0]["supplementaryConfigurationItems"].append({
-                "supplementaryConfigurationName": config_name,
-                "supplementaryConfigurationValue": config_value
-            })
-        else:
-            # Add as a top-level attribute (like businessApplicationName)
-            suggested_payload["searchParameters"][0][config_name] = config_value
-    
-    return suggested_payload
+      }
+    ]
+  }
 
-def main():
-    # 1. Fetch certificates from Snowflake
-    try:
-        df_snowflake = fetch_certificates_from_snowflake()
-        # Cache the DataFrame for faster performance
-        df_snowflake.cache()
-        print("Snowflake certificates:")
-        display(df_snowflake.limit(10))
-    except Exception as e:
-        logger.error(f"Failed to fetch Snowflake data: {e}")
-        # Create an empty DataFrame with the expected schema
-        df_snowflake = spark.createDataFrame([], StructType([
-            StructField("certificate_arn", StringType(), True),
-            StructField("certificate_id", StringType(), True),
-            StructField("nominal_issuer", StringType(), True),
-            StructField("not_valid_before_utc_timestamp", StringType(), True),
-            StructField("not_valid_after_utc_timestamp", StringType(), True),
-            StructField("last_usage_observation_utc_timestamp", StringType(), True)
-        ]))
-    
-    # 2. Fetch certificates from API with initial payload
-    initial_payload = {
-        "searchParameters": [
-            {
-                "resourceType": "AWS::ACM::Certificate",
-                "configurationItems": [
-                    {
-                        "configurationName": "issuer",
-                        "configurationValue": "Amazon"
-                    }
-                ]
-            }
-        ]
-    }
-    
-    try:
-        # Fetch certificates from API
-        api_certificates = fetch_certificates_from_api(initial_payload)
-        
-        df_api = create_flattened_cert_df(api_certificates)
-        # Cache the DataFrame for faster performance
-        df_api.cache()
-        print("API certificates:")
-        display(df_api.limit(10))
-    except Exception as e:
-        logger.error(f"Failed to fetch API data: {e}")
-        df_api = spark.createDataFrame([], StructType([
-            StructField("amazonresourcename", StringType(), True)
-        ]))
-    
-    # 3. Compare and analyze certificates
-    try:
-        snowflake_count = df_snowflake.count()
-        api_count = df_api.count()
-        
-        logger.info(f"Certificate counts - Snowflake: {snowflake_count}, API: {api_count}")
-        
-        if snowflake_count > 0 and api_count > 0:
-            analysis_results = identify_common_attributes_spark(df_snowflake, df_api)
-            
-            # 4. Suggest improved API payload
-            suggested_payload = suggest_api_payload(analysis_results)
-            
-            # 5. Print results
-            print("\n=== Analysis Results ===")
-            print(f"Matching certificates: {analysis_results['matching_count']}")
-            print(f"API-only certificates: {analysis_results['api_only_count']}")
-            print(f"Snowflake-only certificates: {analysis_results['snowflake_only_count']}")
-            
-            print("\n=== Common Configurations ===")
-            for config, value in analysis_results['common_configurations'].items():
-                print(f"{config}: {value}")
-            
-            print("\n=== Suggested API Payload ===")
-            print(json.dumps(suggested_payload, indent=2))
-            
-            # 6. Save results to tables for better viewing in Databricks
-            try:
-                # Convert the analysis results to a Spark DataFrame
-                diff_rows = []
-                for col_name, diff in analysis_results['differences'].items():
-                    diff_rows.append({
-                        "column_name": col_name,
-                        "matching_values": str(diff["matching_values"]),
-                        "non_matching_values": str(diff["non_matching_values"]),
-                        "distinctive_values": str(diff["distinctive_values"])
-                    })
-                
-                if diff_rows:
-                    diff_df = spark.createDataFrame(diff_rows)
-                    print("\n=== Differences Analysis ===")
-                    display(diff_df)
-            except Exception as e:
-                logger.error(f"Error creating differences DataFrame: {e}")
-            
-            # Save the suggested payload for reference
-            try:
-                with open("/tmp/suggested_payload.json", "w") as f:
-                    json.dump(suggested_payload, indent=2, fp=f)
-                print(f"\nResults saved to /tmp/suggested_payload.json")
-            except Exception as e:
-                print(f"Could not save payload to file: {str(e)}")
-                print("Suggested payload (copy from here):")
-                print(json.dumps(suggested_payload, indent=2))
-            
-            # Cache dataframes for faster access without creating temporary views
-            df_snowflake.cache()
-            df_api.cache()
-            
-            return {
-                "snowflake_df": df_snowflake,
-                "api_df": df_api,
-                "analysis_results": analysis_results,
-                "suggested_payload": suggested_payload
-            }
-        else:
-            logger.error(f"Cannot perform analysis because one or both datasets are empty. Snowflake count: {snowflake_count}, API count: {api_count}")
-            return {
-                "snowflake_df": df_snowflake,
-                "api_df": df_api,
-                "analysis_results": {
-                    "matching_count": 0,
-                    "api_only_count": 0,
-                    "snowflake_only_count": 0,
-                    "differences": {},
-                    "common_configurations": {}
-                },
-                "suggested_payload": {
-                    "searchParameters": [
-                        {
-                            "resourceType": "AWS::ACM::Certificate",
-                            "configurationItems": [
-                                {
-                                    "configurationName": "issuer",
-                                    "configurationValue": "Amazon"
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
-    except Exception as e:
-        logger.error(f"Error during analysis stage: {e}")
-        return None
+  # Snowflake connection parameters
+  SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+  sfOptions = dict(
+      sfUrl="prod.us-east-1.capitalone.snowflakecomputing.com",
+      sfUser=username,
+      sfPassword=password,
+      sfDatabase="SB",
+      sfSchema="USER_UNO201",
+      sfWarehouse="CYBR_Q_DI_WH",
+  )
 
-# Run the main function if this is executed directly
-if __name__ == "__main__":
-    results = main()
+  # Configure logging
+  import logging
+  logging.basicConfig(level=logging.INFO, format='%(asctime)s - 
+  %(levelname)s - %(message)s')
+  logger = logging.getLogger(__name__)
+
+  def get_thresholds():
+      """Fetch metric thresholds from Snowflake."""
+      try:
+          # Format the metric IDs for SQL query
+          metric_ids = [TIER0_METRIC_ID, TIER1_METRIC_ID, TIER2_METRIC_ID]
+          metric_ids_sql_string = "'" + "','".join(metric_ids) + "'"
+
+          query = f"""
+          SELECT MONITORING_METRIC_ID, ALERT_THRESHOLD, WARNING_THRESHOLD 
+          FROM 
+  CYBR_DB_COLLAB.LAB_ESRA_TCRD.CYBER_CONTROLS_MONITORING_THRESHOLD
+          WHERE MONITORING_METRIC_ID IN ({metric_ids_sql_string}) 
+          """
+
+          # Use Spark to query Snowflake
+          thresholds_df = (
+              spark.read.format(SNOWFLAKE_SOURCE_NAME)
+              .options(**sfOptions)
+              .option("query", query)
+              .load()
+          )
+
+          return thresholds_df
+      except Exception as e:
+          logger.error(f"Error fetching thresholds: {e}")
+          # Return default thresholds if query fails
+          data = [
+              (TIER0_METRIC_ID, 100.0, 100.0),
+              (TIER1_METRIC_ID, 95.0, 90.0),
+              (TIER2_METRIC_ID, 95.0, 90.0)
+          ]
+          schema = StructType([
+              StructField("MONITORING_METRIC_ID", StringType(), True),
+              StructField("ALERT_THRESHOLD", DoubleType(), True),
+              StructField("WARNING_THRESHOLD", DoubleType(), True)
+          ])
+          return spark.createDataFrame(data, schema=schema)
+
+  def fetch_certificates_from_snowflake():
+      """Fetch certificates from Snowflake."""
+      query = """
+      SELECT DISTINCT 
+          CERTIFICATE_ARN, 
+          CERTIFICATE_ID, 
+          NOMINAL_ISSUER, 
+          NOT_VALID_BEFORE_UTC_TIMESTAMP, 
+          NOT_VALID_AFTER_UTC_TIMESTAMP, 
+          LAST_USAGE_OBSERVATION_UTC_TIMESTAMP
+      FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE 
+      WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%' 
+        AND NOMINAL_ISSUER = 'Amazon' 
+        AND NOT_VALID_AFTER_UTC_TIMESTAMP >= DATEADD('DAY', -365, 
+  CURRENT_TIMESTAMP)
+      """
+
+      try:
+          snowflake_df = (
+              spark.read.format(SNOWFLAKE_SOURCE_NAME)
+              .options(**sfOptions)
+              .option("query", query)
+              .load()
+          )
+          # Convert all column names to lowercase for consistency
+          snowflake_df = snowflake_df.toDF(*[c.lower() for c in
+  snowflake_df.columns])
+          logger.info(f"Retrieved {snowflake_df.count()} certificates from 
+  Snowflake")
+          return snowflake_df
+      except Exception as e:
+          logger.error(f"Error fetching certificates from Snowflake: {e}")
+          return spark.createDataFrame([], StructType([
+              StructField("certificate_arn", StringType(), True),
+              StructField("certificate_id", StringType(), True),
+              StructField("nominal_issuer", StringType(), True),
+              StructField("not_valid_before_utc_timestamp",
+  TimestampType(), True),
+              StructField("not_valid_after_utc_timestamp", TimestampType(),
+   True),
+              StructField("last_usage_observation_utc_timestamp",
+  TimestampType(), True)
+          ]))
+
+  def fetch_tier0_data():
+      """Fetch data for Tier 0 metric (expired certs used after expiry)."""
+      query = """
+      WITH EXPIRED_CERTS AS (
+          SELECT 
+              Certificate_ID,
+              Certificate_ARN,
+              NOT_VALID_AFTER_UTC_TIMESTAMP as EXPIRY_DATE,
+              LAST_USAGE_OBSERVATION_UTC_TIMESTAMP,
+              LEAD(NOT_VALID_BEFORE_UTC_TIMESTAMP) OVER (
+                  PARTITION BY Certificate_ARN 
+                  ORDER BY NOT_VALID_BEFORE_UTC_TIMESTAMP
+              ) as ROTATION_DATE
+          FROM CYBR_DB.PHDP_CYBR.CERTIFICATE_CATALOG_CERTIFICATE_USAGE
+          WHERE CERTIFICATE_ARN LIKE '%arn:aws:acm%'
+          AND NOT_VALID_AFTER_UTC_TIMESTAMP < CURRENT_TIMESTAMP
+          AND NOT_VALID_AFTER_UTC_TIMESTAMP >= DATEADD(day, -3, 
+  CURRENT_TIMESTAMP)
+          AND LAST_USAGE_OBSERVATION_UTC_TIMESTAMP > 
+  NOT_VALID_AFTER_UTC_TIMESTAMP
+      )
+      SELECT
+          COUNT(CASE WHEN ROTATION_DATE IS NULL OR ROTATION_DATE > 
+  EXPIRY_DATE THEN 1 END) as FAILURES_COUNT,
+          CASE 
+              WHEN COUNT(CASE WHEN ROTATION_DATE IS NULL OR ROTATION_DATE >
+   EXPIRY_DATE THEN 1 END) > 0 
+              THEN 'FAILED' ELSE 'PASSED'
+          END as TEST_RESULT
+      FROM EXPIRED_CERTS
+      """
+
+      try:
+          result_df = (
+              spark.read.format(SNOWFLAKE_SOURCE_NAME)
+              .options(**sfOptions)
+              .option("query", query)
+              .load()
+          )
+          return result_df
+      except Exception as e:
+          logger.error(f"Error fetching Tier 0 data: {e}")
+          # Return a DataFrame with zero failures on error
+          return spark.createDataFrame([(0, "PASSED")], ["FAILURES_COUNT",
+  "TEST_RESULT"])
+
+  def fetch_certificates_from_api():
+      """Fetch certificates from API with pagination."""
+      all_certificates = []
+      next_record_key = None
+      page_count = 0
+
+      logger.info("Fetching certificates from API...")
+
+      while True:
+          page_count += 1
+          params = {'limit': 10000}
+
+          if next_record_key:
+              params['nextRecordKey'] = next_record_key
+
+          try:
+              logger.info(f"Fetching page {page_count}...")
+              response = requests.post(
+                  API_URL,
+                  headers=API_HEADERS,
+                  json=API_PAYLOAD,
+                  params=params,
+                  timeout=API_TIMEOUT,
+                  verify=False
+              )
+              response.raise_for_status()
+              data = response.json()
+
+              certificates = data.get('resourceConfigurations', [])
+              logger.info(f"Retrieved {len(certificates)} certificates from
+   page {page_count}")
+              all_certificates.extend(certificates)
+
+              next_record_key = data.get('nextRecordKey')
+              if not next_record_key:
+                  break
+
+              time.sleep(API_CALL_DELAY)
+          except Exception as e:
+              logger.error(f"API request failed on page {page_count}: {e}")
+              break
+
+      logger.info(f"Total certificates fetched from API: 
+  {len(all_certificates)}")
+      return all_certificates
+
+  def create_flattened_cert_df(api_certificates):
+      """Convert API certificates to a flat Spark DataFrame."""
+      if not api_certificates:
+          return spark.createDataFrame([], StructType([
+              StructField("amazonresourcename", StringType(), True)
+          ]))
+
+      flattened_certs = []
+
+      for cert in api_certificates:
+          flat_cert = {
+              "amazonresourcename": cert.get("amazonResourceName", ""),
+              "source": cert.get("source", ""),
+              "status": None
+          }
+
+          # Extract status from configuration
+          for config in cert.get("configurationList", []):
+              if config.get("configurationName") == "status":
+                  flat_cert["status"] = config.get("configurationValue")
+                  break
+
+          flattened_certs.append(flat_cert)
+
+      return spark.createDataFrame(flattened_certs)
+
+  def get_compliance_status(metric_value, threshold_df, metric_id):
+      """Determine compliance status based on thresholds."""
+      metric_row = threshold_df.filter(F.col("MONITORING_METRIC_ID") ==
+  metric_id).first()
+
+      if not metric_row:
+          return "Red"
+
+      alert_threshold = metric_row["ALERT_THRESHOLD"]
+      warning_threshold = metric_row["WARNING_THRESHOLD"]
+
+      if metric_value >= alert_threshold:
+          return "Green"
+      elif warning_threshold is not None and metric_value >=
+  warning_threshold:
+          return "Yellow"
+      else:
+          return "Red"
+
+  def calculate_metrics():
+      """Calculate all three tier metrics."""
+      now = int(datetime.utcnow().timestamp() * 1000)
+      metrics = []
+
+      try:
+          # Fetch thresholds
+          thresholds_df = get_thresholds()
+
+          # Tier 0: Check for certificates used after expiry
+          tier0_df = fetch_tier0_data()
+          tier0_row = tier0_df.first()
+          failures_count = tier0_row["FAILURES_COUNT"] if tier0_row else 0
+          tier0_metric_value = 0.0 if failures_count > 0 else 100.0
+          tier0_numerator = 0 if failures_count > 0 else 1
+          tier0_denominator = 1
+          tier0_status = get_compliance_status(tier0_metric_value,
+  thresholds_df, TIER0_METRIC_ID)
+          tier0_resources = [f"Found {failures_count} expired certificates 
+  used after expiry without rotation"] if failures_count > 0 else None
+
+          metrics.append({
+              "date": now,
+              "control_id": CONTROL_ID,
+              "monitoring_metric_id": TIER0_METRIC_ID,
+              "monitoring_metric_value": float(tier0_metric_value),
+              "compliance_status": tier0_status,
+              "numerator": int(tier0_numerator),
+              "denominator": int(tier0_denominator),
+              "non_compliant_resources": tier0_resources
+          })
+
+          # Fetch data for Tier 1 and Tier 2
+          snowflake_df = fetch_certificates_from_snowflake()
+          api_certs = fetch_certificates_from_api()
+          api_df = create_flattened_cert_df(api_certs)
+
+          # Filter in-scope certificates (not orphaned, not pending 
+  deletion/import)
+          in_scope_df = api_df.filter(
+              (F.col("source") != "CT-AccessDenied") &
+              (~F.col("status").isin(["PENDING_DELETION",
+  "PENDING_IMPORT"]))
+          )
+
+          # Tier 1: Compare API certs to Snowflake
+          api_count = in_scope_df.count()
+          if api_count > 0:
+              # Convert to lowercase for matching
+              snowflake_df = snowflake_df.withColumn("certificate_arn",
+  F.lower(F.col("certificate_arn")))
+              in_scope_df = in_scope_df.withColumn("amazonresourcename",
+  F.lower(F.col("amazonresourcename")))
+
+              # Find matches
+              matching_df = in_scope_df.join(
+                  snowflake_df,
+                  in_scope_df.amazonresourcename ==
+  snowflake_df.certificate_arn,
+                  "inner"
+              )
+              matching_count = matching_df.count()
+
+              # Find non-matches
+              missing_df = in_scope_df.join(
+                  snowflake_df,
+                  in_scope_df.amazonresourcename ==
+  snowflake_df.certificate_arn,
+                  "left_anti"
+              )
+
+              tier1_numerator = matching_count
+              tier1_denominator = api_count
+              tier1_metric_value = round((tier1_numerator /
+  tier1_denominator * 100), 2) if tier1_denominator > 0 else 0.0
+              tier1_status = get_compliance_status(tier1_metric_value,
+  thresholds_df, TIER1_METRIC_ID)
+
+              # Resource info for non-matches
+              missing_arns = [row.amazonresourcename for row in
+  missing_df.limit(100).collect()]
+              tier1_resources = [f"Missing from dataset: {arn}" for arn in
+  missing_arns] if missing_arns else None
+          else:
+              tier1_numerator = 0
+              tier1_denominator = 0
+              tier1_metric_value = 0.0
+              tier1_status = "Red"
+              tier1_resources = ["No in-scope certificates found via API"]
+
+          metrics.append({
+              "date": now,
+              "control_id": CONTROL_ID,
+              "monitoring_metric_id": TIER1_METRIC_ID,
+              "monitoring_metric_value": float(tier1_metric_value),
+              "compliance_status": tier1_status,
+              "numerator": int(tier1_numerator),
+              "denominator": int(tier1_denominator),
+              "non_compliant_resources": tier1_resources
+          })
+
+          # Tier 2: Check certificate rotation compliance
+          snowflake_count = snowflake_df.count()
+          if snowflake_count > 0:
+              # Count non-compliant certificates
+              non_compliant_count = snowflake_df.filter(
+                  # Used after expiration
+                  ((F.col("last_usage_observation_utc_timestamp") >
+  F.col("not_valid_after_utc_timestamp")) |
+                  # Lifetime exceeds 13 months
+                  (F.datediff(F.col("not_valid_after_utc_timestamp"),
+  F.col("not_valid_before_utc_timestamp")) > CERTIFICATE_MAX_AGE_DAYS))
+              ).count()
+
+              tier2_numerator = snowflake_count - non_compliant_count
+              tier2_denominator = snowflake_count
+              tier2_metric_value = round((tier2_numerator /
+  tier2_denominator * 100), 2) if tier2_denominator > 0 else 0.0
+              tier2_status = get_compliance_status(tier2_metric_value,
+  thresholds_df, TIER2_METRIC_ID)
+
+              # Get non-compliant certificate details (limit to 100 for 
+  performance)
+              if non_compliant_count > 0:
+                  non_compliant_df = snowflake_df.filter(
+                      ((F.col("last_usage_observation_utc_timestamp") >
+  F.col("not_valid_after_utc_timestamp")) |
+                      (F.datediff(F.col("not_valid_after_utc_timestamp"),
+  F.col("not_valid_before_utc_timestamp")) > CERTIFICATE_MAX_AGE_DAYS))
+                  ).limit(100)
+
+                  tier2_resources = []
+                  for row in non_compliant_df.collect():
+                      reasons = []
+                      if row.last_usage_observation_utc_timestamp and
+  row.not_valid_after_utc_timestamp and
+  row.last_usage_observation_utc_timestamp >
+  row.not_valid_after_utc_timestamp:
+                          reasons.append("Used after expiration")
+
+                      if row.not_valid_before_utc_timestamp and
+  row.not_valid_after_utc_timestamp:
+                          lifetime_days =
+  (row.not_valid_after_utc_timestamp -
+  row.not_valid_before_utc_timestamp).days
+                          if lifetime_days > CERTIFICATE_MAX_AGE_DAYS:
+                              reasons.append(f"Lifetime ({lifetime_days} 
+  days) exceeds maximum ({CERTIFICATE_MAX_AGE_DAYS} days)")
+
+                      if reasons:
+                          tier2_resources.append(f"{row.certificate_arn}: 
+  {', '.join(reasons)}")
+
+                  if non_compliant_count > 100:
+                      tier2_resources.append(f"... and {non_compliant_count
+   - 100} more")
+              else:
+                  tier2_resources = None
+          else:
+              tier2_numerator = 0
+              tier2_denominator = 0
+              tier2_metric_value = 0.0
+              tier2_status = "Red"
+              tier2_resources = ["No certificates found in dataset"]
+
+          metrics.append({
+              "date": now,
+              "control_id": CONTROL_ID,
+              "monitoring_metric_id": TIER2_METRIC_ID,
+              "monitoring_metric_value": float(tier2_metric_value),
+              "compliance_status": tier2_status,
+              "numerator": int(tier2_numerator),
+              "denominator": int(tier2_denominator),
+              "non_compliant_resources": tier2_resources
+          })
+
+          # Create DataFrame with the metrics
+          metrics_df = spark.createDataFrame(metrics)
+          return metrics_df
+
+      except Exception as e:
+          logger.error(f"Error calculating metrics: {e}")
+          # Return error metrics
+          error_metrics = [
+              {
+                  "date": now,
+                  "control_id": CONTROL_ID,
+                  "monitoring_metric_id": TIER0_METRIC_ID,
+                  "monitoring_metric_value": 0.0,
+                  "compliance_status": "Red",
+                  "numerator": 0,
+                  "denominator": 1,
+                  "non_compliant_resources": [f"Error: {str(e)}"]
+              },
+              {
+                  "date": now,
+                  "control_id": CONTROL_ID,
+                  "monitoring_metric_id": TIER1_METRIC_ID,
+                  "monitoring_metric_value": 0.0,
+                  "compliance_status": "Red",
+                  "numerator": 0,
+                  "denominator": 1,
+                  "non_compliant_resources": [f"Error: {str(e)}"]
+              },
+              {
+                  "date": now,
+                  "control_id": CONTROL_ID,
+                  "monitoring_metric_id": TIER2_METRIC_ID,
+                  "monitoring_metric_value": 0.0,
+                  "compliance_status": "Red",
+                  "numerator": 0,
+                  "denominator": 1,
+                  "non_compliant_resources": [f"Error: {str(e)}"]
+              }
+          ]
+          return spark.createDataFrame(error_metrics)
+
+  def main():
+      """Main function to run the certificate monitoring."""
+      print("Starting certificate monitoring for CTRL-1077188...")
+      metrics_df = calculate_metrics()
+
+      # Print summary
+      print("\n=== Control Metrics Summary ===")
+      for row in metrics_df.collect():
+          tier = row.monitoring_metric_id.split('-')[-1]  # Extract T0, T1,
+   T2
+          print(f"Tier {tier}: {row.monitoring_metric_value}% 
+  ({row.compliance_status}) - {row.numerator}/{row.denominator}")
+
+      # Display the metrics DataFrame
+      display(metrics_df)
+      return metrics_df
+
+  # Run the script
+  if __name__ == "__main__":
+      metrics_result = main()
